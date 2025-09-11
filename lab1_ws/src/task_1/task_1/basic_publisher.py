@@ -8,6 +8,7 @@ from std_msgs.msg import String
 
 class BasicPublisher(Node):
     def __init__(self):
+        # Initialize with 'Node' constructor
         super().__init__('basic_publisher')
         
         # Initialize node start time
@@ -26,13 +27,13 @@ class BasicPublisher(Node):
     def timer_callback(self):
         # Create 'String' message object assigned with node's active/run time 
         msg = String()
-        msg.data = f'{int(time.time()-self.node_started_at)}s'  # Current time - Node start time (in seconds)
+        msg.data = f'Node Active for {int(time.time()-self.node_started_at)}s'  # Current time - Node start time (in seconds)
         
         # Publish message to the topic
         self.publisher_.publish(msg)
         
         # Node logging to show message data published to the topic
-        self.get_logger().info(f'Publishing: {msg.data}')
+        self.get_logger().info(f'[Publishing]: "{msg.data}"')
         
         # Topic publish counter increment
         self.i += 1
@@ -42,7 +43,7 @@ def main(args=None):
     # Initialize rclpy library
     rclpy.init(args=args)
 
-    # Create instance of the 'BasicPublisher' node
+    # Create instance of the 'BasicPublisher' class node
     basic_publisher = BasicPublisher()
 
     # Spin up the created node
