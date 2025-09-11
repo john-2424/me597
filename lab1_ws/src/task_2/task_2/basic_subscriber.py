@@ -1,7 +1,8 @@
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import String
+# from std_msgs.msg import String
+from task_2_interfaces.msg import JointData
 
 
 class BasicSubscriber(Node):
@@ -10,17 +11,26 @@ class BasicSubscriber(Node):
         super().__init__('basic_subscriber')
 
         # Subscribe to a topic
+        # self.subscription = self.create_subscription(
+        #     String,
+        #     'my_first_topic',
+        #     self.listener_callback,
+        #     20
+        # )
+        # Subscribe to a topic with custom message type
         self.subscription = self.create_subscription(
-            String,
-            'my_first_topic',
+            JointData,
+            'joint_topic',
             self.listener_callback,
-            20
+            10
         )
         self.subscription  # prevent unused variable warning
 
     def listener_callback(self, msg):
         # Logs the received messages from a topic
-        self.get_logger().info('[Receiving]: ' + ' ;; '.join(2*[msg.data]))
+        # self.get_logger().info('[Receiving]: ' + ' ;; '.join(2*[msg.data]))
+        # Logs the received message from a topic of custom message type
+        self.get_logger().info(f'[Receiving]: Center: {msg.center}; Vel: {msg.vel}')
 
 
 def main(args=None):
