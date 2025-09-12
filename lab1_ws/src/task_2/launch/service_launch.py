@@ -7,7 +7,7 @@ def generate_launch_description():
         # start the basic_publisher node in a namespace
         Node(
             package='task_2',
-            namespace='basics',
+            # namespace='basics',
             executable='talker',
             name='talker'
         ),

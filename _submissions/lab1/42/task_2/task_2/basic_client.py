@@ -9,7 +9,7 @@ from task_2_interfaces.srv import JointState
 class BasicClientAsync(Node):
     def __init__(self):
         # Initialize with 'Node' constructor
-        super().__init__('basic_client_async')
+        super().__init__('client')
 
         # Create client
         self.cli = self.create_client(JointState, 'joint_service')

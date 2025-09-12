@@ -9,7 +9,7 @@ from std_msgs.msg import String
 class BasicPublisher(Node):
     def __init__(self):
         # Initialize with 'Node' constructor
-        super().__init__('basic_publisher')
+        super().__init__('talker')
         
         # Initialize node start time
         self.node_started_at = time.time()

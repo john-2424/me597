@@ -7,7 +7,7 @@ from task_2_interfaces.srv import JointState
 class BasicService(Node):
     def __init__(self):
         # Initialize with 'Node' constructor
-        super().__init__('basic_service')
+        super().__init__('service')
 
         # Create a service
         self.srv = self.create_service(JointState, 'joint_service', self.check_valid_callback)

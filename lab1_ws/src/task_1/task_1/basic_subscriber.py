@@ -7,7 +7,7 @@ from std_msgs.msg import String
 class BasicSubscriber(Node):
     def __init__(self):
         # Initialize with 'Node' constructor
-        super().__init__('basic_subscriber')
+        super().__init__('listener')
 
         # Subscribe to a topic
         self.subscription = self.create_subscription(
