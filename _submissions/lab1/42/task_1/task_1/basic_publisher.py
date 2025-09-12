@@ -33,7 +33,7 @@ class BasicPublisher(Node):
         self.publisher_.publish(msg)
         
         # Node logging to show message data published to the topic
-        self.get_logger().info(f'[Publishing]: "{msg.data}s"')
+        # self.get_logger().info(f'[Publishing]: "{msg.data}s"')
         
         # Topic publish counter increment
         self.i += 1
