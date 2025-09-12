@@ -20,7 +20,7 @@ class BasicSubscriber(Node):
 
     def listener_callback(self, msg):
         # Logs the received messages from a topic
-        self.get_logger().info(f'[Receiving]: {msg.data}; [Doubled]: {2*msg.data}')
+        self.get_logger().info(f'{msg.data}; {2*msg.data}')
 
 
 def main(args=None):
