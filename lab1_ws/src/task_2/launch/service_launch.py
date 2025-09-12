@@ -15,7 +15,7 @@ def generate_launch_description():
         # start the basic_service node in a namespace
         Node(
             package='task_2',
-            namespace='basics',
+            # namespace='basics',
             executable='service',
             name='service'
         ),
