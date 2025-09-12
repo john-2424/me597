@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import String
+from std_msgs.msg import Float64
 
 
 class BasicSubscriber(Node):
@@ -11,7 +11,7 @@ class BasicSubscriber(Node):
 
         # Subscribe to a topic
         self.subscription = self.create_subscription(
-            String,
+            Float64,
             'my_first_topic',
             self.listener_callback,
             20
@@ -20,7 +20,7 @@ class BasicSubscriber(Node):
 
     def listener_callback(self, msg):
         # Logs the received messages from a topic
-        self.get_logger().info('[Receiving]: ' + ' ;; '.join(2*[msg.data]))
+        self.get_logger().info(f'[Receiving]: {msg.data}; [Doubled]: {2*msg.data}')
 
 
 def main(args=None):

@@ -3,7 +3,7 @@ import time
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import String
+from std_msgs.msg import Float64
 
 
 class BasicPublisher(Node):
@@ -14,8 +14,8 @@ class BasicPublisher(Node):
         # Initialize node start time
         self.node_started_at = time.time()
 
-        # Topic publisher, with 'String' message type, 20 queue size
-        self.publisher_ = self.create_publisher(String, 'my_first_topic', 20)
+        # Topic publisher, with 'Float64' message type, 20 queue size
+        self.publisher_ = self.create_publisher(Float64, 'my_first_topic', 20)
         
         # Topic timer to publish messages in an interval
         timer_period = 0.05  # in seconds, for 20Hz
@@ -25,15 +25,15 @@ class BasicPublisher(Node):
         self.i = 0
 
     def timer_callback(self):
-        # Create 'String' message object assigned with node's active/run time 
-        msg = String()
-        msg.data = f'Node Active for {int(time.time()-self.node_started_at)}s'  # Current time - Node start time (in seconds)
+        # Create 'Float64' message object assigned with node's active/run time 
+        msg = Float64()
+        msg.data = time.time()-self.node_started_at  # Current time minus the Node start time (in seconds)
         
         # Publish message to the topic
         self.publisher_.publish(msg)
         
         # Node logging to show message data published to the topic
-        self.get_logger().info(f'[Publishing]: "{msg.data}"')
+        self.get_logger().info(f'[Publishing]: "{msg.data}s"')
         
         # Topic publish counter increment
         self.i += 1
