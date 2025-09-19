@@ -56,28 +56,28 @@ class PIDSpeedController(Node):
 
         # ===== Parameters (declare + defaults) =====
         self.declare_parameter('setpoint_reference', 0.35)          # desired distance [m]
-        self.declare_parameter('tolerance', 0.05)         # stop band [m]
+        # self.declare_parameter('tolerance', 0.05)         # stop band [m]
         self.declare_parameter('hz', 10.0)                # control rate [Hz]
         self.declare_parameter('kp', 12.4)
-        self.declare_parameter('ki', 0.01)
-        self.declare_parameter('kd', 0.0005)
+        self.declare_parameter('ki', 0.0004)
+        self.declare_parameter('kd', 0.00004)
         # self.declare_parameter('i_limit', 0.5)            # integral clamp
         self.declare_parameter('max_speed', 0.15)          # m/s forward cap
-        self.declare_parameter('min_speed', 0.05)         # deadband to avoid micro jitter
+        # self.declare_parameter('min_speed', 0.05)         # deadband to avoid micro jitter
         self.declare_parameter('sector_deg', 12.0)        # +/- sector around front
         self.declare_parameter('use_median', True)        # median vs min
         self.declare_parameter('reverse_ok', True)       # allow backing up if too close
 
         # ===== Get params =====
         self.setpoint_reference   = float(self.get_parameter('setpoint_reference').value)
-        self.tolerance  = float(self.get_parameter('tolerance').value)
+        # self.tolerance  = float(self.get_parameter('tolerance').value)
         self.hz         = float(self.get_parameter('hz').value)
         kp              = float(self.get_parameter('kp').value)
         ki              = float(self.get_parameter('ki').value)
         kd              = float(self.get_parameter('kd').value)
         # i_limit         = float(self.get_parameter('i_limit').value)
         self.max_speed  = float(self.get_parameter('max_speed').value)
-        self.min_speed  = float(self.get_parameter('min_speed').value)
+        # self.min_speed  = float(self.get_parameter('min_speed').value)
         self.sector_deg = float(self.get_parameter('sector_deg').value)
         self.use_median = bool(self.get_parameter('use_median').value)
         self.reverse_ok = bool(self.get_parameter('reverse_ok').value)
