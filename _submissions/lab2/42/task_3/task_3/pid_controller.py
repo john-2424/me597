@@ -13,14 +13,14 @@ from geometry_msgs.msg import Twist
 
 class PID:
     def __init__(self, kp, ki, kd, 
-                #  i_limit=1.0
+                 i_limit=1.0
                  ):
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.i = 0.0
         self.prev_e = 0.0
-        # self.i_limit = i_limit
+        self.i_limit = i_limit
         self.first = True
 
     def reset(self):
@@ -31,7 +31,7 @@ class PID:
     def step(self, e, dt):
         # Integral with clamping (anti-windup)
         self.i += e * dt
-        # self.i = max(-self.i_limit, min(self.i_limit, self.i))
+        self.i = max(-self.i_limit, min(self.i_limit, self.i))
 
         # Derivative (protect first step)
         if self.first or dt <= 0.0:
@@ -58,10 +58,10 @@ class PIDSpeedController(Node):
         self.declare_parameter('setpoint_reference', 0.35)          # desired distance [m]
         # self.declare_parameter('tolerance', 0.05)         # stop band [m]
         self.declare_parameter('hz', 10.0)                # control rate [Hz]
-        self.declare_parameter('kp', 12.4)
-        self.declare_parameter('ki', 0.0004)
-        self.declare_parameter('kd', 0.00004)
-        # self.declare_parameter('i_limit', 0.5)            # integral clamp
+        self.declare_parameter('kp', 0.4)
+        self.declare_parameter('ki', 0.0006)
+        self.declare_parameter('kd', 0.6)
+        self.declare_parameter('i_limit', 0.1)            # integral clamp
         self.declare_parameter('max_speed', 0.15)          # m/s forward cap
         # self.declare_parameter('min_speed', 0.05)         # deadband to avoid micro jitter
         self.declare_parameter('sector_deg', 12.0)        # +/- sector around front
@@ -75,7 +75,7 @@ class PIDSpeedController(Node):
         kp              = float(self.get_parameter('kp').value)
         ki              = float(self.get_parameter('ki').value)
         kd              = float(self.get_parameter('kd').value)
-        # i_limit         = float(self.get_parameter('i_limit').value)
+        i_limit         = float(self.get_parameter('i_limit').value)
         self.max_speed  = float(self.get_parameter('max_speed').value)
         # self.min_speed  = float(self.get_parameter('min_speed').value)
         self.sector_deg = float(self.get_parameter('sector_deg').value)
@@ -217,7 +217,8 @@ def main(args=None):
     try:
         rclpy.spin(pid_speed_controller)
     except KeyboardInterrupt:
-        pid_speed_controller.save_csv()
+        # pid_speed_controller.save_csv()
+        pass
     finally:
         # Explicit declaration to destroy the node object and shutdown rclpy
         pid_speed_controller.destroy_node()
