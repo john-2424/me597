@@ -85,7 +85,7 @@ class PIDSpeedController(Node):
         # Subscribe to the /scan topic
         self.scan_listener = self.create_subscription(
             LaserScan,
-            '/scan',
+            '/robot/scan',
             self._scan_subscribe_callback,
             10
         )
@@ -96,7 +96,7 @@ class PIDSpeedController(Node):
         self.timer = self.create_timer(timer_period, self._process_timer_callback)
 
         # Publish to /cmd_vel topic
-        self.cmd_vel_talker = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_vel_talker = self.create_publisher(Twist, '/robot/cmd_vel', 10)
 
         # Initialize PID controller
         self.pid = PID(kp, ki, kd, 
