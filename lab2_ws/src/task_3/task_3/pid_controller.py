@@ -100,32 +100,44 @@ class PIDSpeedController(Node):
 
         # Initialize PID controller
         self.pid = PID(kp, ki, kd, 
-                    #    i_limit
+                       i_limit
                     )
 
         # Dist topic, with 'Float64' message type, 10 queue size
-        self.dist_talker = self.create_publisher(Float64, '/bot_dist', 10)
+        # self.dist_talker = self.create_publisher(Float64, '/bot_dist', 10)
 
     def _scan_subscribe_callback(self, msg):
         # Assigns and Logs the received messages from the /scan topic
         self.last_listener_message = msg
-        # self.get_logger().info(f'Listener: {msg}')
+        # dist = self._front_distance(self.last_listener_message)
+        # self.get_logger().info(f'Listener: [{msg.angle_min}, {msg.angle_max}, {msg.angle_increment}, {msg.range_min}, {msg.range_max}, {len(msg.ranges)}, {dist}]')
+        # self.get_logger().info(f'{[(i, i_range) for i, i_range in enumerate(msg.ranges)]}')
+        # min_val = min(msg.ranges)
+        # min_idx = msg.ranges.index(min_val)
+        # self.get_logger().info(f'{min_idx}, {min_val} -> Front angle: {min_idx*msg.angle_increment}')
     
     def _front_distance(self, msg: LaserScan):
         # Compute indices for a symmetric sector around angle = 0 (front)
         total = len(msg.ranges)
+        # self.get_logger().info(f'Total Ranges: {total}')
         if total == 0:
             return None
 
-        # Convert sector to radians and to index range
-        sector_rad = math.radians(self.sector_deg)
-        # Index of angle 0:
-        if msg.angle_increment == 0:
-            return None
-        zero_idx = int(round((0.0 - msg.angle_min) / msg.angle_increment))
-        half_span = int(round(sector_rad / msg.angle_increment))
-        start = max(0, zero_idx - half_span)
-        end   = min(total - 1, zero_idx + half_span)
+        # # Convert sector to radians and to index range
+        # sector_rad = math.radians(self.sector_deg)
+        # self.get_logger().info(f'Angle Increment: {msg.angle_increment}')
+        # # Index of angle 0:
+        # if msg.angle_increment == 0:
+        #     return None
+        # zero_idx = int(round((0.0 - msg.angle_min) / msg.angle_increment))
+        # half_span = int(round(sector_rad / msg.angle_increment))
+        # start = max(0, zero_idx - half_span)
+        # end   = min(total - 1, zero_idx + half_span)
+
+        front_index = 270
+        return msg.ranges[front_index]
+        start = front_index - 100
+        end = front_index + 100
 
         window = []
         for i in range(start, end + 1):
@@ -135,6 +147,7 @@ class PIDSpeedController(Node):
                 r = max(msg.range_min, min(msg.range_max, r))
                 window.append(r)
 
+        self.get_logger().info(f'Window: {window}')
         if not window:
             return None
 
@@ -154,14 +167,16 @@ class PIDSpeedController(Node):
             return
 
         dist = self._front_distance(self.last_listener_message)
+        # self.get_logger().info(f'**** Distance: {dist}')
         # self.dist_talker.publish(Float64(data=float(dist)))
-        if dist is None:
+        if dist is None or dist == 'inf':
             # No valid reading; stop for safety
             self.cmd_vel_talker.publish(twist)
             return
 
         self.distl.append(dist)
         e = dist - self.setpoint_reference   # positive if bot more than the target distance of the obstacle, negative if less
+        # self.get_logger().info(f'**** Error: {e}')
         self.el.append(e)
         # at_goal = abs(e) <= self.tolerance
 
@@ -185,6 +200,7 @@ class PIDSpeedController(Node):
         # if abs(v) < self.min_speed:
         #     v = math.copysign(0.0, v)  # snap to 0 within deadband
         v = max(-self.max_speed, min(self.max_speed, v))
+        # self.get_logger().info(f'**** Velocity: {v}')
         self.vl.append(v)
 
         twist.linear.x = v
