@@ -1,0 +1,7 @@
+map_server:
+  ros__parameters:
+    frame_id: map
+    topic_name: map
+    use_sim_time: true
+    # Note: the yaml_filename has to be the absolute path for the map file to be found
+    yaml_filename: "/final_project_ws/src/turtlebot3_gazebo/maps/map.yaml"
