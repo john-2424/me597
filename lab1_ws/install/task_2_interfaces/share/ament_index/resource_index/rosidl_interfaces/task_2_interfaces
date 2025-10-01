@@ -1,6 +1,0 @@
-msg/JointData.idl
-msg/JointData.msg
-srv/JointState.idl
-srv/JointState.srv
-srv/JointState_Request.msg
-srv/JointState_Response.msg
