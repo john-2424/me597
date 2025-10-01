@@ -1,1 +1,0 @@
-/home/me597/Desktop/ME597Lab/me597/sim_ws/src/turtlebot3_gazebo/launch/spawn_turtlebot3.launch.py
