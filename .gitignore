@@ -173,9 +173,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-build/*
-install/*
-log/*
+**/build/*
+**/install/*
+**/log/*
 
 *.pyc
 
