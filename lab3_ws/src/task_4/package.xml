@@ -3,7 +3,7 @@
 <package format="3">
   <name>task_4</name>
   <version>1.0.0</version>
-  <description>Lab 3 Task 4 Navigation - Mapping with SLAM and Path Planning with A*</description>
+  <description>Lab 3 Task 4 Navigation - Mapping with SLAM, Path Planning with A*, and Path Following (Navigation)</description>
   <maintainer email="srajule@purdue.edu">srajule</maintainer>
   <license>Apache-2.0</license>
 

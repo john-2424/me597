@@ -18,12 +18,12 @@ setup(
     zip_safe=True,
     maintainer='srajule',
     maintainer_email='srajule@purdue.edu',
-    description='Lab 3 Task 4 Navigation - Mapping with SLAM and Path Planning with A*',
+    description='Lab 3 Task 4 Navigation - Mapping with SLAM, Path Planning with A*, and Path Following (Navigation)',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'task_4 = task_4.task_4:main'
+            'auto_navigator.py = task_4.auto_navigator:main'
         ],
     },
 )
