@@ -1,3 +1,8 @@
+from copy import copy
+
+from graphviz import Graph
+
+
 class Queue():
     def __init__(self, init_queue = []):
         self.queue = copy(init_queue)

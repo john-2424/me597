@@ -3,11 +3,11 @@ import yaml
 from copy import copy, deepcopy
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+# import matplotlib.pyplot as plt
+# import matplotlib.cm as cm
 from PIL import Image, ImageOps
 
-from utils.ds import Node, Tree
+from task_4.utils.ds import Node, Tree
 
 
 class Map():
@@ -15,11 +15,11 @@ class Map():
         self.map_im, self.map_df, self.limits = self.__open_map(map_name)
         self.image_array = self.__get_obstacle_map(self.map_im, self.map_df)
 
-    def __repr__(self):
-        fig, ax = plt.subplots(dpi=150)
-        ax.imshow(self.image_array,extent=self.limits, cmap=cm.gray)
-        ax.plot()
-        return ""
+    # def __repr__(self):
+    #     fig, ax = plt.subplots(dpi=150)
+    #     ax.imshow(self.image_array,extent=self.limits, cmap=cm.gray)
+    #     ax.plot()
+    #     return ""
 
     def __open_map(self, map_name):
         # Open the YAML file which contains the map name and other
@@ -27,7 +27,8 @@ class Map():
         f = open(map_name + '.yaml', 'r')
         map_df = pd.json_normalize(yaml.safe_load(f))
         # Open the map image
-        map_name = map_df.image[0]
+        # map_name = map_df.image[0]
+        map_name = map_name + '.pgm'
         im = Image.open(map_name)
         size = 200, 200
         im.thumbnail(size)

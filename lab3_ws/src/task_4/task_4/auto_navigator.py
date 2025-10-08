@@ -3,16 +3,16 @@
 import sys
 import os
 import numpy as np
+from pathlib import Path as os_path
 
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist, Point
 from std_msgs.msg import Float32
-from ament_index_python.packages import get_package_share_directory
 
-from pre_process.map import MapProcessor
-from path_planner.astar import AStar
+from task_4 import MapProcessor
+from task_4 import AStar
 
 
 class Navigation(Node):
@@ -34,8 +34,7 @@ class Navigation(Node):
         self.start_time = 0.0
 
         # Generate Graph from Map
-        package_dir = get_package_share_directory('turtlebot3_gazebo')
-        map_file_path = os.path.join(package_dir, 'maps', 'sync_classroom_map')
+        map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', 'sync_classroom_map')
         self.mp = MapProcessor(map_file_path)
         kr = self.mp.rect_kernel(5, 1)
         self.mp.inflate_map(kr, True)
@@ -161,12 +160,12 @@ class Navigation(Node):
             rclpy.spin_once(self, timeout_sec=0.1)  # Process callbacks without blocking
 
             # 1. Create the path to follow
-            path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+            # path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
             # 2. Loop through the path and move the robot
-            idx = self.get_path_idx(path, self.ttbot_pose)
-            current_goal = path.poses[idx]
-            speed, heading = self.path_follower(self.ttbot_pose, current_goal)
-            self.move_ttbot(speed, heading)
+            # idx = self.get_path_idx(path, self.ttbot_pose)
+            # current_goal = path.poses[idx]
+            # speed, heading = self.path_follower(self.ttbot_pose, current_goal)
+            # self.move_ttbot(speed, heading)
 
             self.rate.sleep()
             # Sleep for the rate to control loop timing
