@@ -3,8 +3,8 @@ import yaml
 from copy import copy, deepcopy
 import numpy as np
 import pandas as pd
-# import matplotlib.pyplot as plt
-# import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from PIL import Image, ImageOps
 
 from task_4.utils.ds import Node, Tree
@@ -15,11 +15,11 @@ class Map():
         self.map_im, self.map_df, self.limits = self.__open_map(map_name)
         self.image_array = self.__get_obstacle_map(self.map_im, self.map_df)
 
-    # def __repr__(self):
-    #     fig, ax = plt.subplots(dpi=150)
-    #     ax.imshow(self.image_array,extent=self.limits, cmap=cm.gray)
-    #     ax.plot()
-    #     return ""
+    def __repr__(self):
+        fig, ax = plt.subplots(dpi=150)
+        ax.imshow(self.image_array,extent=self.limits, cmap=cm.gray)
+        ax.plot()
+        return ""
 
     def __open_map(self, map_name):
         # Open the YAML file which contains the map name and other
@@ -30,8 +30,8 @@ class Map():
         # map_name = map_df.image[0]
         map_name = map_name + '.pgm'
         im = Image.open(map_name)
-        size = 200, 200
-        im.thumbnail(size)
+        # size = 200, 200
+        # im.thumbnail(size)
         im = ImageOps.grayscale(im)
         # Get the limits of the map. This will help to display the map
         # with the correct axis ticks.
@@ -181,10 +181,33 @@ class MapProcessor():
     def draw_path(self, path):
         path_tuple_list = []
         path_array = copy(self.inf_map_img_array)
+        for i in range(self.map.image_array.shape[0]):
+            for j in range(self.map.image_array.shape[1]):
+                if self.inf_map_img_array[i][j] == 0:
+                    tup = tuple([i, j])
+                    # print(tup)
+                    path_tuple_list.append(tup)
+                    if i%2 == 0 and j%2 == 0:
+                        path_array[tup] = 0.25
+                    # print(path_array[tup])
         for idx in path:
             tup = tuple(map(int, idx.split(',')))
             path_tuple_list.append(tup)
-            path_array[tup] = 0.5
+            path_array[tup] = 0.75
+        return path_array
+    
+    def draw_nodes(self):
+        path_tuple_list = []
+        path_array = copy(self.inf_map_img_array)
+        for i in range(self.map.image_array.shape[0]):
+            for j in range(self.map.image_array.shape[1]):
+                if self.inf_map_img_array[i][j] == 0:
+                    tup = tuple([i, j])
+                    # print(tup)
+                    path_tuple_list.append(tup)
+                    if i%2 == 0 and j%2 == 0:
+                        path_array[tup] = 0.25
+                    # print(path_array[tup])
         return path_array
 
 
