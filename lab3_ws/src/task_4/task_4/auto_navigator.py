@@ -32,13 +32,25 @@ class Navigation(Node):
         self.goal_pose = PoseStamped()
         self.ttbot_pose = PoseStamped()
         self.start_time = 0.0
+        self.start_real_pose = 0, 0
+        self.start_img_pose = self.__map_pose_real_to_img(self.start_real_pose)
+
+        # ===== Parameters (declare + defaults) =====
+        self.declare_parameter('map_name', 'sync_classroom_map')          # Name of the map to navigate
+        self.declare_parameter('kernel_size', 5)          # Size of the kernel, to configure how much you want to inflate map/obstacles
+        # ===== Get params =====
+        self.map_name   = float(self.get_parameter('map_name').value)
+        self.kernel_size   = float(self.get_parameter('kernel_size').value)
 
         # Generate Graph from Map
-        map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', 'sync_classroom_map')
+        map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', self.map_name)
         self.mp = MapProcessor(map_file_path)
-        kr = self.mp.rect_kernel(5, 1)
+        kr = self.mp.rect_kernel(self.kernel_size, 1)
         self.mp.inflate_map(kr, True)
         self.mp.get_graph_from_map()
+        self.map_res = self.mp.map.map_df.resolution[0]
+        self.map_origin = self.mp.map.map_df.origin[0]
+        self.map_img_array_shape = self.mp.map.image_array.shape
 
         # Subscribers
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
@@ -69,6 +81,12 @@ class Navigation(Node):
         self.ttbot_pose = data.pose
         self.get_logger().info(
             'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
+    
+    def __map_pose_real_to_img(self, real_x, real_y):
+        return self.map_img_array_shape[0] - ((real_x + abs(self.map_origin[0]))//self.map_res), self.map_img_array_shape[1] - ((real_y + abs(self.map_origin[1]))//self.map_res)
+
+    def __map_pose_img_to_real(self, img_x, img_y):
+        return ((self.map_img_array_shape[0] - img_x)*self.map_res) - abs(self.map_origin[0]), ((self.map_img_array_shape[1] - img_y)*self.map_res) - abs(self.map_origin[1])
 
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
@@ -83,10 +101,12 @@ class Navigation(Node):
         # TODO: IMPLEMENTATION OF THE A* ALGORITHM
         path.poses.append(start_pose)
         
-        start_pose_x_y = f'{start_pose.pose.position.x},{start_pose.pose.position.y}'
+        start_img_pose_x, start_img_pose_y = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
+        start_pose_x_y = f'{start_img_pose_x},{start_img_pose_y}'
         self.mp.map_graph.root = start_pose_x_y
         spxy_mp_node = self.mp.map_graph.g[start_pose_x_y]
-        end_pose_x_y = f'{end_pose.pose.position.x},{end_pose.pose.position.y}'
+        end_img_pose_x, end_img_pose_y = self.__map_pose_real_to_img(end_pose.pose.position.x, end_pose.pose.position.y)
+        end_pose_x_y = f'{end_img_pose_x},{end_img_pose_y}'
         self.mp.map_graph.end = end_pose_x_y
         epxy_mp_node = self.mp.map_graph.g[end_pose_x_y]
         
@@ -95,11 +115,12 @@ class Navigation(Node):
         path_as, dist_as = astar_graph.reconstruct_path(spxy_mp_node, epxy_mp_node)
         for path_taken in path_as[1:-1]:
             path_taken_x, path_taken_y = path_taken.split(',')
+            path_taken_real_pose_x, path_taken_real_pose_y = self.__map_pose_img_to_real(path_taken_x, path_taken_y)
             path_taken_pose = PoseStamped(
                 pose=Pose(
                     position=Point(
-                        x=path_taken_x,
-                        y=path_taken_y
+                        x=path_taken_real_pose_x,
+                        y=path_taken_real_pose_y
                     )
                 )
             )
