@@ -2,6 +2,7 @@
 
 import sys
 import os
+from math import sqrt, atan2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path as os_path
@@ -12,9 +13,8 @@ from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist, Point
 from std_msgs.msg import Float32
 
-from task_4 import MapProcessor
-from task_4 import AStar
-
+from task_4 import MapProcessor, AStar, Follower, PID
+from task_4.utils.etc import *
 
 class Navigation(Node):
     """! Navigation node class.
@@ -24,7 +24,7 @@ class Navigation(Node):
 
     def __init__(self, node_name='Navigation'):
         """! Class constructor.
-        @param  None.
+        @param  node_name.
         @return An instance of the Navigation class.
         """
         super().__init__(node_name)
@@ -42,6 +42,23 @@ class Navigation(Node):
         self.map_name   = str(self.get_parameter('map_name').value)
         self.kernel_size   = int(self.get_parameter('kernel_size').value)
 
+        # speed estimate state
+        self._speed_hist = []  # list of (t, x, y)
+        self._ema_speed = 0.0
+
+        self.speed_max = 0.5
+        self.speed_min = 0.0 
+        self.heading_max = 1.2
+        self.speed_db  = 0.02
+        self.heading_db  = 0.02
+        self.slow_k = 1.2     # slow down when misaligned
+        self.stop_tol = 0.12  # stop when close to waypoint
+        self.ema_alpha = 0.35 # smoother speed estimate
+
+        # PIDs (start conservative; tune later)
+        self.pid_speed = PID(kp=1.0, ki=0.2, kd=0.05, i_limit=0.6, out_limit=(-0.7, 0.7))   # output = linear.x (m/s)
+        self.pid_heading = PID(kp=2.0, ki=0.0, kd=0.10, i_limit=0.8, out_limit=(-1.5, 1.5))  # output = angular.z (rad/s)
+
         # Generate Graph from Map
         map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', self.map_name)
         self.mp = MapProcessor(map_file_path)
@@ -54,6 +71,8 @@ class Navigation(Node):
         self.start_real_pose = 0, 0
         self.start_img_pose = self.__map_pose_real_to_img(*self.start_real_pose)
         self.get_logger().info(f'Start Pose [Img]: {self.start_img_pose}')
+
+        self.flw = Follower()
 
         # Subscribers
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
@@ -89,8 +108,8 @@ class Navigation(Node):
     def __map_pose_real_to_img(self, real_x, real_y):
         return int(self.map_img_array_shape[0] - 1 - ((real_y - self.map_origin[1])/self.map_res)), int(((real_x - self.map_origin[0])/self.map_res))
 
-    def __map_pose_img_to_real(self, img_y, img_x):
-        return (int(img_x)*self.map_res) + self.map_origin[0], ((self.map_img_array_shape[0] - int(img_y) - 1)*self.map_res) + self.map_origin[1]
+    def __map_pose_img_to_real(self, img_u, img_v):
+        return (int(img_v)*self.map_res) + self.map_origin[0], ((self.map_img_array_shape[0] - int(img_u) - 1)*self.map_res) + self.map_origin[1]
 
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
@@ -103,28 +122,27 @@ class Navigation(Node):
         # self.get_logger().info(
         #     'A* planner.\n> start: {},\n> end: {}'.format(start_pose.pose.position, end_pose.pose.position))
         self.start_time = self.get_clock().now().nanoseconds*1e-9 #Do not edit this line (required for autograder)
-        # TODO: IMPLEMENTATION OF THE A* ALGORITHM
         path.poses.append(start_pose)
         
-        start_img_pose_x, start_img_pose_y = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
-        start_pose_x_y = f'{start_img_pose_x},{start_img_pose_y}'
-        self.get_logger().info(f'[START] Real: {start_pose.pose.position.x},{start_pose.pose.position.y} :: Img: {start_pose_x_y}')
-        self.mp.map_graph.root = start_pose_x_y
-        spxy_mp_node = self.mp.map_graph.g[start_pose_x_y]
-        end_img_pose_x, end_img_pose_y = self.__map_pose_real_to_img(end_pose.pose.position.x, end_pose.pose.position.y)
-        end_pose_x_y = f'{end_img_pose_x},{end_img_pose_y}'
-        self.get_logger().info(f'[END] Real: {end_pose.pose.position.x},{end_pose.pose.position.y} :: Img: {end_pose_x_y}')
-        if end_pose_x_y in self.mp.map_graph.g:
-            self.mp.map_graph.end = end_pose_x_y
-            epxy_mp_node = self.mp.map_graph.g[end_pose_x_y]
+        start_img_pose_u, start_img_pose_v = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
+        start_pose_u_v = f'{start_img_pose_u},{start_img_pose_v}'
+        self.get_logger().info(f'[START] Real: {start_pose.pose.position.x},{start_pose.pose.position.y} :: Img: {start_pose_u_v}')
+        self.mp.map_graph.root = start_pose_u_v
+        spxy_mp_node = self.mp.map_graph.g[start_pose_u_v]
+        end_img_pose_u, end_img_pose_v = self.__map_pose_real_to_img(end_pose.pose.position.x, end_pose.pose.position.y)
+        end_pose_u_v = f'{end_img_pose_u},{end_img_pose_v}'
+        self.get_logger().info(f'[END] Real: {end_pose.pose.position.x},{end_pose.pose.position.y} :: Img: {end_pose_u_v}')
+        if end_pose_u_v in self.mp.map_graph.g:
+            self.mp.map_graph.end = end_pose_u_v
+            epxy_mp_node = self.mp.map_graph.g[end_pose_u_v]
             
             astar_graph = AStar(self.mp.map_graph)
             astar_graph.solve(spxy_mp_node, epxy_mp_node)
             path_as, dist_as = astar_graph.reconstruct_path(spxy_mp_node, epxy_mp_node)
             self.get_logger().info(f'[Distance]: {dist_as}')
             for path_taken in path_as[1:-1]:
-                path_taken_x, path_taken_y = path_taken.split(',')
-                path_taken_real_pose_x, path_taken_real_pose_y = self.__map_pose_img_to_real(path_taken_x, path_taken_y)
+                path_taken_u, path_taken_v = path_taken.split(',')
+                path_taken_real_pose_x, path_taken_real_pose_y = self.__map_pose_img_to_real(path_taken_u, path_taken_v)
                 self.get_logger().info(f'[PATH] Real: {path_taken_real_pose_x},{path_taken_real_pose_y} :: Img: {path_taken}')
                 path_taken_pose = PoseStamped(
                     pose=Pose(
@@ -158,11 +176,12 @@ class Navigation(Node):
     def get_path_idx(self, path, vehicle_pose):
         """! Path follower.
         @param  path                  Path object containing the sequence of waypoints of the created path.
-        @param  current_goal_pose     PoseStamped object containing the current vehicle position.
+        @param  vehicle_pose     PoseStamped object containing the current vehicle position.
         @return idx                   Position in the path pointing to the next goal pose to follow.
         """
         idx = 0
-        # TODO: IMPLEMENT A MECHANISM TO DECIDE WHICH POINT IN THE PATH TO FOLLOW idx <= len(path)
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        idx = self.flw.get_path_idx(path, vehicle_pose, now_sec)
         return idx
 
     def path_follower(self, vehicle_pose, current_goal_pose):
@@ -173,7 +192,63 @@ class Navigation(Node):
         """
         speed = 0.0
         heading = 0.0
-        # TODO: IMPLEMENT PATH FOLLOWER
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        rx = vehicle_pose.pose.position.x
+        ry = vehicle_pose.pose.position.y
+        ryaw = yaw_from_quat(vehicle_pose.pose.orientation)
+
+        gx = current_goal_pose.pose.position.x
+        gy = current_goal_pose.pose.position.y
+
+        dx, dy = gx - rx, gy - ry
+        dist = sqrt(dx*dx + dy*dy)
+        if dist <= self.stop_tol:
+            # reset integrators to avoid "creep"
+            self.pid_speed.reset()
+            self.pid_heading.reset()
+            return 0.0, 0.0
+
+        goal_bearing = atan2(dy, dx)
+        heading_err = wrap_pi(goal_bearing - ryaw)  # desired heading is goal_bearing → error to zero
+
+        # keep ~0.5–1.0 s of history; here we auto-size to timer rate
+        self._speed_hist.append((now_sec, rx, ry))
+        # keep last ~1 s
+        while len(self._speed_hist) > 0 and (now_sec - self._speed_hist[0][0]) > 1.0:
+            self._speed_hist.pop(0)
+
+        speed_meas = 0.0
+        if len(self._speed_hist) >= 2:
+            t0, x0, y0 = self._speed_hist[0]
+            dt_hist = max(1e-3, now_sec - t0)
+            speed_raw = dist2d((rx, ry), (x0, y0)) / dt_hist
+            self._ema_speed = self.ema_alpha*speed_raw + (1.0-self.ema_alpha)*self._ema_speed
+            speed_meas = self._ema_speed
+
+        # speed setpoint: proportional to distance, reduced when misaligned
+        speed_sp = (dist) / (1.0 + self.slow_k*abs(heading_err))
+        speed_sp = float(np.clip(speed_sp, self.speed_min, self.speed_max))
+
+        # heading setpoint: we want heading_err → 0 (so setpoint is 0)
+        heading_err_sp = 0.0  # track zero heading error
+
+        # Speed PID tracks speed_sp using measured speed speed_meas.
+        # error = speed_sp - speed_meas
+        # dt from last control step ~ timer period; here use last two timestamps if possible
+        if len(self._speed_hist) >= 2:
+            dt = now_sec - self._speed_hist[-2][0]
+        else:
+            dt = 1.0 / 10.0  # fallback 10 Hz
+
+        speed_out = self.pid_speed.step(speed_sp - speed_meas, dt)
+        heading_out = self.pid_heading.step(heading_err, dt)  # error = 0 - heading_err
+
+        # ---------- saturate for safety ----------
+        speed = float(np.clip(speed_out, -self.speed_max, self.speed_max))
+        heading = float(np.clip(heading_out, -self.heading_max, self.heading_max))
+
         return speed, heading
 
     def move_ttbot(self, speed, heading):
@@ -183,7 +258,13 @@ class Navigation(Node):
         @return path      object containing the sequence of waypoints of the created path.
         """
         cmd_vel = Twist()
-        # TODO: IMPLEMENT YOUR LOW-LEVEL CONTROLLER
+
+        speed = float(np.clip(speed,  -self.speed_max, self.speed_max))
+        heading = float(np.clip(heading, -self.heading_max, self.heading_max))
+
+        if abs(speed) < self.speed_db: speed = 0.0
+        if abs(heading) < self.heading_db: heading = 0.0
+
         cmd_vel.linear.x = speed
         cmd_vel.angular.z = heading
 
@@ -196,12 +277,12 @@ class Navigation(Node):
         @return none
         """
         # Shows the nodes on the Map
-        map_with_nodes = self.mp.draw_nodes()
-        fig, ax = plt.subplots(nrows = 1, ncols = 1, dpi=300, sharex=True, sharey=True)
-        ax.imshow(map_with_nodes)
-        ax.set_title('Nodes')
-        plt.show()
-        # plt.show(block=False)
+        # map_with_nodes = self.mp.draw_nodes()
+        # fig, ax = plt.subplots(nrows = 1, ncols = 1, dpi=300, sharex=True, sharey=True)
+        # ax.imshow(map_with_nodes)
+        # ax.set_title('Nodes')
+        # plt.show()
+        # # plt.show(block=False)
         
         while rclpy.ok():
             # Call the spin_once to handle callbacks
@@ -209,13 +290,15 @@ class Navigation(Node):
 
             # 1. Create the path to follow
             if self.goal_updated:
-                path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+                self.path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
                 self.goal_updated = False
-            # 2. Loop through the path and move the robot
-            # idx = self.get_path_idx(path, self.ttbot_pose)
-            # current_goal = path.poses[idx]
-            # speed, heading = self.path_follower(self.ttbot_pose, current_goal)
-            # self.move_ttbot(speed, heading)
+            if len(self.path.poses) >= 1:
+                # 2. Loop through the path and move the robot
+                idx = self.get_path_idx(self.path, self.ttbot_pose)
+                idx = min(max(idx, 0), len(self.path.poses) - 1)   # clamp
+                current_goal = self.path.poses[idx]
+                speed, heading = self.path_follower(self.ttbot_pose, current_goal)
+                self.move_ttbot(speed, heading)
 
             # self.rate.sleep()
             # Sleep for the rate to control loop timing
