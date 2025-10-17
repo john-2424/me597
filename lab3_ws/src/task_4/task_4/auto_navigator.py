@@ -13,7 +13,7 @@ from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist, Point
 from std_msgs.msg import Float32
 
-from task_4 import MapProcessor, AStar, Follower, PID
+from task_4 import MapProcessor, AStar, WayPoints, PID
 from task_4.utils.etc import *
 
 class Navigation(Node):
@@ -33,7 +33,7 @@ class Navigation(Node):
         self.goal_pose = PoseStamped()
         self.ttbot_pose = PoseStamped()
         self.start_time = 0.0
-        self.goal_updated = True
+        self.goal_updated = False
 
         # ===== Parameters (declare + defaults) =====
         self.declare_parameter('map_name', 'sync_classroom_map')          # Name of the map to navigate
@@ -72,7 +72,8 @@ class Navigation(Node):
         self.start_img_pose = self.__map_pose_real_to_img(*self.start_real_pose)
         self.get_logger().info(f'Start Pose [Img]: {self.start_img_pose}')
 
-        self.flw = Follower()
+        # self.flw = Follower()
+        self.wps = None
 
         # Subscribers
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
@@ -156,12 +157,12 @@ class Navigation(Node):
                     path_taken_pose
                 )
             
-            map_with_path_as = self.mp.draw_path(path_as)
-            fig, ax = plt.subplots(nrows = 1, ncols = 1, dpi=300, sharex=True, sharey=True)
-            ax.imshow(map_with_path_as)
-            ax.set_title('Path A*')
-            plt.show()
-            # plt.show(block=False)
+            # map_with_path_as = self.mp.draw_path(path_as)
+            # fig, ax = plt.subplots(nrows = 1, ncols = 1, dpi=300, sharex=True, sharey=True)
+            # ax.imshow(map_with_path_as)
+            # ax.set_title('Path A*')
+            # plt.show()
+            # # plt.show(block=False)
         else:
             self.get_logger().warn(f'Goal position does not exist!')
         
@@ -179,10 +180,13 @@ class Navigation(Node):
         @param  vehicle_pose     PoseStamped object containing the current vehicle position.
         @return idx                   Position in the path pointing to the next goal pose to follow.
         """
-        idx = 0
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
-        idx = self.flw.get_path_idx(path, vehicle_pose, now_sec)
-        return idx
+        # idx = 0
+        # now_sec = self.get_clock().now().nanoseconds * 1e-9
+        # idx = self.flw.get_path_idx(path, vehicle_pose, now_sec)
+
+        self.wps.choose_next(vehicle_pose)
+
+        # return idx
 
     def path_follower(self, vehicle_pose, current_goal_pose):
         """! Path follower.
@@ -259,9 +263,6 @@ class Navigation(Node):
         """
         cmd_vel = Twist()
 
-        speed = float(np.clip(speed,  -self.speed_max, self.speed_max))
-        heading = float(np.clip(heading, -self.heading_max, self.heading_max))
-
         if abs(speed) < self.speed_db: speed = 0.0
         if abs(heading) < self.heading_db: heading = 0.0
 
@@ -288,15 +289,22 @@ class Navigation(Node):
             # Call the spin_once to handle callbacks
             rclpy.spin_once(self, timeout_sec=0.1)  # Process callbacks without blocking
 
-            # 1. Create the path to follow
-            if self.goal_updated:
+            # 1. Create the path to follow, when either goal is updated or when the ttbot_pose is not within the tolerane of the previously generated A* path
+            if self.goal_updated or (self.wps is not None and not self.wps.bot_on_path(self.ttbot_pose)):
                 self.path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+                self.path_pub.publish(self.path)
+                self.wps = WayPoints(self.path)
                 self.goal_updated = False
-            if len(self.path.poses) >= 1:
-                # 2. Loop through the path and move the robot
-                idx = self.get_path_idx(self.path, self.ttbot_pose)
-                idx = min(max(idx, 0), len(self.path.poses) - 1)   # clamp
-                current_goal = self.path.poses[idx]
+            else:
+                self.wps = None
+            
+            # 2. Loop through the path and move the robot
+            if self.wps is not None and self.wps.bot_reached(self.ttbot_pose):
+                self.get_path_idx(self.path, self.ttbot_pose)
+                # idx = min(max(idx, 0), len(self.path.poses) - 1)   # clamp
+            
+            if self.wps is not None:
+                current_goal = self.path.poses[self.wps.last_idx]
                 speed, heading = self.path_follower(self.ttbot_pose, current_goal)
                 self.move_ttbot(speed, heading)
 
