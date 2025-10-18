@@ -10,7 +10,7 @@ from pathlib import Path as os_path
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist, Point
+from geometry_msgs.msg import PoseStamped, PoseWithCovariance, PoseWithCovarianceStamped, Pose, Twist, Point
 from std_msgs.msg import Float32
 
 from task_4 import MapProcessor, AStar, WayPoints, PID
@@ -29,7 +29,7 @@ class Navigation(Node):
         """
         super().__init__(node_name)
         # Path planner/follower related variables
-        self.path = Path()
+        self.path = None
         self.goal_pose = PoseStamped()
         self.ttbot_pose = PoseStamped()
         self.start_time = 0.0
@@ -52,7 +52,7 @@ class Navigation(Node):
         self.speed_db  = 0.02
         self.heading_db  = 0.02
         self.slow_k = 1.2     # slow down when misaligned
-        self.stop_tol = 0.12  # stop when close to waypoint
+        self.stop_tol = 0.4  # stop when close to waypoint
         self.ema_alpha = 0.35 # smoother speed estimate
 
         # PIDs (start conservative; tune later)
@@ -112,18 +112,63 @@ class Navigation(Node):
     def __map_pose_img_to_real(self, img_u, img_v):
         return (int(img_v)*self.map_res) + self.map_origin[0], ((self.map_img_array_shape[0] - int(img_u) - 1)*self.map_res) + self.map_origin[1]
 
+    def _as_ps(self, src, frame="map"):
+        ps = PoseStamped()
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.header.frame_id = frame
+
+        if isinstance(src, PoseStamped):
+            # Optionally refresh header/frame to your current clock/frame
+            return src
+
+        if isinstance(src, PoseWithCovarianceStamped):
+            pose = src.pose.pose
+            ps.pose = Pose()
+            ps.pose.position.x = float(pose.position.x)
+            ps.pose.position.y = float(pose.position.y)
+            ps.pose.position.z = float(pose.position.z)
+            ps.pose.orientation = pose.orientation
+            return ps
+
+        if isinstance(src, PoseWithCovariance):
+            pose = src.pose  # <-- the inner Pose
+            ps.pose = Pose()
+            ps.pose.position.x = float(pose.position.x)
+            ps.pose.position.y = float(pose.position.y)
+            ps.pose.position.z = float(pose.position.z)
+            ps.pose.orientation = pose.orientation
+            return ps
+
+        if isinstance(src, Pose):
+            ps.pose = src
+            return ps
+
+        if isinstance(src, tuple) and len(src) == 2:
+            x, y = src
+            ps.pose = Pose(position=Point(x=float(x), y=float(y)))
+            return ps
+
+        raise TypeError(f"Cannot coerce {type(src)} to PoseStamped")
+
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
         @param  start_pose    PoseStamped object containing the start of the path to be created.
         @param  end_pose      PoseStamped object containing the end of the path to be created.
         @return path          Path object containing the sequence of waypoints of the created path.
         """
-        path = Path()
+        self.path = Path()
+        self.path.header.stamp = self.get_clock().now().to_msg()
+        self.path.header.frame_id = "map"
+
         self.get_logger().info('A* Planner ->')
         # self.get_logger().info(
         #     'A* planner.\n> start: {},\n> end: {}'.format(start_pose.pose.position, end_pose.pose.position))
         self.start_time = self.get_clock().now().nanoseconds*1e-9 #Do not edit this line (required for autograder)
-        path.poses.append(start_pose)
+
+        # Normalize end points
+        start_ps = self._as_ps(start_pose)
+        end_ps   = self._as_ps(end_pose)
+        self.path.poses.append(start_ps)
         
         start_img_pose_u, start_img_pose_v = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
         start_pose_u_v = f'{start_img_pose_u},{start_img_pose_v}'
@@ -153,7 +198,10 @@ class Navigation(Node):
                         )
                     )
                 )
-                path.poses.append(
+                path_taken_pose = self._as_ps(
+                    (path_taken_real_pose_x, path_taken_real_pose_y)
+                )
+                self.path.poses.append(
                     path_taken_pose
                 )
             
@@ -165,14 +213,21 @@ class Navigation(Node):
             # # plt.show(block=False)
         else:
             self.get_logger().warn(f'Goal position does not exist!')
+            self.path = None
+            return
         
-        path.poses.append(end_pose)
+        self.path.poses.append(end_ps)
         # Do not edit below (required for autograder)
         self.astarTime = Float32()
         self.astarTime.data = float(self.get_clock().now().nanoseconds*1e-9-self.start_time)
         self.calc_time_pub.publish(self.astarTime)
         
-        return path
+        # for i, p in enumerate(self.path.poses):
+        #     self.get_logger().info(
+        #         f"[poses[{i}]] type={p.__class__.__module__}.{p.__class__.__name__}"
+        #     )
+
+        return self.path
 
     def get_path_idx(self, path, vehicle_pose):
         """! Path follower.
@@ -212,6 +267,7 @@ class Navigation(Node):
             # reset integrators to avoid "creep"
             self.pid_speed.reset()
             self.pid_heading.reset()
+            # self.get_logger().info('Reset integrators to avoid creep')
             return 0.0, 0.0
 
         goal_bearing = atan2(dy, dx)
@@ -253,6 +309,9 @@ class Navigation(Node):
         speed = float(np.clip(speed_out, -self.speed_max, self.speed_max))
         heading = float(np.clip(heading_out, -self.heading_max, self.heading_max))
 
+        # if abs(speed) < self.speed_db: speed = 0.0
+        # if abs(heading) < self.heading_db: heading = 0.0
+
         return speed, heading
 
     def move_ttbot(self, speed, heading):
@@ -262,9 +321,6 @@ class Navigation(Node):
         @return path      object containing the sequence of waypoints of the created path.
         """
         cmd_vel = Twist()
-
-        if abs(speed) < self.speed_db: speed = 0.0
-        if abs(heading) < self.heading_db: heading = 0.0
 
         cmd_vel.linear.x = speed
         cmd_vel.angular.z = heading
@@ -291,21 +347,24 @@ class Navigation(Node):
 
             # 1. Create the path to follow, when either goal is updated or when the ttbot_pose is not within the tolerane of the previously generated A* path
             if self.goal_updated or (self.wps is not None and not self.wps.bot_on_path(self.ttbot_pose)):
-                self.path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
-                self.path_pub.publish(self.path)
-                self.wps = WayPoints(self.path)
+                self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+                # self.get_logger().info(f'Path Generated: {type(self.path)}')
+                if self.path is not None:
+                    self.path_pub.publish(self.path)
+                    self.wps = WayPoints(self.path)
                 self.goal_updated = False
-            else:
-                self.wps = None
             
             # 2. Loop through the path and move the robot
             if self.wps is not None and self.wps.bot_reached(self.ttbot_pose):
-                self.get_path_idx(self.path, self.ttbot_pose)
+                if not self.wps.final_idx:
+                    self.get_path_idx(self.path, self.ttbot_pose)
                 # idx = min(max(idx, 0), len(self.path.poses) - 1)   # clamp
             
             if self.wps is not None:
                 current_goal = self.path.poses[self.wps.last_idx]
+                # self.get_logger().info(f'Current Goal: {current_goal}')
                 speed, heading = self.path_follower(self.ttbot_pose, current_goal)
+                self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
                 self.move_ttbot(speed, heading)
 
             # self.rate.sleep()

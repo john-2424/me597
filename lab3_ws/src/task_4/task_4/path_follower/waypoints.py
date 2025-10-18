@@ -200,9 +200,10 @@ import numpy as np
 class WayPoints():
     def __init__(self, waypoints):
         self.last_idx = 0
+        self.final_idx = False
         self.waypoints = np.array([ (wp.pose.position.x, wp.pose.position.y) for wp in waypoints.poses ])
     
-    def bot_on_path(self, bot_pose, tol=0.1):
+    def bot_on_path(self, bot_pose, tol=0.2):
         """
         Check if bot_pose lies within tol distance of any segment in waypoints.
         """
@@ -228,7 +229,7 @@ class WayPoints():
         # print(np.any(dists <= tol))
         return np.any(dists <= tol)
 
-    def bot_reached(self, bot_pose, tol=0.1):
+    def bot_reached(self, bot_pose, tol=0.4):
         """
         Check if the robot has reached the waypoint at index `idx`
         within a given Euclidean distance tolerance.
@@ -240,7 +241,7 @@ class WayPoints():
 
         return dist <= tol
 
-    def _extend_collinear_segment(self, start_idx, tol=1e-9):
+    def _extend_collinear_segment(self, start_idx, tol=1e-6):
         """
         From start_idx, look forward and find the longest contiguous run of points
         that lie on the same infinite line defined by waypoints[start_idx] and
@@ -288,7 +289,10 @@ class WayPoints():
         # Get the last index based on the points which lie close to the same line as waypoints next_idx and next_idx+1
         next_idx = self._extend_collinear_segment(next_idx)
 
+        print(f'Next Index: {next_idx}')
+
         self.last_idx = next_idx
+        if self.last_idx == len(self.waypoints)-1: self.final_idx = True
 
         return next_idx
 
