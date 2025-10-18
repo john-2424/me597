@@ -56,8 +56,8 @@ class Navigation(Node):
         self.ema_alpha = 0.35 # smoother speed estimate
 
         # PIDs (start conservative; tune later)
-        self.pid_speed = PID(kp=1.0, ki=0.2, kd=0.05, i_limit=0.6, out_limit=(-0.7, 0.7))   # output = linear.x (m/s)
-        self.pid_heading = PID(kp=2.0, ki=0.0, kd=0.10, i_limit=0.8, out_limit=(-1.5, 1.5))  # output = angular.z (rad/s)
+        self.pid_speed = PID(kp=1.0, ki=0.2, kd=0.05, i_limit=0.6, out_limit=(-self.speed_max, self.speed_max))   # output = linear.x (m/s)
+        self.pid_heading = PID(kp=2.0, ki=0.0, kd=0.10, i_limit=0.8, out_limit=(-self.heading_max, self.heading_max))  # output = angular.z (rad/s)
 
         # Generate Graph from Map
         map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', self.map_name)
@@ -184,7 +184,12 @@ class Navigation(Node):
             
             astar_graph = AStar(self.mp.map_graph)
             astar_graph.solve(spxy_mp_node, epxy_mp_node)
-            path_as, dist_as = astar_graph.reconstruct_path(spxy_mp_node, epxy_mp_node)
+            try:
+                path_as, dist_as = astar_graph.reconstruct_path(spxy_mp_node, epxy_mp_node)
+            except KeyError:
+                self.get_logger().warn(f'Goal is not reachable!')
+                self.path = None
+                return
             self.get_logger().info(f'[Distance]: {dist_as}')
             for path_taken in path_as[1:-1]:
                 path_taken_u, path_taken_v = path_taken.split(',')
@@ -360,7 +365,7 @@ class Navigation(Node):
                     self.get_path_idx(self.path, self.ttbot_pose)
                 # idx = min(max(idx, 0), len(self.path.poses) - 1)   # clamp
             
-            if self.wps is not None:
+            if self.wps is not None and self.path is not None:
                 current_goal = self.path.poses[self.wps.last_idx]
                 # self.get_logger().info(f'Current Goal: {current_goal}')
                 speed, heading = self.path_follower(self.ttbot_pose, current_goal)
