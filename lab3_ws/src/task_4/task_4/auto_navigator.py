@@ -173,14 +173,39 @@ class Navigation(Node):
         start_img_pose_u, start_img_pose_v = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
         start_pose_u_v = f'{start_img_pose_u},{start_img_pose_v}'
         self.get_logger().info(f'[START] Real: {start_pose.pose.position.x},{start_pose.pose.position.y} :: Img: {start_pose_u_v}')
-        self.mp.map_graph.root = start_pose_u_v
+        
+        if start_pose_u_v not in self.mp.map_graph.g:
+            # Find the nearest node on the grid to the bot
+            u0, v0 = int(round(start_img_pose_u)), int(round(start_img_pose_v))
+            found = False
+            max_radius = 25
+
+            for r in range(1, max_radius + 1):
+                for du in range(-r, r + 1):
+                    for dv in range(-r, r + 1):
+                        u, v = u0 + du, v0 + dv
+                        candidate = f"{u},{v}"
+                        if candidate in self.mp.map_graph.g:
+                            start_pose_u_v = candidate
+                            found = True
+                            self.get_logger().warn(f"[START snapped] to nearby node {candidate} at radius {r}")
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+
+            if not found:
+                self.get_logger().error("[START] No nearby node found within search radius!")
+        
         spxy_mp_node = self.mp.map_graph.g[start_pose_u_v]
+        self.mp.map_graph.root = start_pose_u_v
         end_img_pose_u, end_img_pose_v = self.__map_pose_real_to_img(end_pose.pose.position.x, end_pose.pose.position.y)
         end_pose_u_v = f'{end_img_pose_u},{end_img_pose_v}'
         self.get_logger().info(f'[END] Real: {end_pose.pose.position.x},{end_pose.pose.position.y} :: Img: {end_pose_u_v}')
         if end_pose_u_v in self.mp.map_graph.g:
-            self.mp.map_graph.end = end_pose_u_v
             epxy_mp_node = self.mp.map_graph.g[end_pose_u_v]
+            self.mp.map_graph.end = end_pose_u_v
             
             astar_graph = AStar(self.mp.map_graph)
             astar_graph.solve(spxy_mp_node, epxy_mp_node)
