@@ -36,10 +36,13 @@ class Navigation(Node):
         self.goal_updated = False
 
         # ===== Parameters (declare + defaults) =====
-        self.declare_parameter('map_name', 'sync_classroom_map')          # Name of the map to navigate
+        self.declare_parameter('map', 'sync_classroom_map')          # Name of the map to navigate
+        self.declare_parameter('namespace', '')          # Name of the namespace
         self.declare_parameter('kernel_size', 12)          # Size of the kernel, to configure how much you want to inflate map/obstacles
         # ===== Get params =====
-        self.map_name   = str(self.get_parameter('map_name').value)
+        self.map_name   = str(self.get_parameter('map').value).split('/')[-1]
+        if '.' in self.map_name: self.map_name = self.map_name.split('.')[0]
+        self.namespace   = str(self.get_parameter('namespace').value)
         self.kernel_size   = int(self.get_parameter('kernel_size').value)
 
         # speed estimate state
@@ -92,11 +95,11 @@ class Navigation(Node):
 
         # Subscribers
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
-        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
+        self.create_subscription(PoseWithCovarianceStamped, f'{self.namespace}/amcl_pose', self.__ttbot_pose_cbk, 10)
 
         # Publishers
         self.path_pub = self.create_publisher(Path, 'global_plan', 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, f'{self.namespace}/cmd_vel', 10)
         self.calc_time_pub = self.create_publisher(Float32, 'astar_time',10) #DO NOT MODIFY
 
         # Node rate
