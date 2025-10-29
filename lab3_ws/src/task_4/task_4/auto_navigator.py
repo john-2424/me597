@@ -13,7 +13,7 @@ from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovariance, PoseWithCovarianceStamped, Pose, Twist, Point
 from std_msgs.msg import Float32
 
-from task_4 import MapProcessor, AStar, WayPoints, PID
+from task_4 import MapProcessor, AStar, WayPoints, PID, PIDStar
 from task_4.utils.etc import *
 
 class Navigation(Node):
@@ -36,43 +36,79 @@ class Navigation(Node):
         self.goal_updated = False
 
         # ===== Parameters (declare + defaults) =====
-        self.declare_parameter('map_name', 'sync_classroom_map')          # Name of the map to navigate
-        self.declare_parameter('kernel_size', 12)          # Size of the kernel, to configure how much you want to inflate map/obstacles
+        self.declare_parameter('map', 'sync_classroom_map')          # Name of the map to navigate
+        self.declare_parameter('namespace', '')          # Name of the namespace
+        self.declare_parameter('kernel', 16)          # Size of the kernel, to configure how much you want to inflate map/obstacles
         # ===== Get params =====
-        self.map_name   = str(self.get_parameter('map_name').value)
-        self.kernel_size   = int(self.get_parameter('kernel_size').value)
+        self.map_name   = str(self.get_parameter('map').value).split('/')[-1]
+        if '.' in self.map_name: self.map_name = self.map_name.split('.')[0]
+        self.namespace   = str(self.get_parameter('namespace').value)
+        self.kernel_size   = int(self.get_parameter('kernel').value)
 
         # speed estimate state
         self._speed_hist = []  # list of (t, x, y)
-        self._ema_speed = 0.0
+        # self._ema_speed = 0.0
 
-        self.speed_max = 0.5
-        self.speed_min = 0.0 
-        self.heading_max = 1.2
-        self.speed_db  = 0.02
-        self.heading_db  = 0.02
-        self.slow_k = 1.2     # slow down when misaligned
-        self.stop_tol = 0.3  # stop when close to waypoint
-        self.ema_alpha = 0.35 # smoother speed estimate
-        self.yaw_tol = 0.05            # ~3 degrees; stop when aligned
+        self.speed_max = 0.4
+        self.speed_min = 0.1 
+        self.heading_max = 1.0
+        self.heading_max_orient = 0.8
+        # self.speed_max_star = 0.8
+        # self.speed_min_star = 0.2 
+        # self.heading_max_star = 2.0
+        # self.heading_max_orient_star = 1.6
+        # self.speed_db  = 0.02
+        # self.heading_db  = 0.02
+        # self.slow_k = 1.2     # slow down when misaligned
+        self.stop_tol = 0.2  # stop when close to waypoint
+        # self.ema_alpha = 0.35 # smoother speed estimate
+        self.yaw_tol = 0.1            # stop when aligned
         self.last_ctrl_time = None     # for dt in final heading PID
+        self.turn_coeff = 0.20    # coeff to stop bot by zeroing bot vel
+        self.slow_down_dist = 0.50    # Slow down before as dist to goal is less than 0.5 m
 
-        # PIDs (start conservative; tune later)
+        # PIDs
         self.pid_speed = PID(
-            kp=2.0, ki=0.02, kd=0.01, 
+            kp=2.8, ki=0.10, kd=0.25, 
             i_limit=0.8, 
             out_limit=(-self.speed_max, self.speed_max)
         )   # output = linear.x (m/s)
         self.pid_heading = PID(
-            kp=2.0, ki=0.02, kd=0.10, 
+            kp=1.5, ki=0.02, kd=0.24, 
             i_limit=0.8, 
             out_limit=(-self.heading_max, self.heading_max)
         )  # output = angular.z (rad/s)
         self.pid_yaw_final = PID(
-            kp=2.2, ki=0.02, kd=0.10,
-            i_limit=0.6,
-            out_limit=(-self.heading_max, self.heading_max)
+            kp=1.0, ki=0.02, kd=0.24,
+            i_limit=0.8,
+            out_limit=(-self.heading_max_orient, self.heading_max_orient)
         )  # output = angular.z (rad/s)
+
+        # PIDStars
+        # self.pid_speed = PIDStar(
+        #     skp=2.8, ski=0.10, skd=0.25, 
+        #     si_limit=0.8, 
+        #     sout_limit=(-self.speed_max, self.speed_max),
+        #     fkp=5.6, fki=0.20, fkd=0.50, 
+        #     fi_limit=1.6, 
+        #     fout_limit=(-self.speed_max_star, self.speed_max_star)
+        # )   # output = linear.x (m/s)
+        # self.pid_heading = PIDStar(
+        #     skp=1.5, ski=0.02, skd=0.24, 
+        #     si_limit=0.8, 
+        #     sout_limit=(-self.heading_max, self.heading_max),
+        #     fkp=4.5, fki=0.35, fkd=0.75, 
+        #     fi_limit=2.0, 
+        #     fout_limit=(-self.heading_max_star, self.heading_max_star)
+        # )  # output = angular.z (rad/s)
+        # self.pid_yaw_final = PIDStar(
+        #     skp=1.0, ski=0.02, skd=0.24, 
+        #     si_limit=0.8, 
+        #     sout_limit=(-self.heading_max_orient, self.heading_max_orient),
+        #     fkp=3.0, fki=0.35, fkd=0.75, 
+        #     fi_limit=2.0, 
+        #     fout_limit=(-self.heading_max_orient_star, self.heading_max_orient_star)
+        # )  # output = angular.z (rad/s)
 
         # Generate Graph from Map
         map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', self.map_name)
@@ -92,15 +128,15 @@ class Navigation(Node):
 
         # Subscribers
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
-        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
+        self.create_subscription(PoseWithCovarianceStamped, f'{self.namespace}/amcl_pose', self.__ttbot_pose_cbk, 10)
 
         # Publishers
         self.path_pub = self.create_publisher(Path, 'global_plan', 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, f'{self.namespace}/cmd_vel', 10)
         self.calc_time_pub = self.create_publisher(Float32, 'astar_time',10) #DO NOT MODIFY
 
         # Node rate
-        self.rate = self.create_rate(10)
+        # self.rate = self.create_rate(10)
 
     def __goal_pose_cbk(self, data):
         """! Callback to catch the goal pose.
@@ -332,8 +368,9 @@ class Navigation(Node):
         gy = current_goal_pose.pose.position.y
 
         dx, dy = gx - rx, gy - ry
-        dist = sqrt(dx*dx + dy*dy)
-        if dist <= self.stop_tol:
+        dist_from_goal = dist2d((rx, ry), (gx, gy))
+        
+        if self.wps.final_idx and dist_from_goal <= self.stop_tol:
             # reset integrators to avoid "creep"
             self.pid_speed.reset()
             self.pid_heading.reset()
@@ -349,33 +386,56 @@ class Navigation(Node):
         while len(self._speed_hist) > 0 and (now_sec - self._speed_hist[0][0]) > 1.0:
             self._speed_hist.pop(0)
 
-        speed_meas = 0.0
-        if len(self._speed_hist) >= 2:
-            t0, x0, y0 = self._speed_hist[0]
-            dt_hist = max(1e-3, now_sec - t0)
-            speed_raw = dist2d((rx, ry), (x0, y0)) / dt_hist
-            self._ema_speed = self.ema_alpha*speed_raw + (1.0-self.ema_alpha)*self._ema_speed
-            speed_meas = self._ema_speed
-
+        # speed_meas = 0.0
+        # if len(self._speed_hist) >= 2:
+        #     t0, x0, y0 = self._speed_hist[0]
+        #     dt_hist = max(1e-3, now_sec - t0)
+        #     speed_raw = dist2d((rx, ry), (x0, y0)) / dt_hist
+        #     self._ema_speed = self.ema_alpha*speed_raw + (1.0-self.ema_alpha)*self._ema_speed
+        #     speed_meas = self._ema_speed
+        
         # speed setpoint: proportional to distance, reduced when misaligned
-        speed_sp = (dist) / (1.0 + self.slow_k*abs(heading_err))
-        speed_sp = float(np.clip(speed_sp, self.speed_min, self.speed_max))
+        # speed_sp = (dist) / (1.0 + self.slow_k*abs(heading_err))
+        # speed_sp = float(np.clip(speed_sp, self.speed_min, self.speed_max))
 
         # Speed PID tracks speed_sp using measured speed speed_meas.
         # error = speed_sp - speed_meas
+        
         # dt from last control step ~ timer period; here use last two timestamps if possible
         if len(self._speed_hist) >= 2:
             dt = now_sec - self._speed_hist[-2][0]
+            dist = dist2d((self._speed_hist[-2][1], self._speed_hist[-2][2]), (rx, ry))
         else:
             dt = 1.0 / 10.0  # fallback 10 Hz
+            dist = 0  # fallback 0 m
+        
+        if dist_from_goal > self.slow_down_dist: speed_goal = self.speed_max
+        else: speed_goal = self.speed_min
+        # if dist_from_goal > 0.5:
+        #     speed_goal = self.speed_max_star
+        #     mode = 'fast'
+        # else:
+        #     speed_goal = self.speed_min_star
+        #     mode = 'opt'
+        speed_curr = dist/dt
+        speed_err = speed_goal - speed_curr
 
-        speed_out = self.pid_speed.step(speed_sp - speed_meas, dt)
-        heading_out = self.pid_heading.step(heading_err, dt)  # error = 0 - heading_err
+        speed = self.pid_speed.step(speed_err, dt)
+        heading = self.pid_heading.step(heading_err, dt)
+
+        # speed = self.pid_speed.step(speed_err, dt, mode)
+        # heading = self.pid_heading.step(heading_err, dt, mode)
 
         # ---------- saturate for safety ----------
-        speed = float(np.clip(speed_out, -self.speed_max, self.speed_max))
-        heading = float(np.clip(heading_out, -self.heading_max, self.heading_max))
+        # speed = float(np.clip(speed_out, -self.speed_max, self.speed_max))
+        # heading = float(np.clip(heading_out, -self.heading_max, self.heading_max))
 
+        if abs(heading) >= self.turn_coeff*self.heading_max:
+            speed = 0.0
+        
+        # if abs(heading) >= self.turn_coeff*self.heading_max_star:
+        #     speed = 0.0
+        
         # if abs(speed) < self.speed_db: speed = 0.0
         # if abs(heading) < self.heading_db: heading = 0.0
 
