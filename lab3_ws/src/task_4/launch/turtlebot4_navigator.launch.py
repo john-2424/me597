@@ -8,6 +8,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     slam_launch_dir = PathJoinSubstitution([FindPackageShare('turtlebot4_navigation'), 'launch'])
+    rviz_launch_dir = PathJoinSubstitution([FindPackageShare('task_4'), 'launch'])
 
     return LaunchDescription([
         DeclareLaunchArgument('map', default_value='src/task_4/maps/classroom_map.yaml'),
@@ -16,7 +17,10 @@ def generate_launch_description():
         # include SLAM/Localization launch file
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                PathJoinSubstitution([slam_launch_dir, 'localization.launch.py']),
+                PathJoinSubstitution([
+                    slam_launch_dir, 
+                    'localization.launch.py'
+                ]),
             ),
             launch_arguments={
                 'map': LaunchConfiguration('map'),
@@ -27,7 +31,10 @@ def generate_launch_description():
         # Include RViz visualization launch (to view map and robot)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                'view_robot.launch.py'
+                PathJoinSubstitution([
+                    rviz_launch_dir,
+                    'view_robot.launch.py'
+                ])
             ),
             launch_arguments={
                 'map': LaunchConfiguration('map'),
