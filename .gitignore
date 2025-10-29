@@ -177,6 +177,8 @@ cython_debug/
 **/install/*
 **/log/*
 
+/__pycache__/
+
 *.pyc
 
 /lab2_ws/*.csv

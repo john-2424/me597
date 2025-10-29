@@ -52,12 +52,27 @@ class Navigation(Node):
         self.speed_db  = 0.02
         self.heading_db  = 0.02
         self.slow_k = 1.2     # slow down when misaligned
-        self.stop_tol = 0.4  # stop when close to waypoint
+        self.stop_tol = 0.3  # stop when close to waypoint
         self.ema_alpha = 0.35 # smoother speed estimate
+        self.yaw_tol = 0.05            # ~3 degrees; stop when aligned
+        self.last_ctrl_time = None     # for dt in final heading PID
 
         # PIDs (start conservative; tune later)
-        self.pid_speed = PID(kp=1.0, ki=0.2, kd=0.05, i_limit=0.6, out_limit=(-self.speed_max, self.speed_max))   # output = linear.x (m/s)
-        self.pid_heading = PID(kp=2.0, ki=0.0, kd=0.10, i_limit=0.8, out_limit=(-self.heading_max, self.heading_max))  # output = angular.z (rad/s)
+        self.pid_speed = PID(
+            kp=2.0, ki=0.02, kd=0.01, 
+            i_limit=0.8, 
+            out_limit=(-self.speed_max, self.speed_max)
+        )   # output = linear.x (m/s)
+        self.pid_heading = PID(
+            kp=2.0, ki=0.02, kd=0.10, 
+            i_limit=0.8, 
+            out_limit=(-self.heading_max, self.heading_max)
+        )  # output = angular.z (rad/s)
+        self.pid_yaw_final = PID(
+            kp=2.2, ki=0.02, kd=0.10,
+            i_limit=0.6,
+            out_limit=(-self.heading_max, self.heading_max)
+        )  # output = angular.z (rad/s)
 
         # Generate Graph from Map
         map_file_path = os.path.join(os_path(os.path.abspath(__file__)).resolve().parent.parent, 'maps', self.map_name)
@@ -173,14 +188,39 @@ class Navigation(Node):
         start_img_pose_u, start_img_pose_v = self.__map_pose_real_to_img(start_pose.pose.position.x, start_pose.pose.position.y)
         start_pose_u_v = f'{start_img_pose_u},{start_img_pose_v}'
         self.get_logger().info(f'[START] Real: {start_pose.pose.position.x},{start_pose.pose.position.y} :: Img: {start_pose_u_v}')
-        self.mp.map_graph.root = start_pose_u_v
+        
+        if start_pose_u_v not in self.mp.map_graph.g:
+            # Find the nearest node on the grid to the bot
+            u0, v0 = int(round(start_img_pose_u)), int(round(start_img_pose_v))
+            found = False
+            max_radius = 25
+
+            for r in range(1, max_radius + 1):
+                for du in range(-r, r + 1):
+                    for dv in range(-r, r + 1):
+                        u, v = u0 + du, v0 + dv
+                        candidate = f"{u},{v}"
+                        if candidate in self.mp.map_graph.g:
+                            start_pose_u_v = candidate
+                            found = True
+                            self.get_logger().warn(f"[START snapped] to nearby node {candidate} at radius {r}")
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+
+            if not found:
+                self.get_logger().error("[START] No nearby node found within search radius!")
+        
         spxy_mp_node = self.mp.map_graph.g[start_pose_u_v]
+        self.mp.map_graph.root = start_pose_u_v
         end_img_pose_u, end_img_pose_v = self.__map_pose_real_to_img(end_pose.pose.position.x, end_pose.pose.position.y)
         end_pose_u_v = f'{end_img_pose_u},{end_img_pose_v}'
         self.get_logger().info(f'[END] Real: {end_pose.pose.position.x},{end_pose.pose.position.y} :: Img: {end_pose_u_v}')
         if end_pose_u_v in self.mp.map_graph.g:
-            self.mp.map_graph.end = end_pose_u_v
             epxy_mp_node = self.mp.map_graph.g[end_pose_u_v]
+            self.mp.map_graph.end = end_pose_u_v
             
             astar_graph = AStar(self.mp.map_graph)
             astar_graph.solve(spxy_mp_node, epxy_mp_node)
@@ -248,6 +288,31 @@ class Navigation(Node):
 
         # return idx
 
+    def _final_heading_controller(self, vehicle_pose, goal_pose):
+        """Rotate in place to match the goal's yaw. Returns angular.z.
+        Linear.x should be 0 when calling this.
+        """
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        if self.last_ctrl_time is None:
+            dt = 1.0 / 10.0  # same as node rate fallback
+        else:
+            dt = max(1e-3, now_sec - self.last_ctrl_time)
+        self.last_ctrl_time = now_sec
+
+        # Current yaw and target yaw
+        ryaw = yaw_from_quat(vehicle_pose.pose.orientation)
+        gyaw = yaw_from_quat(goal_pose.pose.orientation)
+
+        err = wrap_pi(gyaw - ryaw)
+        if abs(err) < self.yaw_tol:
+            self.pid_yaw_final.reset()
+            return 0.0
+
+        # PID purely on yaw error; only angular.z is commanded at the end
+        ang_out = self.pid_yaw_final.step(err, dt)
+        return float(np.clip(ang_out, -self.heading_max, self.heading_max))
+
     def path_follower(self, vehicle_pose, current_goal_pose):
         """! Path follower.
         @param  vehicle_pose           PoseStamped object containing the current vehicle pose.
@@ -295,9 +360,6 @@ class Navigation(Node):
         # speed setpoint: proportional to distance, reduced when misaligned
         speed_sp = (dist) / (1.0 + self.slow_k*abs(heading_err))
         speed_sp = float(np.clip(speed_sp, self.speed_min, self.speed_max))
-
-        # heading setpoint: we want heading_err → 0 (so setpoint is 0)
-        heading_err_sp = 0.0  # track zero heading error
 
         # Speed PID tracks speed_sp using measured speed speed_meas.
         # error = speed_sp - speed_meas
@@ -367,10 +429,22 @@ class Navigation(Node):
             
             if self.wps is not None and self.path is not None:
                 current_goal = self.path.poses[self.wps.last_idx]
-                # self.get_logger().info(f'Current Goal: {current_goal}')
-                speed, heading = self.path_follower(self.ttbot_pose, current_goal)
-                self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
-                self.move_ttbot(speed, heading)
+
+                if self.wps.final_idx and self.wps.bot_reached(self.ttbot_pose):
+                    orient = self._final_heading_controller(self.ttbot_pose, self.goal_pose)
+                    self.get_logger().info(f'Final Heading/Orientation: {orient}')
+                    self.move_ttbot(0.0, orient)
+
+                    # Full stop
+                    if orient == 0.0:
+                        self.move_ttbot(0.0, 0.0)
+                        self.wps = None
+                        self.get_logger().info(f'You have arrived at your destination!! \nGoal Pose: Position: x -> {self.goal_pose.pose.position.x} ; y -> {self.goal_pose.pose.position.y} ;; Orientation: z -> {self.goal_pose.pose.orientation.z} \nTTBot Pose: Position: x -> {self.ttbot_pose.pose.position.x} ; y -> {self.ttbot_pose.pose.position.y} ;; Orientation: z -> {self.ttbot_pose.pose.orientation.z}')
+                else:
+                    # self.get_logger().info(f'Current Goal: {current_goal}')
+                    speed, heading = self.path_follower(self.ttbot_pose, current_goal)
+                    self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
+                    self.move_ttbot(speed, heading)
 
             # self.rate.sleep()
             # Sleep for the rate to control loop timing

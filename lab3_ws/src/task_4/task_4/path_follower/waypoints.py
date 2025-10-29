@@ -229,7 +229,7 @@ class WayPoints():
         # print(np.any(dists <= tol))
         return np.any(dists <= tol)
 
-    def bot_reached(self, bot_pose, tol=0.4):
+    def bot_reached(self, bot_pose, tol=0.3):
         """
         Check if the robot has reached the waypoint at index `idx`
         within a given Euclidean distance tolerance.
