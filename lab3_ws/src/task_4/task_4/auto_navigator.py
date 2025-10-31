@@ -38,7 +38,7 @@ class Navigation(Node):
         # ===== Parameters (declare + defaults) =====
         self.declare_parameter('map', 'sync_classroom_map')          # Name of the map to navigate
         self.declare_parameter('namespace', '')          # Name of the namespace
-        self.declare_parameter('kernel', 8)          # Size of the kernel, to configure how much you want to inflate map/obstacles
+        self.declare_parameter('kernel', 10)          # Size of the kernel, to configure how much you want to inflate map/obstacles
         # ===== Get params =====
         self.map_name   = str(self.get_parameter('map').value).split('/')[-1]
         if '.' in self.map_name: self.map_name = self.map_name.split('.')[0]
@@ -49,7 +49,7 @@ class Navigation(Node):
         self._speed_hist = []  # list of (t, x, y)
         # self._ema_speed = 0.0
 
-        self.speed_max = 0.4
+        self.speed_max = 0.35
         self.speed_min = 0.1 
         self.heading_max = 1.0
         self.heading_max_orient = 0.8
