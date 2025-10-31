@@ -49,7 +49,7 @@ class Navigation(Node):
         self._speed_hist = []  # list of (t, x, y)
         # self._ema_speed = 0.0
 
-        self.speed_max = 0.35
+        self.speed_max = 0.20
         self.speed_min = 0.1 
         self.heading_max = 1.0
         self.heading_max_orient = 0.8
@@ -64,7 +64,7 @@ class Navigation(Node):
         # self.ema_alpha = 0.35 # smoother speed estimate
         self.yaw_tol = 0.1            # stop when aligned
         self.last_ctrl_time = None     # for dt in final heading PID
-        self.turn_coeff = 0.20    # coeff to stop bot by zeroing bot vel
+        self.turn_coeff = 1.0    # 0.20 coeff to stop bot by zeroing bot vel, 1 to ignore this logic
         self.slow_down_dist = 0.50    # Slow down before as dist to goal is less than 0.5 m
 
         # PIDs
@@ -74,7 +74,7 @@ class Navigation(Node):
             out_limit=(-self.speed_max, self.speed_max)
         )   # output = linear.x (m/s)
         self.pid_heading = PID(
-            kp=1.5, ki=0.02, kd=0.24, 
+            kp=2.0, ki=0.02, kd=0.24, 
             i_limit=0.8, 
             out_limit=(-self.heading_max, self.heading_max)
         )  # output = angular.z (rad/s)
@@ -430,7 +430,7 @@ class Navigation(Node):
         # speed = float(np.clip(speed_out, -self.speed_max, self.speed_max))
         # heading = float(np.clip(heading_out, -self.heading_max, self.heading_max))
 
-        if abs(heading) >= self.turn_coeff*self.heading_max:
+        if abs(heading) > self.turn_coeff*self.heading_max:
             speed = 0.0
         
         # if abs(heading) >= self.turn_coeff*self.heading_max_star:
