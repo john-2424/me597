@@ -38,7 +38,7 @@ class Navigation(Node):
         # ===== Parameters (declare + defaults) =====
         self.declare_parameter('map', 'sync_classroom_map')          # Name of the map to navigate
         self.declare_parameter('namespace', '')          # Name of the namespace
-        self.declare_parameter('kernel', 16)          # Size of the kernel, to configure how much you want to inflate map/obstacles
+        self.declare_parameter('kernel', 8)          # Size of the kernel, to configure how much you want to inflate map/obstacles
         # ===== Get params =====
         self.map_name   = str(self.get_parameter('map').value).split('/')[-1]
         if '.' in self.map_name: self.map_name = self.map_name.split('.')[0]
