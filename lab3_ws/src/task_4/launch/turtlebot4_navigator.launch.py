@@ -13,7 +13,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('map', default_value='src/task_4/maps/classroom_map.yaml'),
         DeclareLaunchArgument('namespace', default_value='/robot'),
-        DeclareLaunchArgument('kernel', default_value='16'),
+        DeclareLaunchArgument('kernel', default_value='10'),
 
         # include SLAM/Localization launch file
         IncludeLaunchDescription(
