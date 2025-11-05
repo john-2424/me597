@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'image_publisher = task_5.image_publisher:main'
+            'object_detector = task_5.object_detector:main'
         ],
     },
 )

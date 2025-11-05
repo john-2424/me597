@@ -19,7 +19,7 @@ class ImagePublisher(Node):
         self.publisher_ = self.create_publisher(Image, 'video_data', 20)
         
         # Topic timer to publish messages in an interval
-        timer_period = 0.05  # in seconds
+        timer_period = 0.5  # in seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
         # Bridge to convert image type between CV and ROS
@@ -32,7 +32,7 @@ class ImagePublisher(Node):
         self.vid = Video(video_file_path)
 
         # Parameter to show video in this node
-        self.show_video = True
+        self.show_video = False
 
     def timer_callback(self):
         try:
@@ -57,7 +57,7 @@ class ImagePublisher(Node):
             self.get_logger().info('End of video stream!')
     
     def __del__(self):
-        if self.vid:
+        if self.vid is not None:
             self.vid.release()
 
 
