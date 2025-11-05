@@ -12,6 +12,11 @@ class PID:
         self.i = 0.0
         self.prev_e = 0.0
         self.first = True
+    
+    def is_reset(self):
+        if self.i == 0.0 and self.prev_e == 0.0 and self.first:
+            return True
+        return False
 
     def step(self, e, dt):
         if dt <= 0.0:

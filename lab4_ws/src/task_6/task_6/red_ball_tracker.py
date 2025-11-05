@@ -41,31 +41,33 @@ class RedBallTracker(Node):
 
         # Tracking Reference params
         self.speed_reference = None
-        self.speed_tol = None
-        # self.speed_err_max = None
-        # self.speed_err_min = None
+        self.speed_tol = 1
         self.heading_reference = None
-        self.heading_tol = None
-        # self.heading_err_max = None
-        # self.heading_err_min = None
-        self.alpha = 0.3  # error scale down factor
+        self.heading_tol = 1
+        self.prev_speed = 0.0
+        self.prev_heading = 0.0
 
         # PID parameters
         self.prev_sec = None
         self.speed_max = 0.20
         self.heading_max = 1.0
         self.turn_coeff = 1.0    # 0.20 coeff to stop bot by zeroing bot vel, 1.0 to ignore this logic
+        self.speed_db   = 0.05      # ~5% size error
+        self.heading_db = 0.02      # ~2% of half-frame
+        self.max_speed_slew   = 0.05     # m/s per cycle
+        self.max_heading_slew = 0.20     # rad/s per cycle
         # PIDs for speed and yaw
+        # normalized-error tuning (err in [-1,1])
         self.pid_speed = PID(
-            kp=0.20, ki=0.01, kd=0.50, 
-            i_limit=0.8, 
+            kp=0.18, ki=0.03, kd=0.08,
+            i_limit=0.8,
             out_limit=(-self.speed_max, self.speed_max)
-        )   # output = linear.x (m/s)
+        )
         self.pid_heading = PID(
-            kp=0.20, ki=0.01, kd=0.50, 
-            i_limit=0.8, 
+            kp=1.00, ki=0.02, kd=0.25,
+            i_limit=0.8,
             out_limit=(-self.heading_max, self.heading_max)
-        )  # output = angular.z (rad/s)
+        )
 
         # Command Velocity Publisher
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -75,41 +77,44 @@ class RedBallTracker(Node):
             return find_object_hsv_triangle(frame)
         return find_object_hsv(frame)
     
-    def __scale_value(self, x, min1, max1, min2, max2):
-        return min2 + ( (x - min1) / (max1 - min1) ) * (max2 - min2)
-    
     def _plan(self, cx, bw, bh):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        dt = now_sec - self.prev_sec if self.prev_sec is not None else 0
+        dt = now_sec - self.prev_sec if self.prev_sec is not None else 1.0 / 10.0
         self.prev_sec = now_sec
 
         speed = 0.0
-        heading = 0.0
-
-        # reset integrators to avoid "creep"
-        # self.pid_speed.reset()
-        # self.pid_heading.reset()
-        # return 0.0, 0.0
-
-        speed_curr = 0.5 * bw + 0.5 * bh
-        speed_err = self.alpha * (self.speed_reference - speed_curr)
-        # speed_err = self.__scale_value(speed_err, self.speed_err_min, self.speed_err_max, -1*self.speed_max, self.speed_max)
+        heading = 0.0        
+            
+        # speed_curr = 0.5 * bw + 0.5 * bh
+        speed_curr = bw
+        speed_err = (self.speed_reference - speed_curr) / max(self.speed_reference, 1e-6)
+        speed_err = max(-1.5, min(1.5, speed_err))  # clamp outliers
+        self.get_logger().info(f'[Speed] Ref: {self.speed_reference}; Curr: {speed_curr}; Err: {speed_err}')
 
         heading_curr = cx
-        heading_err = self.alpha * (heading_curr - self.heading_reference)
-        # heading_err = self.__scale_value(heading_err, self.heading_err_min, self.heading_err_max, -1*self.heading_max, self.heading_max)
+        heading_err = (self.heading_reference - heading_curr) / max(heading_curr, 1e-6)
+        heading_err = max(-1.5, min(1.5, heading_err))
+        self.get_logger().info(f'[Heading] Ref: {self.heading_reference}; Curr: {heading_curr}; Err: {heading_err}')
 
         speed = self.pid_speed.step(speed_err, dt)
         heading = self.pid_heading.step(heading_err, dt)
 
+        # deadbands (on normalized error)
+        if abs(speed_err) < self.speed_db: speed = 0.0
+        if abs(heading_err) < self.heading_db: heading = 0.0
+        
         if abs(heading) > self.turn_coeff*self.heading_max:
             speed = 0.0
         
-        if abs(speed_err)  < self.speed_tol: speed = 0.0
-        if abs(heading_err) < self.heading_tol: heading = 0.0
+        # slew-rate limit commands
+        def slew(prev, new, max_delta):
+            delta = max(-max_delta, min(max_delta, new - prev))
+            return prev + delta
 
-        if abs(speed) < 1e-2: speed = 0.0
-        if abs(heading) < 1e-3: heading = 0.0
+        speed   = slew(self.prev_speed,   speed,   self.max_speed_slew)
+        heading = slew(self.prev_heading, heading, self.max_heading_slew)
+
+        self.prev_speed, self.prev_heading = speed, heading
 
         return speed, heading
 
@@ -130,13 +135,15 @@ class RedBallTracker(Node):
 
         if self.first_frame:
             self.frame_height, self.frame_width = frame.shape[:2]
-            self.speed_reference = 0.5 * 0.3 * self.frame_width + 0.5 * 0.3 * self.frame_height
+            # self.speed_reference = 0.5 * 0.3 * self.frame_width + 0.5 * 0.3 * self.frame_height
+            self.speed_reference = 0.08 * self.frame_width
             self.heading_reference = 0.5 * self.frame_width
             # self.speed_err_min = self.speed_reference - (0.5 * self.frame_width + 0.5 * self.frame_height)
             # self.speed_err_max = self.speed_reference - 0
             # self.heading_err_min = self.heading_reference - self.frame_width
             # self.heading_err_max = self.heading_reference - 0
             self.first_frame = False
+            self.get_logger().info('Frame Parameters are set!')
 
         result = self._detect(frame)
         if result is not None:
@@ -151,10 +158,15 @@ class RedBallTracker(Node):
             speed, heading = self._plan(cx, bw, bh)
         else:
             speed, heading = 0.0, 0.0
-            self.pid_speed.reset()
-            self.pid_heading.reset()
+            if not self.pid_speed.is_reset():
+                self.pid_speed.reset()
+                self.get_logger().info(f'Speed PID Reset!')
+            if not self.pid_heading.is_reset():
+                self.pid_heading.reset()
+                self.get_logger().info(f'Heading PID Reset!')
 
-        self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
+        if self.prev_speed != speed and self.prev_heading != heading:
+            self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
         self._follow(speed, heading)
 
         # Show or display frames on a window

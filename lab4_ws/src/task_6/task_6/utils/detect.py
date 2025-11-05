@@ -1,11 +1,11 @@
 import cv2 as cv
 import numpy as np
 
-LOWER_RED_1 = np.array([0,   90,  80], dtype=np.uint8)
-UPPER_RED_1 = np.array([10, 255, 255], dtype=np.uint8)
-LOWER_RED_2 = np.array([170, 90,  80], dtype=np.uint8)
-UPPER_RED_2 = np.array([180,255, 255], dtype=np.uint8)
-K = 5  # morphology kernel
+LOWER_RED_1 = np.array([0,   120, 90 ], dtype=np.uint8)
+UPPER_RED_1 = np.array([10,  255, 255], dtype=np.uint8)
+LOWER_RED_2 = np.array([170, 120, 90 ], dtype=np.uint8)
+UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
+K = 5
 
 
 def _red_mask_hsv(frame_bgr):
