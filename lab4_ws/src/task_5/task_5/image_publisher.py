@@ -19,15 +19,16 @@ class ImagePublisher(Node):
         self.publisher_ = self.create_publisher(Image, 'video_data', 20)
         
         # Topic timer to publish messages in an interval
-        timer_period = 0.05  # in seconds, for 20Hz
+        timer_period = 0.05  # in seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
         # Bridge to convert image type between CV and ROS
         self.bridge = CvBridge()
 
         # Reading a video using open cv
-        pkg_share = get_package_share_directory('my_package')
-        video_file_path = os.path.join(pkg_share, 'resource', 'lab4_video.avi')
+        self.vid = None
+        pkg_share_path = get_package_share_directory('task_5')
+        video_file_path = os.path.join(pkg_share_path, 'Resources', 'lab4_video.avi')
         self.vid = Video(video_file_path)
 
         # Parameter to show video in this node
@@ -37,7 +38,7 @@ class ImagePublisher(Node):
         try:
             # Get next frame to publish
             frame = next(self.vid)
-            frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            # frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
             
             # Show or display frames on a window
             if self.show_video:
@@ -47,15 +48,17 @@ class ImagePublisher(Node):
                     cv.destroyAllWindows()
             
             # Create and assign 'Image' message object by converting CV image to ROS image
-            msg = self.bridge.cv2_to_imgmsg(frame)
+            msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            # self.get_logger().info(f'Message Type: {type(msg)}')
             
             # Publish message to the topic
             self.publisher_.publish(msg)
         except StopIteration:
-            self.get_logger.info('End of video stream.')
+            self.get_logger().info('End of video stream!')
     
     def __del__(self):
-        self.vid.release()
+        if self.vid:
+            self.vid.release()
 
 
 def main(args=None):
