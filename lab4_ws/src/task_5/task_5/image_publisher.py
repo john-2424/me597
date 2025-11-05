@@ -19,7 +19,7 @@ class ImagePublisher(Node):
         self.publisher_ = self.create_publisher(Image, 'video_data', 20)
         
         # Topic timer to publish messages in an interval
-        timer_period = 0.5  # in seconds
+        timer_period = 0.1  # in seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
         # Bridge to convert image type between CV and ROS
@@ -42,7 +42,7 @@ class ImagePublisher(Node):
             
             # Show or display frames on a window
             if self.show_video:
-                cv.imshow('Frame', frame)
+                cv.imshow('Image Publisher: Frame', frame)
                 if cv.waitKey(1) & 0xFF == ord('q'):
                     self.show_video = False
                     cv.destroyAllWindows()

@@ -1,4 +1,5 @@
 import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'task_5'
@@ -11,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*')),
         (os.path.join('share', package_name, 'Resources'), ['Resources/lab4_video.avi']),
     ],
     install_requires=['setuptools'],
@@ -22,7 +24,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'image_publisher = task_5.image_publisher:main'
+            'image_publisher = task_5.image_publisher:main',
             'object_detector = task_5.object_detector:main'
         ],
     },
