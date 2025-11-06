@@ -1,19 +1,23 @@
 import cv2 as cv
 import numpy as np
 
-LOWER_RED_1 = np.array([0,   120, 90 ], dtype=np.uint8)
-UPPER_RED_1 = np.array([10,  255, 255], dtype=np.uint8)
-LOWER_RED_2 = np.array([170, 120, 90 ], dtype=np.uint8)
+LOWER_RED_1 = np.array([0,   160, 130], dtype=np.uint8)
+UPPER_RED_1 = np.array([8,   255, 255], dtype=np.uint8)
+LOWER_RED_2 = np.array([172, 160, 130], dtype=np.uint8)
 UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
-K = 5
+K = 7
 
 
 def _red_mask_hsv(frame_bgr):
     hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
-    m1  = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
-    m2  = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    hsv[...,2] = np.clip(hsv[...,2], 30, 245)
+
+    m1 = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    m2 = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask = cv.bitwise_or(m1, m2)
-    kernel = np.ones((K, K), np.uint8)
+
+    mask = cv.medianBlur(mask, 5)
+    kernel = np.ones((3,3), np.uint8)  # 3x3, not 7x7
     mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  kernel)
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
     return mask

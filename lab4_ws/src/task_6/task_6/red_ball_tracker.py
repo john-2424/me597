@@ -46,7 +46,9 @@ class RedBallTracker(Node):
         self.heading_tol = 1
         self.prev_speed = 0.0
         self.prev_heading = 0.0
-
+        self.log_prev_speed = 0.0
+        self.log_prev_heading = 0.0
+        
         # PID parameters
         self.prev_sec = None
         self.speed_max = 0.20
@@ -138,10 +140,6 @@ class RedBallTracker(Node):
             # self.speed_reference = 0.5 * 0.3 * self.frame_width + 0.5 * 0.3 * self.frame_height
             self.speed_reference = 0.08 * self.frame_width
             self.heading_reference = 0.5 * self.frame_width
-            # self.speed_err_min = self.speed_reference - (0.5 * self.frame_width + 0.5 * self.frame_height)
-            # self.speed_err_max = self.speed_reference - 0
-            # self.heading_err_min = self.heading_reference - self.frame_width
-            # self.heading_err_max = self.heading_reference - 0
             self.first_frame = False
             self.get_logger().info('Frame Parameters are set!')
 
@@ -149,7 +147,7 @@ class RedBallTracker(Node):
         if result is not None:
             cx, cy, w, h, (x, y, bw, bh) = result
             # Logging pixels from top-left origin
-            self.get_logger().info(f'centroid=({cx:.1f},{cy:.1f}) size=({w:.0f},{h:.0f})')
+            self.get_logger().info(f'[Object - Red Ball] centroid=({cx:.1f},{cy:.1f}) size=({w:.0f},{h:.0f})')
 
             # Draw bbox + centroid
             cv.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
@@ -165,8 +163,10 @@ class RedBallTracker(Node):
                 self.pid_heading.reset()
                 self.get_logger().info(f'Heading PID Reset!')
 
-        if self.prev_speed != speed and self.prev_heading != heading:
-            self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
+        if self.log_prev_speed != speed and self.log_prev_heading != heading:
+            self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
+            self.log_prev_speed, self.log_prev_heading = speed, heading
+        
         self._follow(speed, heading)
 
         # Show or display frames on a window
