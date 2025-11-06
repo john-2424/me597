@@ -1,26 +1,41 @@
 import cv2 as cv
 import numpy as np
 
-LOWER_RED_1 = np.array([0,   140, 110], dtype=np.uint8)
-UPPER_RED_1 = np.array([10,  255, 255], dtype=np.uint8)
-LOWER_RED_2 = np.array([170, 140, 110], dtype=np.uint8)
+LOWER_RED_1 = np.array([0,   160, 130], dtype=np.uint8)
+UPPER_RED_1 = np.array([8,   255, 255], dtype=np.uint8)
+LOWER_RED_2 = np.array([172, 160, 130], dtype=np.uint8)
 UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
-K = 5
+K = 7
+
+
+# def _red_mask_hsv(frame_bgr):
+#     hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
+
+#     # suppress very dark or very bright highlights in V before thresholding
+#     v = hsv[...,2]
+#     v = np.clip(v, 30, 245)
+#     hsv[...,2] = v
+
+#     m1  = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+#     m2  = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+#     mask = cv.bitwise_or(m1, m2)
+#     mask = cv.medianBlur(mask, 5)  # smooth fine brick texture; keeps ball
+
+#     kernel = np.ones((K, K), np.uint8)
+#     mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  kernel)
+#     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
+#     return mask
 
 def _red_mask_hsv(frame_bgr):
     hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
+    hsv[...,2] = np.clip(hsv[...,2], 30, 245)
 
-    # suppress very dark or very bright highlights in V before thresholding
-    v = hsv[...,2]
-    v = np.clip(v, 30, 245)
-    hsv[...,2] = v
-
-    m1  = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
-    m2  = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    m1 = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    m2 = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask = cv.bitwise_or(m1, m2)
-    mask = cv.medianBlur(mask, 5)  # smooth fine brick texture; keeps ball
 
-    kernel = np.ones((K, K), np.uint8)
+    mask = cv.medianBlur(mask, 5)
+    kernel = np.ones((3,3), np.uint8)  # 3x3, not 7x7
     mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  kernel)
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
     return mask
@@ -54,74 +69,98 @@ def find_object_hsv_triangle(frame_bgr, tri_tol=0.04):
             return (cx, cy, w, h, (x, y, w, h))
     return None
 
-def find_object_hsv_circle(frame_bgr, circ_tol=0.85, ar_tol=0.15):
+def find_object_hsv_circle(frame_bgr,
+                           circ_tol=0.72,     # was 0.86
+                           ar_tol=0.28,       # was 0.18
+                           min_px=200,        # was 600
+                           fill_tol=0.25,     # was 0.16
+                           s_min=120, v_min=90):  # was 170,150
     """
-    HSV + strong circularity gating:
-      - circularity >= circ_tol
-      - aspect ratio ~ 1 (|ar-1| <= ar_tol)
-      - high solidity (compact, no gaps)
-      - extent (area / bbox area) reasonably high
-      - radial std/mean small (uniform radius)
-      - size within a sane band relative to image
-    Returns (cx, cy, w, h, (x,y,w,h)) or None
+    HSV + “must be circle”: returns (cx, cy, w, h, (x,y,w,h)) or None
     """
-    mask = _red_mask_hsv(frame_bgr)
+    hsv  = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
+
+    # tame highlights & deep shadows to stabilize thresholding (you had this in _red_mask_hsv)
+    v = hsv[..., 2]
+    v = np.clip(v, 30, 245)
+    hsv[..., 2] = v
+
+    m1   = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    m2   = cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    mask = cv.bitwise_or(m1, m2)
+
+    # smooth speckle before morphology (you did this in the HSV-only path)
+    mask = cv.medianBlur(mask, 5)
+
+    kernel = np.ones((5, 5), np.uint8)  # was K=7 → less erosion of small balls
+    mask   = cv.morphologyEx(mask, cv.MORPH_OPEN,  kernel)
+    mask   = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
+
     cnts = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)[0]
     if not cnts:
         return None
 
-    H, W = frame_bgr.shape[:2]
-    img_area = float(W * H)
-    # size band: ignore tiny specks and huge walls
-    min_area = 0.0003 * img_area     # ~0.03% of frame
-    max_area = 0.06   * img_area     # ~6% of frame
+    def red_hue_score(h):
+        # allow wider hue tolerance; wrap-around safe
+        h = h.astype(np.float32)
+        return np.minimum(np.minimum(np.abs(h - 0), np.abs(h - 180)), np.abs(h - 179))
 
     best = None
-    best_score = -1.0
+    best_area = 0
 
     for c in sorted(cnts, key=cv.contourArea, reverse=True):
         area = cv.contourArea(c)
-        if area < min_area or area > max_area:
+        if area < min_px:
             continue
-
-        hull = cv.convexHull(c)
-        hull_area = cv.contourArea(hull) or 1.0
-        solidity = area / hull_area           # circles ~1.0
-
-        peri = cv.arcLength(c, True) or 1.0
-        circularity = 4.0 * np.pi * area / (peri * peri)
 
         x, y, w, h = cv.boundingRect(c)
-        ar = w / float(h) if h > 0 else 0.0
-        extent = area / float(w * h)          # circles ~π/4 ≈ 0.785
-
-        # radial-uniformity: distances from centroid should be consistent
-        M = cv.moments(c)
-        if M["m00"] == 0:
+        if h <= 0:
             continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        pts = c.reshape(-1, 2)
-        r = np.linalg.norm(pts - np.array([cx, cy]), axis=1)
-        r_mean = np.mean(r)
-        r_nstd = (np.std(r) / (r_mean + 1e-6))   # lower is more circle-like
-
-        # hard gates
-        if circularity < circ_tol:             # very round only
-            continue
-        if abs(ar - 1.0) > ar_tol:             # not square-ish -> reject
-            continue
-        if solidity < 0.92:                    # fill must be compact
-            continue
-        if extent < 0.60:                      # reject long rectangles/grids
-            continue
-        if r_nstd > 0.20:                      # radius must be uniform
+        ar = w / float(h)
+        if abs(ar - 1.0) > ar_tol:
             continue
 
-        # score & keep best (more round + compact)
-        score = (circularity * 0.5) + (solidity * 0.3) + (extent * 0.2)
-        if score > best_score:
-            best_score = score
+        peri = cv.arcLength(c, True)
+        if peri <= 0:
+            continue
+
+        # (1) circularity
+        circularity = 4.0 * np.pi * area / (peri * peri)
+        if circularity < circ_tol:
+            continue
+
+        # (2) bbox fill ~ π/4 for a circle; give more slack
+        fill = area / float(w * h)
+        if abs(fill - (np.pi / 4.0)) > fill_tol:
+            continue
+
+        # (3) convexity — use the raw contour; approx can introduce artifacts
+        if not cv.isContourConvex(c):
+            # optional: allow slight non-convexity if circularity is strong
+            if circularity < (circ_tol + 0.05):
+                continue
+
+        # (4) color quality (relaxed)
+        mask_roi = mask[y:y+h, x:x+w]
+        if mask_roi.size == 0:
+            continue
+        hsv_roi  = hsv[y:y+h, x:x+w]
+        sel      = mask_roi > 0
+        if sel.sum() == 0:
+            continue
+
+        mean_s = float(np.mean(hsv_roi[..., 1][sel]))
+        mean_v = float(np.mean(hsv_roi[..., 2][sel]))
+        if mean_s < s_min or mean_v < v_min:
+            continue
+
+        # allow wider hue error (lighting shifts, camera WB)
+        if float(np.mean(red_hue_score(hsv_roi[..., 0][sel]))) > 12:  # was 6
+            continue
+
+        if area > best_area:
+            cx, cy = x + w / 2.0, y + h / 2.0
             best = (cx, cy, w, h, (x, y, w, h))
+            best_area = area
 
     return best

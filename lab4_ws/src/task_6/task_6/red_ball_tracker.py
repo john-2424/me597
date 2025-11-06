@@ -10,7 +10,7 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
-from task_6.utils.detect import find_object_hsv, find_object_hsv_triangle, find_object_hsv_circle
+from task_6.utils.detect import find_object_hsv, find_object_hsv_triangle, find_object_hsv_circle, LOWER_RED_1, LOWER_RED_2, UPPER_RED_1, UPPER_RED_2
 from task_6.utils.pid import PID
 
 
@@ -35,11 +35,11 @@ class RedBallTracker(Node):
         self.show_video = True
 
         # Mode of detection
-        self.mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
+        self.detector_mode = 'hsv'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
         self.declare_parameter('controller', 'pid')     # 'pid' or 'stanley'
-        self.declare_parameter('search_mode', 'hybrid')   # 'none', 'spiral', or 'hybrid'
+        self.declare_parameter('search_mode', 'none')   # 'none', 'spiral', or 'hybrid'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
 
@@ -111,17 +111,17 @@ class RedBallTracker(Node):
         self.heading_hist_len = 6
 
         # ISP sweep accumulators
-        self.isp_bins        = 30        # number of yaw bins per 360° sweep
-        self.isp_bin_time    = 0.25      # seconds spent in each yaw bin
-        self.isp_peak_ratio  = 1.5       # (peak / median) threshold for red likelihood
+        self.isp_bins        = 24        # number of yaw bins per 360° sweep
+        self.isp_bin_time    = 0.22      # seconds spent in each yaw bin
+        self.isp_peak_ratio  = 1.2       # (peak / median) threshold for red likelihood
         self.isp_scores = np.zeros(self.isp_bins, dtype=np.float32)
         self.isp_elapsed = 0.0
         self.isp_active = False
 
         # Door/gap thresholds
-        self.door_min_width_m = 1.0      # minimum door opening width (meters)
-        self.door_min_depth_m = 1.8      # must be this deep to be considered a doorway
-        self.gap_min_width_m  = 1.2      # minimum gap for a valid vantage hop (meters)
+        self.door_min_width_m = 0.7      # minimum door opening width (meters)
+        self.door_min_depth_m = 1.2      # must be this deep to be considered a doorway
+        self.gap_min_width_m  = 0.6      # minimum gap for a valid vantage hop (meters)
         self.hop_distance_m   = 1.7      # forward distance per gap hop (meters)
 
         # PTS-mini
@@ -138,24 +138,21 @@ class RedBallTracker(Node):
 
     def _red_likelihood(self, frame):
         hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        # simple red mask (safe defaults)
-        lower1 = np.array([0,  90,  80], np.uint8)
-        upper1 = np.array([10, 255, 255], np.uint8)
-        lower2 = np.array([170, 90,  80], np.uint8)
-        upper2 = np.array([180,255, 255], np.uint8)
-        m = cv.inRange(hsv, lower1, upper1) | cv.inRange(hsv, lower2, upper2)
+        # simple red mask
+        m = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1) | cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
         return float(cv.countNonZero(m)) / float(m.size)  # fraction in [0,1]
 
     def _scan_gaps(self, width_m):
-        """Return list of (angle_rad, gap_width_m) for gaps >= width_m."""
         if self.scan is None: return []
         r = np.array(self.scan.ranges, dtype=np.float32)
         ang0 = self.scan.angle_min
         dang = self.scan.angle_increment
-        # consider rays that are 'open' (valid & far)
         valid = np.isfinite(r)
-        far = r > self.door_min_depth_m
-        open_mask = valid & far
+
+        # Consider “open” if valid and not too close; use 1.0 m as a softer floor
+        farish = r > 1.0
+        open_mask = valid & farish
+
         gaps = []
         i = 0
         while i < len(open_mask):
@@ -163,17 +160,23 @@ class RedBallTracker(Node):
                 j = i
                 while j < len(open_mask) and open_mask[j]:
                     j += 1
-                # width at the sensor = arc length ~ min(range) * angular span
-                span = (j - i) * dang
-                depth = np.nanmin(r[i:j]) if np.any(valid[i:j]) else self.door_min_depth_m
-                gap_width = depth * span  # crude but works indoors
+
+                seg = r[i:j][np.isfinite(r[i:j])]
+                if seg.size == 0:
+                    i = j
+                    continue
+
+                depth = float(np.quantile(seg, 0.3))  # robust depth
+                span  = (j - i) * dang
+                gap_width = depth * span
+
                 if gap_width >= width_m:
                     ang_center = ang0 + (i + j - 1) * 0.5 * dang
                     gaps.append((ang_center, gap_width))
                 i = j
             else:
                 i += 1
-        # sort widest-first
+
         gaps.sort(key=lambda t: t[1], reverse=True)
         return gaps
 
@@ -196,7 +199,7 @@ class RedBallTracker(Node):
             self.isp_active = True
 
         # rotate slowly and accumulate red score into current bin
-        omega_cmd = 0.4   # rad/s sweep
+        omega_cmd = 0.3   # rad/s sweep
         v_cmd     = 0.0
 
         # which bin are we in?
@@ -216,13 +219,14 @@ class RedBallTracker(Node):
         return v_cmd, omega_cmd, done
 
     def _isp_pick_heading(self):
-        if np.all(self.isp_scores == 0):
-            return None
-        med = np.median(self.isp_scores[self.isp_scores > 0]) if np.any(self.isp_scores > 0) else 0.0
-        peak_idx = int(np.argmax(self.isp_scores))
-        peak = float(self.isp_scores[peak_idx])
-        if med == 0.0 or (peak / max(med, 1e-6)) >= self.isp_peak_ratio:
-            # convert bin -> heading in robot frame (sweep CCW from 0 rad)
+        s = self.isp_scores
+        if np.all(s == 0): return None
+        total = float(np.sum(s))
+        med = float(np.median(s[s > 0])) if np.any(s > 0) else 0.0
+        peak_idx = int(np.argmax(s)); peak = float(s[peak_idx])
+
+        # accept if clearly above background OR if overall red is significant
+        if (med == 0.0) or (peak / max(med, 1e-6) >= self.isp_peak_ratio) or (total >= 0.10 * self.isp_bins):
             theta = (peak_idx / self.isp_bins) * 2*np.pi - np.pi
             return theta
         return None
@@ -253,10 +257,15 @@ class RedBallTracker(Node):
         return v, omega, done
 
     def _enter_search(self):
-        # first try doorway/opening; if none, go directly to GVH
-        self.mode = 'DOD'
-        self.search_phase = 0.0
-        self.isp_active = False
+        if self.scan is None:
+            # No scan → start with spiral, not DOD
+            self.mode = 'PTS'   # or a small spiral routine
+            self.search_phase = 0.0
+            self.isp_active = False
+        else:
+            self.mode = 'DOD'
+            self.search_phase = 0.0
+            self.isp_active = False
 
     def _search_step(self, frame, dt):
         # DOD → GVH → ISP → PTS → (repeat or stop)
@@ -307,7 +316,7 @@ class RedBallTracker(Node):
                     # bias toward that heading for a short commit
                     self.mode = 'GVH'
                     self.search_phase = 0.0
-                    return 0.10, np.sign(theta)*0.4
+                    return 0.12, np.sign(theta)*0.35
                 # nothing promising → PTS
                 self.mode = 'PTS'
                 self.search_phase = 0.0
@@ -325,9 +334,9 @@ class RedBallTracker(Node):
         return 0.0, 0.0
 
     def _detect(self, frame):
-        if self.mode == 'hsv_circle':
+        if self.detector_mode == 'hsv_circle':
             return find_object_hsv_circle(frame)
-        if self.mode == 'hsv_triangle':
+        if self.detector_mode == 'hsv_triangle':
             return find_object_hsv_triangle(frame)
         return find_object_hsv(frame)
     
@@ -515,6 +524,7 @@ class RedBallTracker(Node):
 
         result = self._detect(frame)
         if result is not None:
+            self.get_logger().info('Red Ball Detected!')
             cx, cy, w, h, (x, y, bw, bh) = result
             # Logging pixels from top-left origin
             self.get_logger().info(f'centroid=({cx:.1f},{cy:.1f}) size=({w:.0f},{h:.0f})')
@@ -532,13 +542,16 @@ class RedBallTracker(Node):
 
             speed, heading = self._plan(cx, bw, bh, dt)
         else:
+            self.get_logger().info('No Red Ball Detected!')
             # Lost target
             if self.controller == 'pid':
                 if not self.pid_speed.is_reset():
                     self.pid_speed.reset()
+                    self.prev_speed = 0.0
                     self.get_logger().info('Speed PID Reset!')
                 if not self.pid_heading.is_reset():
                     self.pid_heading.reset()
+                    self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
 
             if self.search_mode == 'spiral':
@@ -553,8 +566,7 @@ class RedBallTracker(Node):
                 self.mode = 'TRACKING'
                 speed, heading = 0.0, 0.0
 
-        if self.prev_speed != speed and self.prev_heading != heading:
-            self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
+        self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
         
         self._follow(speed, heading)
 
