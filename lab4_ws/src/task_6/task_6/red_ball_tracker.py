@@ -55,7 +55,9 @@ class RedBallTracker(Node):
         self.heading_tol = 1
         self.prev_speed = 0.0
         self.prev_heading = 0.0
-
+        self.log_prev_speed = 0.0
+        self.log_prev_heading = 0.0
+        
         # PID parameters
         self.prev_sec = None
         self.speed_max = 0.20
@@ -527,7 +529,7 @@ class RedBallTracker(Node):
             self.get_logger().info('Red Ball Detected!')
             cx, cy, w, h, (x, y, bw, bh) = result
             # Logging pixels from top-left origin
-            self.get_logger().info(f'centroid=({cx:.1f},{cy:.1f}) size=({w:.0f},{h:.0f})')
+            self.get_logger().info(f'[Object - Red Ball] centroid=({cx:.1f},{cy:.1f}) size=({w:.0f},{h:.0f})')
 
             self.last_seen_t  = now_sec
             self.last_seen_cx = cx
@@ -566,7 +568,9 @@ class RedBallTracker(Node):
                 self.mode = 'TRACKING'
                 speed, heading = 0.0, 0.0
 
-        self.get_logger().info(f'Speed: {speed}; Heading: {heading}')
+        if self.log_prev_speed != speed and self.log_prev_heading != heading:
+            self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
+            self.log_prev_speed, self.log_prev_heading = speed, heading
         
         self._follow(speed, heading)
 
