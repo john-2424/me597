@@ -35,11 +35,11 @@ class RedBallTracker(Node):
         self.show_video = True
 
         # Mode of detection
-        self.detector_mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
+        self.detector_mode = 'hsv'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
-        self.declare_parameter('controller', 'pid')     # 'pid' or 'stanley'
-        self.declare_parameter('search_mode', 'none')   # 'none', 'spiral', or 'hybrid'
+        self.declare_parameter('controller', 'pid')     # 'pid'
+        self.declare_parameter('search_mode', 'none')   # 'none'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
 
@@ -227,7 +227,6 @@ class RedBallTracker(Node):
             speed, heading = self._plan(cx, bw, bh, dt)
         else:
             self.get_logger().info('No Red Ball Detected!')
-            # Lost target
             if self.controller == 'pid':
                 if not self.pid_speed.is_reset():
                     self.pid_speed.reset()
@@ -237,6 +236,8 @@ class RedBallTracker(Node):
                     self.pid_heading.reset()
                     self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
+            
+            speed, heading = 0.0, 0.0
 
         if self.log_prev_speed != speed and self.log_prev_heading != heading:
             self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
