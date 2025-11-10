@@ -111,27 +111,6 @@ class RedBallTracker(Node):
         self.pp_omega_vnom = 0.18  # nominal speed used to scale omega (steer strength)
         self.pp_reverse_ok = True  # allow reverse when too close
 
-        # Runtime options
-        self.gap_min_width_m = 0.5
-        self.gap_min_depth_m = 0.8
-        self.spin_rate_hz    = 1.5
-        self.local_spin_deg  = 360
-        self.replan_hz       = 3.0
-        self.min_commit_s    = 1.0
-        self.ttc_stop_d      = 0.35
-        self.safe_accel      = 0.6
-        self.inflation_m     = 0.2
-
-        # utility weights
-        self.w_width   = 0.35
-        self.w_depth   = 0.20
-        self.w_head    = 0.15
-        self.w_novel   = 0.15
-        self.w_info    = 0.10
-        self.w_red     = 0.05
-        self.w_tgt_gate = 0.20
-        self.w_tgt_bear = 0.15
-
         self.scan = None
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
 
