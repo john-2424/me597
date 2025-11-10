@@ -38,8 +38,8 @@ class RedBallTracker(Node):
         self.detector_mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
-        self.declare_parameter('controller', 'pp')     # 'pid', 'pidgs', 'pp'
-        self.declare_parameter('search_mode', 'frontier')   # 'none', 'frontier'
+        self.declare_parameter('controller', 'pid')     # 'pid', 'pidgs', 'pp'
+        self.declare_parameter('search_mode', 'none')   # 'none', 'frontier', 'wall_following'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
 
@@ -101,13 +101,13 @@ class RedBallTracker(Node):
 
         self.pp_hfov = 60.0 * math.pi/180.0  # approximate; tune with your camera
         self.pp_Ld   = 0.5  # L_d in meters
-        self.pp_vmax = 0.22  # cap linear speed for PP
-        self.pp_vmin = 0.05  # floor linear speed so it moves
+        self.pp_vmax = 0.42  # cap linear speed for PP
+        self.pp_vmin = 0.24  # floor linear speed so it moves
         self.pp_turn_slow = 0.8  # how much turning reduces speed (0..1)
         self.pp_w_dist = 0.6  # blend weight of distance vs turn
         self.pp_kdist      = 0.8       # gain on normalized distance error
         self.pp_stop_db    = 0.08     # deadband on |(bw - ref)/ref| ; e.g., ±8% width
-        self.pp_vback_max  = 0.22  # max reverse speed (0 to disable backing up)
+        self.pp_vback_max  = 0.42  # max reverse speed (0 to disable backing up)
         self.pp_omega_vnom = 0.18  # nominal speed used to scale omega (steer strength)
         self.pp_reverse_ok = True  # allow reverse when too close
 
@@ -135,14 +135,10 @@ class RedBallTracker(Node):
         self.scan = None
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
 
-        self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
+        # self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
         # Command Velocity Publisher
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        # Search context & hypothesis
-        self.sc = SearchContext()
-        self.tgt = TargetHypothesis()
     
     def _scan_cb(self, msg: LaserScan):
         self.scan = msg
@@ -341,168 +337,6 @@ class RedBallTracker(Node):
 
         self.cmd_vel_pub.publish(cmd_vel)
 
-    def _set_state(self, new_state: str, now_sec: float):
-        if self.sc.state != new_state:
-            self.get_logger().info(f"[SEARCH] {self.sc.state} -> {new_state}")
-        self.sc.state = new_state
-        self.sc.state_start_sec = now_sec
-        self.sc.spin_accum_yaw = 0.0
-        self.sc.commit_sec = 0.0
-
-    def _spin_step(self, dt):
-        # spin at configured rate (rad/s)
-        w = 2 * math.pi * self.spin_rate_hz / (2 * math.pi)  # simplify: ~spin_rate_hz rad/s
-        w = max(0.4, min(1.2, self.spin_rate_hz))            # clamp
-        return 0.0, np.sign(1.0) * w
-
-    def _search_cmd(self, frame, dt, now_sec):
-        """
-        Returns (v, w) during search state machine, wrapped with safety.
-        Uses synthetic cx to drive chosen controller toward desired heading.
-        """
-        # Predict hypothesis forward
-        self.tgt.predict(dt)
-
-        if self.sc.state == 'TRACK':
-            # Should not be here (only when ball lost, we switch); fallthrough
-            pass
-
-        # SPIN_SCAN: 360° sweep to seed gaps and chance to see ball
-        if self.sc.state == 'SPIN_SCAN':
-            # spin until accumulated yaw passes target
-            v, w = 0.0, 0.9
-            self.sc.spin_accum_yaw += abs(w) * dt
-            if self.sc.spin_accum_yaw >= self.sc.spin_target:
-                self._set_state('SELECT_GAP', now_sec)
-            return self._safety_wrap(v, w)
-
-        # SELECT_GAP: score gaps and choose target
-        if self.sc.state == 'SELECT_GAP':
-            gaps = self._scan_gaps(self.gap_min_width_m)
-            best = self._score_gaps(frame, gaps)
-            if best is None:
-                self.sc.spin_target = 2 * math.pi
-                self._set_state('SPIN_SCAN', now_sec)
-                return self._safety_wrap(0.0, 0.8)
-
-            # Normalize desired bearing and set waypoint
-            self.sc.goal_angle = wrap_pi(float(best['theta']))
-            depth = float(best['depth'])
-            gx = self.sc.x + depth * math.cos(self.sc.yaw + self.sc.goal_angle)
-            gy = self.sc.y + depth * math.sin(self.sc.yaw + self.sc.goal_angle)
-            self.sc.goal_waypoint = (gx, gy)
-            self.sc.commit_sec = 0.0
-
-            # NEW: go align first (fast turn-in-place) before GO_TO_GAP
-            self._set_state('ALIGN', now_sec)
-
-        # ALIGN: rotate quickly to face the chosen gap (bearing to waypoint NOW)
-        if self.sc.state == 'ALIGN':
-            wx, wy = self.sc.goal_waypoint
-            # Bearing from current odom pose to waypoint, in robot frame
-            desired = math.atan2(wy - self.sc.y, wx - self.sc.x) - self.sc.yaw
-            berr = wrap_pi(desired)
-
-            aligned = abs(berr) < math.radians(15.0)  # 10–20° works well
-
-            # Fast, pure rotation toward the waypoint
-            # Scale a bit with error (proportional clamp) to avoid hunting
-            w_mag = 0.8 * max(0.25, min(1.0, abs(berr) / math.radians(60.0)))
-            w_cmd = w_mag * (1.0 if berr >= 0.0 else -1.0)
-            v_cmd = 0.0 if not aligned else 0.0  # still zero when aligned; GO_TO_GAP handles forward
-
-            if aligned:
-                self._set_state('GO_TO_GAP', now_sec)
-                return self._safety_wrap(0.0, 0.0)
-
-            return self._safety_wrap(v_cmd, w_cmd)
-
-        if self.sc.state == 'GO_TO_GAP':
-            # Re-score occasionally with hysteresis; if a much better angle appears, re-align
-            self.sc.replan_ticker += dt
-            if self.sc.replan_ticker >= 1.0 / max(0.5, self.replan_hz):
-                self.sc.replan_ticker = 0.0
-                gaps = self._scan_gaps(self.gap_min_width_m)
-                alt = self._score_gaps(frame, gaps)
-                if alt is not None:
-                    new_theta = wrap_pi(float(alt['theta']))
-                    if abs(new_theta) < 0.8 * abs(wrap_pi(new_theta)):  # relaxed check
-                        # Update waypoint to the new gap and re-align
-                        depth = float(alt['depth'])
-                        gx = self.sc.x + depth * math.cos(self.sc.yaw + new_theta)
-                        gy = self.sc.y + depth * math.sin(self.sc.yaw + new_theta)
-                        self.sc.goal_waypoint = (gx, gy)
-                        self._set_state('ALIGN', now_sec)
-                        return self._safety_wrap(0.0, 0.0)
-
-            # Compute live bearing error (waypoint - current heading)
-            wx, wy = self.sc.goal_waypoint
-            desired = math.atan2(wy - self.sc.y, wx - self.sc.x) - self.sc.yaw
-            berr = wrap_pi(desired)
-            aligned = abs(berr) < math.radians(15.0)
-
-            # Build a synthetic pixel target from the CLAMPED bearing alpha
-            edge = 0.85 * (self.pp_hfov * 0.5)
-            alpha = max(-edge, min(edge, berr))
-            u = -alpha / (self.pp_hfov * 0.5)
-            cx_syn = 0.5 * self.frame_width + u * (0.5 * self.frame_width)
-            bw_syn = self.bw_far
-            bh_syn = bw_syn
-
-            # If aligned, let your controller translate. If not, keep nudging rotation.
-            if aligned:
-                v_des, w_des = self._plan(cx_syn, bw_syn, bh_syn, dt)
-            else:
-                # gentle rotate-only nudge
-                v_des, w_des = 0.0, 0.4 * (1.0 if berr >= 0.0 else -1.0)
-
-            v_out, w_out = self._safety_wrap(v_des, w_des)
-
-            # Only start commit/arrival logic once aligned (prevents early LOCAL_SCAN flips)
-            if aligned:
-                self.sc.commit_sec += dt
-
-                # Arrival when close enough to the waypoint
-                if math.hypot(wx - self.sc.x, wy - self.sc.y) < max(0.8 * self.gap_min_depth_m, 0.6):
-                    self._mark_visited(self.sc.x, self.sc.y)
-                    self._set_state('LOCAL_SCAN', now_sec)
-                    return self._safety_wrap(0.0, 0.0)
-
-                # If stuck with v≈0 for a while, peek locally
-                if abs(v_out) < 1e-2 and self.sc.commit_sec > max(2.0, self.min_commit_s):
-                    self._mark_visited(self.sc.x, self.sc.y)
-                    self._set_state('LOCAL_SCAN', now_sec)
-                    return self._safety_wrap(0.0, 0.0)
-
-            return v_out, w_out
-
-        # LOCAL_SCAN: short scan at waypoint, mark visited, then reselect
-        if self.sc.state == 'LOCAL_SCAN':
-            # mark visited cell (after we stop)
-            self._mark_visited(self.sc.x, self.sc.y)
-
-            # spin quickly for a limited angle (config)
-            v, w = 0.0, 1.0
-            self.sc.spin_accum_yaw += abs(w) * dt
-            target = math.radians(max(90, int(self.local_spin_deg)))
-            if self.sc.spin_accum_yaw >= target:
-                self._set_state('SELECT_GAP', now_sec)
-                return self._safety_wrap(0.0, 0.0)
-            return self._safety_wrap(v, w)
-
-        # RECOVER (rare): back-off & reorient
-        if self.sc.state == 'RECOVER':
-            # short reverse and slight turn
-            v, w = -0.08, 0.5
-            self.sc.commit_sec += dt
-            if self.sc.commit_sec >= 1.0:
-                self._set_state('SPIN_SCAN', now_sec)
-                return self._safety_wrap(0.0, 0.0)
-            return self._safety_wrap(v, w)
-
-        # default
-        return self._safety_wrap(0.0, 0.0)
-
     def listener_callback(self, msg):
         # Logs the received messages from a topic
         # self.get_logger().info(f'Message Type: {type(msg)}')
@@ -537,26 +371,7 @@ class RedBallTracker(Node):
             cv.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv.circle(frame, (int(cx), int(cy)), 4, (255, 255, 255), -1)
 
-            # Estimate approximate range from bbox width (rough pinhole proxy)
-            # Need a scale; use proportional inverse of width, normalized by frame width.
-            # This is heuristic; adequate for biasing search hypothesis.
-            norm = max(1.0, float(self.frame_width))
-            approx_range = max(0.4, min(3.5, 0.9 * (norm / max(10.0, float(bw)))))  # tuneable clamp
-
-            # Convert pixel bearing to angle in robot frame
-            u = (cx - 0.5*self.frame_width) / max(0.5*self.frame_width, 1e-6)
-            alpha = -u * (self.pp_hfov * 0.5)
-
-            # Update hypothesis in odom frame
-            if self.sc.have_odom:
-                hx = self.sc.x + approx_range * math.cos(self.sc.yaw + alpha)
-                hy = self.sc.y + approx_range * math.sin(self.sc.yaw + alpha)
-                self.tgt.update(hx, hy, max(dt, 1e-3))
-
             speed, heading = self._plan(cx, bw, bh, dt)
-
-            # reset search state to TRACK
-            self._set_state('TRACK', now_sec)
         else:
             self.get_logger().info('No Red Ball Detected!')
             if self.controller in ('pid', 'pidgs'):
@@ -568,17 +383,7 @@ class RedBallTracker(Node):
                     self.pid_heading.reset()
                     self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
-            
-            if self.search_mode != 'none':
-                # Enter search state if coming from TRACK
-                if self.sc.state == 'TRACK':
-                    self.sc.spin_target = 2 * math.pi
-                    self._set_state('SPIN_SCAN', now_sec)
-
-                # Run search machine
-                speed, heading = self._search_cmd(frame, dt, now_sec)
-            else:
-                speed, heading = 0.0, 0.0
+            speed, heading = 0.0, 0.0
 
         if self.log_prev_speed != speed and self.log_prev_heading != heading:
             self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
