@@ -38,7 +38,7 @@ class RedBallTracker(Node):
         self.detector_mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
-        self.declare_parameter('controller', 'pid')     # 'pid', 'pidgs', 'pp'
+        self.declare_parameter('controller', 'pp')     # 'pid', 'pidgs', 'pp'
         self.declare_parameter('search_mode', 'none')   # 'none', 'frontier', 'wall_following'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
