@@ -12,8 +12,7 @@ from nav_msgs.msg import Odometry
 
 from task_6.utils.detect import find_object_hsv, find_object_hsv_triangle, find_object_hsv_circle, LOWER_RED_1, LOWER_RED_2, UPPER_RED_1, UPPER_RED_2
 from task_6.utils.pid import PID
-from task_6.utils.helper import clamp01, wrap_pi
-from task_6.utils.search import SearchContext, TargetHypothesis
+from task_6.utils.helper import clamp01
 
 class RedBallTracker(Node):
     def __init__(self):
