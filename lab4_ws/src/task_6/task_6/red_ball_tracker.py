@@ -121,50 +121,6 @@ class RedBallTracker(Node):
     def _scan_cb(self, msg: LaserScan):
         self.scan = msg
 
-    def _red_likelihood(self, frame):
-        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        # simple red mask
-        m = cv.inRange(hsv, LOWER_RED_1, UPPER_RED_1) | cv.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
-        return float(cv.countNonZero(m)) / float(m.size)  # fraction in [0,1]
-
-    def _scan_gaps(self, width_m):
-        if self.scan is None: return []
-        r = np.array(self.scan.ranges, dtype=np.float32)
-        ang0 = self.scan.angle_min
-        dang = self.scan.angle_increment
-        valid = np.isfinite(r)
-
-        # Consider “open” if valid and not too close; use 1.0 m as a softer floor
-        farish = r > 1.0
-        open_mask = valid & farish
-
-        gaps = []
-        i = 0
-        while i < len(open_mask):
-            if open_mask[i]:
-                j = i
-                while j < len(open_mask) and open_mask[j]:
-                    j += 1
-
-                seg = r[i:j][np.isfinite(r[i:j])]
-                if seg.size == 0:
-                    i = j
-                    continue
-
-                depth = float(np.quantile(seg, 0.3))  # robust depth
-                span  = (j - i) * dang
-                gap_width = depth * span
-
-                if gap_width >= width_m:
-                    ang_center = ang0 + (i + j - 1) * 0.5 * dang
-                    gaps.append((ang_center, gap_width))
-                i = j
-            else:
-                i += 1
-
-        gaps.sort(key=lambda t: t[1], reverse=True)
-        return gaps
-
     def _detect(self, frame):
         if self.detector_mode == 'hsv_circle':
             return find_object_hsv_circle(frame)
@@ -281,63 +237,7 @@ class RedBallTracker(Node):
         #     )
 
         return speed, heading
-
-    # def __plan_pp(self, cx, bw, bh, dt):
-    #     """
-    #     Pure Pursuit steering:
-    #     alpha = bearing of target centroid relative to camera optical axis.
-    #     kappa = 2*sin(alpha)/L_d
-    #     omega = v * kappa
-    #     We schedule v down with |alpha| and proximity (from bbox width).
-    #     """
-    #     # Pixel -> angle
-    #     # Map center offset to angle using camera HFOV
-    #     # center_x in pixels, normalized u in [-1,1] across width
-    #     u = (cx - 0.5*self.frame_width) / max(0.5*self.frame_width, 1e-6)
-    #     alpha = -u * (self.pp_hfov * 0.5)   # small-angle ok; exact linear map of pixels to angle
-        
-    #     # Turn severity in [0,1]
-    #     sigma_turn = clamp01(abs(alpha) / max(self.pp_hfov*0.5, 1e-6))  # 0 at center, 1 at edge
-        
-    #     # Proximity in [0,1] using the same bw_far/bw_near you set
-    #     sigma_dist = 0.0
-    #     if self.bw_far is not None and self.bw_near is not None:
-    #         sigma_dist = clamp01((bw - self.bw_far) / max(self.bw_near - self.bw_far, 1e-6))
-        
-    #     # Blend speed penalty: more penalty if turning and/or near
-    #     sigma_speed = clamp01((1.0 - self.pp_w_dist) * sigma_turn + self.pp_w_dist * sigma_dist)
-        
-    #     # Speed schedule: vmax -> vmin as sigma_speed -> 1
-    #     v_des = (1.0 - sigma_speed*self.pp_turn_slow) * self.pp_vmax
-    #     v_des = max(self.pp_vmin, min(self.pp_vmax, v_des))
-        
-    #     # Pure Pursuit curvature and omega
-    #     # Guard L_d
-    #     Ld = max(0.1, self.pp_Ld)
-    #     kappa = 2.0 * math.sin(alpha) / Ld
-    #     omega_des = v_des * kappa
-        
-    #     # Stability guard: if turning too hard, optionally suppress linear speed
-    #     if abs(omega_des) > self.turn_coeff * self.heading_max:
-    #         v_des = 0.0
-        
-    #     # Slew-rate limit using your existing helper
-    #     v_cmd   = self.__slew(self.prev_speed,   v_des,   self.max_speed_slew)
-    #     w_cmd   = self.__slew(self.prev_heading, omega_des, self.max_heading_slew)
-    #     self.prev_speed, self.prev_heading = v_cmd, w_cmd
-        
-    #     # Small deadband on alpha -> zero tiny omega
-    #     if abs(alpha) < self.heading_db * (self.pp_hfov*0.5):  # reuse your concept of deadband
-    #         w_cmd = 0.0
-        
-    #     # Log at low rate
-    #     self.get_logger().info(
-    #         f"[PP] u={u:.3f} alpha={alpha:.3f} rad | sigma_turn={sigma_turn:.2f} sigma_dist={sigma_dist:.2f} "
-    #         f"| v_des={v_des:.3f} m/s omega={omega_des:.3f} rad/s -> v={v_cmd:.3f}, w={w_cmd:.3f}"
-    #     )
-
-    #     return v_cmd, w_cmd
-
+    
     def __plan_pp(self, cx, bw, bh, dt):
         # earing (PP)
         u = (cx - 0.5*self.frame_width) / max(0.5*self.frame_width, 1e-6)
