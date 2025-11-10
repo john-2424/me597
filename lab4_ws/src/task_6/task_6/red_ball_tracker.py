@@ -360,6 +360,7 @@ class RedBallTracker(Node):
             self.first_frame = False
             self.get_logger().info('Frame Parameters are set!')
 
+        speed, heading = 0.0, 0.0
         result = self._detect(frame)
         if result is not None:
             self.get_logger().info('Red Ball Detected!')
@@ -383,7 +384,6 @@ class RedBallTracker(Node):
                     self.pid_heading.reset()
                     self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
-            speed, heading = 0.0, 0.0
 
         if self.log_prev_speed != speed and self.log_prev_heading != heading:
             self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
