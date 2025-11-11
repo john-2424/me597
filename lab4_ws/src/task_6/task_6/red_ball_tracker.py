@@ -114,13 +114,51 @@ class RedBallTracker(Node):
         self.scan = None
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
 
-        # self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
+        # Search params
+        self.search_rotate = True
+
+        # Odometry / yaw tracking
+        self.accum_yaw = 0.0        # accumulated rotation magnitude [rad]
+        self.odom_yaw = None
+        self.prev_odom_yaw = None
+
+        self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
         # Command Velocity Publisher
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        self.speed, self.heading = 0.0, 0.0
     
     def _scan_cb(self, msg: LaserScan):
         self.scan = msg
+    
+    def _quat_to_yaw(self, q):
+        # q: geometry_msgs/Quaternion
+        # returns yaw in [-pi, pi]
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def _ang_wrap_pi(self, a):
+        # wrap to [-pi, pi]
+        while a > math.pi:  a -= 2.0 * math.pi
+        while a < -math.pi: a += 2.0 * math.pi
+        return a
+
+    def _ang_diff(self, a, b):
+        # smallest signed diff a-b in [-pi, pi]
+        return self._ang_wrap_pi(a - b)
+
+    def _odom_cb(self, msg: Odometry):
+        yaw = self._quat_to_yaw(msg.pose.pose.orientation)
+        self.odom_yaw = yaw
+        if self.prev_odom_yaw is None:
+            self.prev_odom_yaw = yaw
+
+        d = self._ang_diff(self.odom_yaw, self.prev_odom_yaw)
+        # accumulate absolute rotation regardless of direction
+        self.accum_yaw += d  # abs(d)
+        self.prev_odom_yaw = self.odom_yaw
 
     def _detect(self, frame):
         if self.detector_mode == 'hsv_circle':
@@ -308,14 +346,299 @@ class RedBallTracker(Node):
         else:
             return 0.0, 0.0
 
-    def _follow(self, speed, heading):
+    def _follow(self):
         cmd_vel = Twist()
 
-        cmd_vel.linear.x = speed
-        cmd_vel.angular.z = heading
+        cmd_vel.linear.x = self.speed
+        cmd_vel.angular.z = self.heading
 
         self.cmd_vel_pub.publish(cmd_vel)
 
+    def _wrap_to_span(self, a, amin, amax):
+        """Wrap angle a (rad) into [amin, amax] by adding/subtracting 2π."""
+        twopi = 2.0 * math.pi
+        while a < amin:
+            a += twopi
+        while a > amax:
+            a -= twopi
+        return a
+
+    def _scan_value(self, deg):
+        """
+        Return range at 'deg'
+        Mapping: sensor_angle_rad = radians(deg).
+        If out of bounds or non-finite, returns None.
+        """
+        if self.scan is None or not self.scan.ranges:
+            return None
+
+        scan = self.scan
+
+        if deg > len(scan.ranges):
+            self.get_logger().info(f'Invalid degree provided!: {deg}')
+        if deg == 360:
+            deg = 0
+
+        r = scan.ranges[deg]
+        if r is None or (isinstance(r, float) and not math.isfinite(r)):
+            return None
+        return float(r)
+
+    # ------------- GAP FINDING (segments of indices and angles) -------------
+    def _scan_to_numpy(self):
+        """Return (ranges_np, angle_min, angle_inc, angle_max) or (None,...) if no scan."""
+        if self.scan is None or not self.scan.ranges:
+            return None, None, None, None
+        scan = self.scan
+        # Use numpy for fast masking; keep NaN/inf as-is for detection
+        rng = np.array(scan.ranges, dtype=float)
+        self.get_logger().info(f'[SCAN] Range Len: {len(rng)}, Angle Min: {scan.angle_min}, Angle Increment: {scan.angle_increment}, Angle Max: {scan.angle_max}')
+        return rng, scan.angle_min, scan.angle_increment, scan.angle_max
+
+    def _mask_to_segments(self, mask: np.ndarray):
+        """
+        Given a boolean mask over indices, return list of contiguous (start_idx, end_idx) inclusive.
+        Handles wrap-around (merge end and start if both True).
+        """
+        n = mask.size
+        if n == 0:
+            return []
+
+        # If all False -> no segments
+        if not mask.any():
+            return []
+
+        # Handle wrap-around by rotating if mask[0] and mask[-1] are True
+        # Find runs by diff on padded mask
+        m = mask.astype(np.int8)
+        # If wrap True at both ends, rotate so a segment doesn't straddle edges
+        if m[0] == 1 and m[-1] == 1:
+            # find first zero->one transition as a rotation point
+            # Build transitions
+            dm = np.diff(np.r_[0, m, 0])
+            starts = np.where(dm == 1)[0]       # inclusive
+            ends   = np.where(dm == -1)[0] - 1  # inclusive
+            # choose the longest segment and rotate just after it ends (heuristic),
+            # or simply rotate to the first start to break the wrap.
+            rot = int(starts[0])  # simple & robust
+            m = np.roll(m, -rot)
+            rotated = True
+        else:
+            rot = 0
+            rotated = False
+
+        dm = np.diff(np.r_[0, m, 0])
+        starts = np.where(dm == 1)[0]
+        ends   = np.where(dm == -1)[0] - 1
+        segs = list(zip(starts, ends))
+
+        if rotated:
+            # rotate indices back
+            n = mask.size
+            segs = [((s + rot) % n, (e + rot) % n) for (s, e) in segs]
+            # After un-rotating, segments are correct; nothing straddles edges anymore.
+
+        return segs
+
+    def _segments_to_angles(self, segs, angle_min, angle_inc):
+        """
+        For each (start_idx, end_idx) inclusive, compute (ang_start, ang_end) in radians.
+        Uses the sensor's native frame: angle = angle_min + idx * angle_inc.
+        """
+        out = []
+        for s, e in segs:
+            ang_s = angle_min + s * angle_inc
+            ang_e = angle_min + e * angle_inc
+            out.append((s, e, ang_s, ang_e))
+        return out
+
+    # def _find_gap_segments(self, mode='nan', radius=None, finite_only=True):
+    #     """
+    #     mode: 'nan'  -> gaps are runs of non-finite (inf/NaN).
+    #         'radius' -> gaps are runs where range > radius (optionally also must be finite).
+    #     radius: float, used only when mode='radius'.
+    #     finite_only (radius mode): if True, only counts finite readings > radius as gaps;
+    #                             if False, non-finite are also treated as gaps.
+    #     returns: list of tuples (start_idx, end_idx, start_ang, end_ang) inclusive indices,
+    #             angles in sensor frame (radians).
+    #     """
+    #     rng, a_min, a_inc, a_max = self._scan_to_numpy()
+    #     if rng is None:
+    #         return []
+
+    #     if mode == 'nan':
+    #         mask = ~np.isfinite(rng)  # True where inf/NaN
+    #     elif mode == 'radius':
+    #         if radius is None or radius <= 0:
+    #             # Sensible default: slightly less than max range if available
+    #             # If max_range is available in LaserScan, you could use self.scan.range_max.
+    #             radius = getattr(self.scan, 'range_max', np.nanmax(np.where(np.isfinite(rng), rng, 0.0)) * 0.9) or 1.0
+    #         if finite_only:
+    #             mask = (np.isfinite(rng)) & (rng > radius)
+    #         else:
+    #             # treat non-finite also as gaps
+    #             mask = (~np.isfinite(rng)) | (rng > radius)
+    #     else:
+    #         # Unknown mode -> no segments
+    #         return []
+
+    #     segs = self._mask_to_segments(mask)
+    #     return self._segments_to_angles(segs, a_min, a_inc)
+
+    def _find_gap_segments(self, mode='nan', radius=None, finite_only=True, front_only=True):
+        """
+        mode: 'nan'     -> gaps are runs of non-finite (inf/NaN)
+            'radius'  -> gaps are runs where range > radius
+        radius: threshold used when mode='radius'
+        finite_only (radius mode): True -> only finite > radius; False -> OR with non-finite
+        front_only: if True, restrict detection to sensor angles in [-pi/2, +pi/2]
+        returns: list of (start_idx, end_idx, start_ang, end_ang) [angles: sensor frame, rad]
+        """
+        rng, a_min, a_inc, a_max = self._scan_to_numpy()
+        if rng is None:
+            return []
+
+        # 1) base mask by gap definition
+        if mode == 'nan':
+            base = ~np.isfinite(rng)
+        elif mode == 'radius':
+            if radius is None or radius <= 0:
+                radius = getattr(self.scan, 'range_max', None)
+                if radius is None or not np.isfinite(radius):
+                    # fallback: 90% of finite max or 1.0
+                    finite_vals = rng[np.isfinite(rng)]
+                    radius = (0.9 * finite_vals.max()) if finite_vals.size else 1.0
+            if finite_only:
+                base = (np.isfinite(rng)) & (rng > radius)
+            else:
+                base = (~np.isfinite(rng)) | (rng > radius)
+        else:
+            return []
+
+        # 2) optional front-only mask: sensor angles in [-pi/2, +pi/2]
+        if front_only:
+            n = rng.size
+            idx = np.arange(n, dtype=np.int64)
+            ang = a_min + idx * a_inc
+            front_mask = ((ang >= 0) & (ang <= math.pi/2)) | (ang >= 3*math.pi/2)
+            mask = base & front_mask
+        else:
+            mask = base
+
+        segs = self._mask_to_segments(mask)
+        return self._segments_to_angles(segs, a_min, a_inc)
+
+    # Optional: convert sensor angle (rad) -> your compass style degrees
+    def _sensor_rad_to_deg(self, ang_rad: float) -> float:
+        """
+        For logging convenience: convert a sensor-frame angle to compass degrees
+        """
+        # Inverse of what _scan_value does:
+        # sensor_angle = radians(deg)  => deg = degrees(sensor_angle)
+        return math.degrees(ang_rad)
+
+    def _split_three_segments(self, s: int, e: int):
+        """
+        Split inclusive index range [s, e] into 3 near-equal inclusive sub-segments.
+        Returns [(s1, e1), (s2, e2), (s3, e3)].
+        """
+        idxs = np.arange(s, e + 1, dtype=int)
+        parts = np.array_split(idxs, 3)
+        out = []
+        for p in parts:
+            if p.size == 0:
+                out.append((None, None))
+            else:
+                out.append((int(p[0]), int(p[-1])))
+        return out
+
+    def _mid_index(self, s: int, e: int) -> int:
+        """Inclusive mid index of [s, e]."""
+        return int((s + e) // 2)
+
+    def _idx_to_ang(self, idx: int) -> float:
+        """Sensor-frame angle (rad) for index."""
+        if self.scan is None:
+            return 0.0
+        return self.scan.angle_min + idx * self.scan.angle_increment
+
+    def _log_gaps_with_thirds(self, label: str, segments):
+        """
+        segments: list of (s_idx, e_idx, a_s, a_e).
+        For each gap, log 3 sub-segments + mid index/angle for each sub-segment.
+        """
+        if not segments:
+            self.get_logger().info(f"[Gaps {label}] none (front-only)")
+            return
+
+        self.get_logger().info(f"[Gaps {label}] count={len(segments)} (front-only)")
+        for gi, (s, e, a_s, a_e) in enumerate(segments):
+            self.get_logger().info(
+                f"  gap#{gi:02d} idx[{s}-{e}] | ang[{a_s:+.3f},{a_e:+.3f}] rad "
+                f"| front-deg[{self._sensor_rad_to_deg(a_s):.1f},"
+                f"{self._sensor_rad_to_deg(a_e):.1f}]"
+            )
+            thirds = self._split_three_segments(s, e)
+            for ti, (ts, te) in enumerate(thirds):
+                if ts is None:
+                    self.get_logger().info(f"    seg{ti}: <empty>")
+                    continue
+                mid = self._mid_index(ts, te)
+                ang_ts, ang_te = self._idx_to_ang(ts), self._idx_to_ang(te)
+                ang_mid = self._idx_to_ang(mid)
+                self.get_logger().info(
+                    f"    seg{ti}: idx[{ts}-{te}] mid={mid} | "
+                    f"ang[{ang_ts:+.3f},{ang_te:+.3f}] mid={ang_mid:+.3f} rad | "
+                    f"front-deg[{self._sensor_rad_to_deg(ang_ts):.1f},"
+                    f"{self._sensor_rad_to_deg(ang_te):.1f}] "
+                    f"mid={self._sensor_rad_to_deg(ang_mid):.1f}"
+                )
+    
+    def _log_scan(self):
+        if self.scan is not None:
+            probe_angles = [0, 45, 90, 135, 180, 225, 270, 315]
+            readings = []
+            for a in probe_angles:
+                v = self._scan_value(a)
+                readings.append(f"{a}:{('%.2f' % v) if v is not None else 'nan'}")
+            self.get_logger().info("[ScanProbe] " + " ".join(readings))
+        else:
+            self.get_logger().info("[ScanProbe] No /scan data yet!")
+    
+    def _log_yaw(self):
+        self.get_logger().info(f'Accum Yaw: {self.accum_yaw}')
+
+    def _log_gaps(self):
+        # --- NEW: find gap segments by (A) non-finite readings ---
+        nan_segments = self._find_gap_segments(mode='nan', front_only=True)
+        self._log_gaps_with_thirds("non-finite", nan_segments)
+        # if nan_segments:
+        #     self.get_logger().info(f"[Gaps: non-finite] count={len(nan_segments)}")
+        #     for (s, e, a_s, a_e) in nan_segments:
+        #         self.get_logger().info(
+        #             f"  seg idx[{s}-{e}] | ang[{a_s:+.3f},{a_e:+.3f}] rad "
+        #             f"| front-deg[{self._sensor_rad_to_deg(a_s):.1f},"
+        #             f"{self._sensor_rad_to_deg(a_e):.1f}]"
+        #         )
+        # else:
+        #     self.get_logger().info("[Gaps: non-finite] none")
+
+        # --- NEW: find gap segments by (B) radius threshold (> radius) ---
+        # choose whatever radius makes sense for your environment; e.g., 2.0 m
+        RADIUS = 2.0
+        rad_segments = self._find_gap_segments(mode='radius', radius=RADIUS, finite_only=True, front_only=True)
+        self._log_gaps_with_thirds(f">{RADIUS:.1f}m", rad_segments)
+        # if rad_segments:
+        #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] count={len(rad_segments)}")
+        #     for (s, e, a_s, a_e) in rad_segments:
+        #         self.get_logger().info(
+        #             f"  seg idx[{s}-{e}] | ang[{a_s:+.3f},{a_e:+.3f}] rad "
+        #             f"| front-deg[{self._sensor_rad_to_deg(a_s):.1f},"
+        #             f"{self._sensor_rad_to_deg(a_e):.1f}]"
+        #         )
+        # else:
+        #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] none")
+    
     def listener_callback(self, msg):
         # Logs the received messages from a topic
         # self.get_logger().info(f'Message Type: {type(msg)}')
@@ -339,7 +662,6 @@ class RedBallTracker(Node):
             self.first_frame = False
             self.get_logger().info('Frame Parameters are set!')
 
-        speed, heading = 0.0, 0.0
         result = self._detect(frame)
         if result is not None:
             self.get_logger().info('Red Ball Detected!')
@@ -351,7 +673,7 @@ class RedBallTracker(Node):
             cv.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv.circle(frame, (int(cx), int(cy)), 4, (255, 255, 255), -1)
 
-            speed, heading = self._plan(cx, bw, bh, dt)
+            self.speed, self.heading = self._plan(cx, bw, bh, dt)
         else:
             self.get_logger().info('No Red Ball Detected!')
             if self.controller in ('pid', 'pidgs'):
@@ -363,12 +685,34 @@ class RedBallTracker(Node):
                     self.pid_heading.reset()
                     self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
+            
+            # Rotate 360
+            if self.search_rotate:
+                self.speed, self.heading = 0.0, 0.6
+                if abs(self.accum_yaw) > 2*math.pi:
+                    self.speed, self.heading = 0.0, 0.0
+                    self.search_rotate = False
 
-        if self.log_prev_speed != speed and self.log_prev_heading != heading:
-            self.get_logger().info(f'[Robot] Speed: {speed}; Heading: {heading}')
-            self.log_prev_speed, self.log_prev_heading = speed, heading
+        # self._log_yaw()
+            
+        # self._log_scan()
+
+        self._log_gaps()
+
+        ## Do a 360 to look for the ball
+        ## Find the gaps based on radius mainly and find the first gap on the left and its 2nd segment and its mid angle
+        ## Move towards the gap->segment until that angle distance is less than a distance defined (see how to keep track of that pointttttt or angle which was identified in the gap initially, since you will have to turn to head to that point/angle)
+        ## During the process, lookout for
+        ## ## Obstacles and to avoid it, course correct, by keeping the heading in memory to correct it back to that initial heading
+        ## ## Any change in lidar readings on the left, if detected make a left turn and explore
+        ## If there are no gaps in front facing, then turn right by 90, check for gaps
+        ## Stop every some distance between the bot's initialposition after findig a gap to the gap direction, and perform a 360 to look for the ball.
+
+        if self.log_prev_speed != self.speed and self.log_prev_heading != self.heading:
+            self.get_logger().info(f'[Robot] Speed: {self.speed}; Heading: {self.heading}')
+            self.log_prev_speed, self.log_prev_heading = self.speed, self.heading
         
-        self._follow(speed, heading)
+        self._follow()
 
         # Show or display frames on a window
         if self.show_video:
