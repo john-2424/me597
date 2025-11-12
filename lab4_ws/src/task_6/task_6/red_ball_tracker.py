@@ -40,7 +40,7 @@ class RedBallTracker(Node):
         self.detector_mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
-        self.declare_parameter('controller', 'pp')     # 'pid', 'pidgs', 'pp'
+        self.declare_parameter('controller', 'pid')     # 'pid', 'pidgs', 'pp'
         self.declare_parameter('search_mode', 'fntr-gf')   # 'none', 'fntr-gf'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
@@ -122,23 +122,23 @@ class RedBallTracker(Node):
         # Search params
         self.search_rotate_z = 2*math.pi
         self.search_rotate_d = 'ccw'
-        self.search_plan = [SearchStates.rotate_z_d, SearchStates.find_gaps]
+        self.search_plan = [SearchStates.none, SearchStates.rotate_z_d, SearchStates.find_gaps]
         self.search_state = None
         self.search_state_running = False
         self.search_rotate = True
-        self.rotate_speed_ccw = 0.6  # rad/s
-        self.rotate_speed_cw = -0.6  # rad/s
-        self.search_gap_radius = 2  # m
+        self.rotate_speed_ccw = 0.9  # rad/s
+        self.rotate_speed_cw = -0.9  # rad/s
+        self.search_gap_radius = 2.4  # m
         self.search_gaps = None
         self.search_gap_selection = 'left_most_gap_segment'  # left_most_gap_segment, or left_most_gap
-        self.search_gap_dist_ref = 0.5  # m
-        self.search_traverse_check_dist = 1.0  # m
+        self.search_gap_dist_ref = 0.7  # m
+        self.search_traverse_check_dist = 4.0  # m
         self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = '', True, []
     
-        self.change_thresh_m = 0.25   # meters; "sudden" increase threshold per step
-        self.min_consec_jumps = 45     # how many consecutive jumps to call it a real opening
+        self.change_thresh_m = 0.2   # meters; "sudden" increase threshold per step
+        self.min_consec_jumps = 20     # how many consecutive jumps to call it a real opening
         self.smooth_win = 9           # moving-average window (odd is nice), NaN-aware
-        self.require_base_dist = 0.5  # optional: require distances in the opening to be at least this (meters)
+        self.require_base_dist = 0.4  # optional: require distances in the opening to be at least this (meters)
 
         # PID parameters for Search
         self.s_prev_sec = None
@@ -162,6 +162,7 @@ class RedBallTracker(Node):
             i_limit=0.8,
             out_limit=(-self.s_heading_max, self.s_heading_max)
         )
+        self.traverse_first = True
         self.traversing_paused = False
         self.last_accum_yaw_cd = 0.0
         
@@ -178,7 +179,6 @@ class RedBallTracker(Node):
         self.prev_odom_xy = None
         self.prev_odom_t  = None
         self.max_step_m   = 0.50       # ignore bigger-than-this single-step jumps
-        self.segment_dist = 0.0
 
         self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
@@ -201,7 +201,7 @@ class RedBallTracker(Node):
     def _reset_ball_found(self):
         self.search_rotate_z = 2*math.pi
         self.search_rotate_d = 'ccw'
-        self.search_plan = [SearchStates.rotate_z_d, SearchStates.find_gaps]
+        self.search_plan = [SearchStates.none, SearchStates.rotate_z_d, SearchStates.find_gaps]
         self.search_state = None
         self.search_state_running = False
         self.search_gaps = None
@@ -209,6 +209,7 @@ class RedBallTracker(Node):
         self.prev_speed = 0.0
         self.search_pid_heading.reset()
         self.prev_heading = 0.0
+        self.traverse_first = True
     
     def _scan_cb(self, msg: LaserScan):
         self.scan = msg
@@ -271,7 +272,6 @@ class RedBallTracker(Node):
         if step <= max(self.max_step_m, v_cap):
             self.accum_dist += step
             self.accum_dist_forward += (dx * math.cos(self.odom_yaw) + dy * math.sin(self.odom_yaw))
-            self.segment_dist += step
 
         # --- update previous values ---
         self.prev_odom_xy = (px, py)
@@ -727,10 +727,11 @@ class RedBallTracker(Node):
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] none")
     
     def _rotate_z_d(self):
-        # Rotate x
+        # Rotate x in d
         self.speed, self.heading = 0.0, self.rotate_speed_ccw if self.search_rotate_d == 'ccw' else self.rotate_speed_cw
         if abs(self.accum_yaw) > self.search_rotate_z:
             self.speed, self.heading = 0.0, 0.0
+            self.accum_yaw = 0.0
             self.prev_odom_yaw = None
 
             self.search_state_running = False
@@ -743,14 +744,32 @@ class RedBallTracker(Node):
 
         self.search_state_running = False
         self.search_plan.append(SearchStates.pick_a_gap)
+        self.get_logger().info(f'[Find Gaps] {self.search_gaps}')
     
     def __pick_left_most_gap(self):
         if self.search_gaps is not None:
-            left_most_gaps = []
+            left_most_gaps, right_most_gaps = [], []
             for (s, e, a_s, a_e) in self.search_gaps:
                 if a_s >=0 and a_e <=90:
                     left_most_gaps.append((s, e, a_s, a_e))
-            s, e, a_s, a_e = left_most_gaps[-1]
+                if a_s >= 270 and a_e < 360:
+                    right_most_gaps.append((s, e, a_s, a_e))
+            
+            if left_most_gaps:
+                max_s, left_max = None, None
+                for left_most_gap in left_most_gaps:
+                    if max_s is None or max_s < left_most_gap[0]:
+                        max_s = left_most_gap[0]
+                        left_max = left_most_gap
+            elif right_most_gaps:
+                min_s, left_max = None, None
+                for left_most_gap in right_most_gaps:
+                    if min_s is None or min_s > left_most_gap[0]:
+                        min_s = left_most_gap[0]
+                        left_max = left_most_gap
+            else:
+                return None
+            s, e, a_s, a_e = left_max
             mid = self._mid_index(s, e)
             a_mid = self._idx_to_ang(mid)
             return s, e, mid, a_s, a_e, a_mid
@@ -786,19 +805,22 @@ class RedBallTracker(Node):
             self.search_rotate_d = 'cw'
             self.search_state_running = False
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
+            self.get_logger().info(f'[Pick Gap] No Gaps Found! Rotating 90 to turn right to look for new gaps!')
         else:
             s, e, mid, a_s, a_e, a_mid = search_gap
             if self.last_seen_gap_pick:
                 self.search_rotate_z = abs(a_mid)
-                self.search_rotate_d = 'ccw' if a_mid < 0 else 'cw'
+                self.search_rotate_d = 'ccw' if a_mid > 0 else 'cw'
                 self.last_seen_gap_pick = False
+                self.get_logger().info(f'[Pick Gap] Planning to look in the direction of where the ball was last seen! Rotating {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             else:
-                self.search_rotate_z = self.scan_angle_min + a_mid * self.scan_angle_increment
+                self.search_rotate_z = a_mid
                 if self.search_rotate_z >= math.pi:
                     self.search_rotate_z = 2*math.pi - self.search_rotate_z
                     self.search_rotate_d = 'cw'
                 else:
                     self.search_rotate_d = 'ccw'
+                self.get_logger().info(f'[Pick Gap] Planning to Rotate {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             
             self.search_state_running = False
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
@@ -866,22 +888,32 @@ class RedBallTracker(Node):
             return int(starts[i]), int(ends[i])
     
     def _traverse_the_gap(self):
-        if self.segment_dist > self.search_traverse_check_dist:
+        if self.traverse_first:
+            self.get_logger().info('[Traverse] First Traversal!')
+            self.accum_yaw_cd = 0.0
+            self.accum_dist = 0.0
+            self.traverse_first = False
+
+        if self.accum_dist > self.search_traverse_check_dist:
             self.speed, self.heading = 0.0, 0.0
             self.traversing_paused = True
             self.last_accum_yaw_cd = self.accum_yaw_cd
-            self.segment_dist = 0.0
+            self.prev_odom_xy = None
 
             self.search_rotate_z = 2*math.pi
             self.search_rotate_d = 'ccw'
             self.search_state_running = False
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
+            self.traverse_first = True
+
+            self.get_logger().info(f'[Traverse] Checkpoint Reached! - Last Accum Yaw: {self.last_accum_yaw_cd}')
             return
 
         if self.scan is not None or not self.scan.ranges:
             if self.traversing_paused:
                 self.accum_yaw_cd = self.last_accum_yaw_cd
                 self.traversing_paused = False
+                self.get_logger().info(f'[Traverse] Resuming post Checkpoint! - Last Accum Yaw: {self.last_accum_yaw_cd}')
             
             # scan = self.scan
             # front_dist = scan.ranges[:5] + scan.ranges[354:]  # Front 0 +- 5
@@ -899,8 +931,8 @@ class RedBallTracker(Node):
 
             # --- Define regions in degrees (assuming len=360; adjust if different) ---
             front_region       = np.r_[0:5, 355:360]        # 0 ±5°
-            front_left_region  = np.arange(35, 55)          # 45 ±10°
-            front_right_region = np.arange(305, 325)        # 315 ±10°
+            front_left_region  = np.arange(15, 75)          # 45 ±30°
+            front_right_region = np.arange(285, 345)        # 315 ±30°
             left_region = np.arange(45, 135)        #  45-135
 
             # --- Extract slices safely ---
@@ -928,6 +960,7 @@ class RedBallTracker(Node):
             # )
 
             if left_opening_detected:
+                self.get_logger().info(f'[Traverse] Left Opening Detected!')
                 self.speed, self.heading = 0.0, 0.0
 
                 span = self.__longest_run_span(jump_good)
@@ -950,30 +983,38 @@ class RedBallTracker(Node):
                 
                 self.search_state_running = False
                 self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
+                self.traverse_first = True
+                self.get_logger().info(f'[Traverse] Rotating {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             else:
                 if front_left_dist_min != np.inf and front_left_dist_min <= self.search_gap_dist_ref/2:
-                    self.speed = 0.0
+                    self.speed = self.s_speed_max
                     self.heading = self.rotate_speed_cw
+                    self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Left!')
                 elif front_right_dist_min != np.inf and front_right_dist_min <= self.search_gap_dist_ref/2:
-                    self.speed = 0.0
+                    self.speed = self.s_speed_max
                     self.heading = self.rotate_speed_ccw
+                    self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Right!')
                 else:
                     if front_dist_min != np.inf:
                         speed_err = self.search_gap_dist_ref - front_dist_min
-                        if self.s_prev_max_speed_err is None or speed_err > self.s_prev_max_speed_err: self.s_prev_max_speed_err = speed_err
+                        if self.s_prev_max_speed_err is None or abs(speed_err) > abs(self.s_prev_max_speed_err): self.s_prev_max_speed_err = speed_err
                     else:
                         speed_err = self.s_prev_max_speed_err
                     heading_err = self.accum_yaw_cd
                     self.get_logger().info(f'[Speed] Ref: {self.search_gap_dist_ref}; Curr: {front_dist_min}; Err: {speed_err}')
                     self.get_logger().info(f'[Heading] Ref: {0.0}; Curr: {self.prev_odom_yaw}; Err: {heading_err}')
 
-                    if speed_err < 0.1:
+                    if abs(speed_err) < 0.1:
                         self.speed, self.heading = 0.0, 0.0
                         
                         self.search_rotate_z = 2*math.pi
                         self.search_rotate_d = 'ccw'
                         self.search_state_running = False
                         self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
+                        # self.search_state_running = False
+                        # self.search_plan.extend([SearchStates.find_gaps])
+                        self.traverse_first = True
+                        self.get_logger().info(f'[Traverse] Done! Next Cycle!')
                     else:
                         speed = self.search_pid_speed.step(speed_err, self.dt)
                         heading = self.search_pid_heading.step(heading_err, self.dt)
@@ -984,16 +1025,18 @@ class RedBallTracker(Node):
                         
                         if abs(heading) > self.turn_coeff*self.s_heading_max:
                             speed = 0.0
-                        
+                        # if abs(heading) > 0.45:
+                        #     speed = 0.0
+
                         # slew-rate limit commands
                         speed   = self.__slew(self.prev_speed, speed, self.s_max_speed_slew)
                         heading = self.__slew(self.prev_heading, heading, self.s_max_heading_slew)
 
                         self.prev_speed, self.prev_heading = speed, heading
 
-                        self.speed, self.heading = speed, heading
+                        self.speed, self.heading = -speed, -heading
         else:
-            self.get_logger().warn('Scan sensor unavailable at the moment!')
+            self.get_logger().warn('[Traverse] Scan sensor unavailable at the moment!')
 
     def _search_fntr_gf(self):
         if not self.search_state_running: self.search_plan.pop(0)
@@ -1071,9 +1114,6 @@ class RedBallTracker(Node):
             self.get_logger().info('No Red Ball Detected!')
             self._reset_ball_lost()
             
-            if self.log_prev_search_state != self.search_state or self.log_prev_search_state_running != self.search_state_running or self.log_prev_search_plan != self.search_plan:
-                self.get_logger().info(f'Search State: {self.search_state}; Search State Status: {self.search_state_running}; Search Plan: {self.search_plan}')
-                self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = self.search_state, self.search_state_running, self.search_plan
             if self.search_mode != 'none':
                 self._search()
 
@@ -1094,6 +1134,10 @@ class RedBallTracker(Node):
         ## -- Stop every some distance between the bot's initial position after findig a gap to the gap direction, and perform a 360 to look for the ball.
         ## -- Keep track of the last seen angle of the ball and consider it for the next find gaps state 
 
+        if self.log_prev_search_state != self.search_state or self.log_prev_search_state_running != self.search_state_running or self.log_prev_search_plan != self.search_plan:
+                self.get_logger().info(f'[Search] State: {self.search_state}; State Status: {self.search_state_running}; Plan: {self.search_plan}')
+                self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = self.search_state, self.search_state_running, self.search_plan
+        
         if self.log_prev_speed != self.speed or self.log_prev_heading != self.heading:
             self.get_logger().info(f'[Robot] Speed: {self.speed}; Heading: {self.heading}')
             self.log_prev_speed, self.log_prev_heading = self.speed, self.heading
