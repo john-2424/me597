@@ -120,25 +120,32 @@ class RedBallTracker(Node):
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
 
         # Search params
-        self.search_rotate_z = 2*math.pi
-        self.search_rotate_d = 'ccw'
+        self.search_rotate_z = 2*math.pi  # rads
+        self.search_rotate_d = 'ccw'  # ccw or cw
+        self.search_move_x = 0.4  # m
+        self.search_move_d = 'fw'  # fw or bw
         self.search_plan = [SearchStates.none, SearchStates.rotate_z_d, SearchStates.find_gaps]
         self.search_state = None
         self.search_state_running = False
         self.search_rotate = True
         self.rotate_speed_ccw = 0.9  # rad/s
         self.rotate_speed_cw = -0.9  # rad/s
-        self.search_gap_radius = 2.4  # m
+        self.move_speed_fw = 0.2
+        self.move_speed_bw = -0.2
+        self.search_gap_radius = 1.0  # m
         self.search_gaps = None
         self.search_gap_selection = 'left_most_gap_segment'  # left_most_gap_segment, or left_most_gap
         self.search_gap_dist_ref = 0.7  # m
         self.search_traverse_check_dist = 4.0  # m
+        self.last_left_90_val = None
+        self.left_opening_ema_beta = 0.20  # how quickly the baseline tracks normal drift (0..1)
+        self.search_left_opening_thres = 0.7  # m
         self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = '', True, []
     
-        self.change_thresh_m = 0.2   # meters; "sudden" increase threshold per step
-        self.min_consec_jumps = 20     # how many consecutive jumps to call it a real opening
-        self.smooth_win = 9           # moving-average window (odd is nice), NaN-aware
-        self.require_base_dist = 0.4  # optional: require distances in the opening to be at least this (meters)
+        # self.change_thresh_m = 0.2   # meters; "sudden" increase threshold per step
+        # self.min_consec_jumps = 20     # how many consecutive jumps to call it a real opening
+        # self.smooth_win = 9           # moving-average window (odd is nice), NaN-aware
+        # self.require_base_dist = 0.4  # optional: require distances in the opening to be at least this (meters)
 
         # PID parameters for Search
         self.s_prev_sec = None
@@ -178,7 +185,7 @@ class RedBallTracker(Node):
         self.accum_dist_forward = 0.0  # signed forward distance [m] (optional)
         self.prev_odom_xy = None
         self.prev_odom_t  = None
-        self.max_step_m   = 0.50       # ignore bigger-than-this single-step jumps
+        self.max_step_m   = 0.50       # ignore bigger-than-this single-step jump        
 
         self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
@@ -257,7 +264,7 @@ class RedBallTracker(Node):
         dy = py - y0
         step = math.hypot(dx, dy)
 
-        # --- SMART JUMP FILTER (inserted right here) ---
+        # SMART JUMP FILTER
         if self.prev_odom_t is not None and t is not None:
             dt = max(1e-3, t - self.prev_odom_t)
         else:
@@ -268,12 +275,12 @@ class RedBallTracker(Node):
         v_body = math.hypot(vx, vy)
         v_cap = 1.5 * v_body * dt + 0.05  # allowable step size
 
-        # --- update accumulators only if movement is valid ---
+        # update accumulators only if movement is valid
         if step <= max(self.max_step_m, v_cap):
             self.accum_dist += step
             self.accum_dist_forward += (dx * math.cos(self.odom_yaw) + dy * math.sin(self.odom_yaw))
 
-        # --- update previous values ---
+        # update previous values
         self.prev_odom_xy = (px, py)
         self.prev_odom_t = t
 
@@ -480,26 +487,68 @@ class RedBallTracker(Node):
             a -= twopi
         return a
 
-    def _scan_value(self, deg):
+    # def _scan_value(self, deg):
+    #     """
+    #     Return range at 'deg'
+    #     Mapping: sensor_angle_rad = radians(deg).
+    #     If out of bounds or non-finite, returns None.
+    #     """
+    #     if self.scan is None or not self.scan.ranges:
+    #         return None
+
+    #     scan = self.scan
+
+    #     if deg > len(scan.ranges):
+    #         self.get_logger().info(f'Invalid degree provided!: {deg}')
+    #     if deg == 360:
+    #         deg = 0
+
+    #     r = scan.ranges[deg]
+    #     if r is None or (isinstance(r, float) and not math.isfinite(r)):
+    #         return None
+    #     return float(r)
+
+    def _scan_value(self, deg: float):
         """
-        Return range at 'deg'
-        Mapping: sensor_angle_rad = radians(deg).
-        If out of bounds or non-finite, returns None.
+        Return range at 'deg' (degrees in robot/sensor frame where 0° is forward).
+        Maps the requested angle into the scan's angular span using angle_min/max/increment.
+        Returns None if outside FOV or value is non-finite.
         """
-        if self.scan is None or not self.scan.ranges:
+        if not self._has_scan():
             return None
 
         scan = self.scan
+        n = len(scan.ranges)
+        a0 = scan.angle_min
+        inc = scan.angle_increment
+        aN = a0 + inc * (n - 1)
 
-        if deg > len(scan.ranges):
-            self.get_logger().info(f'Invalid degree provided!: {deg}')
-        if deg == 360:
-            deg = 0
+        # Normalize request to [0, 2π), then map into scan's span (which could be [-π, π], [0, 2π), or partial FOV)
+        target = math.radians(deg % 360.0)
 
-        r = scan.ranges[deg]
-        if r is None or (isinstance(r, float) and not math.isfinite(r)):
+        # Choose an equivalent 2π-shifted angle that lies within [min(a0,aN), max(a0,aN)]
+        lo, hi = (a0, aN) if a0 <= aN else (aN, a0)
+        twopi = 2.0 * math.pi
+
+        # Bring target into [lo-2π, hi+2π] window, then clamp into [lo, hi] via wrapping
+        # Compute k so that target + k*2π is as close as possible to the scan span
+        k = round((lo - target) / twopi)
+        ang = target + k * twopi
+        if ang < lo:
+            ang += twopi * math.ceil((lo - ang) / twopi)
+        elif ang > hi:
+            ang -= twopi * math.ceil((ang - hi) / twopi)
+
+        # If still outside, it's truly out of FOV
+        if ang < lo - 1e-12 or ang > hi + 1e-12:
             return None
-        return float(r)
+
+        idx = int(round((ang - a0) / inc))
+        if idx < 0 or idx >= n:
+            return None
+
+        r = scan.ranges[idx]
+        return float(r) if (r is not None and math.isfinite(r)) else None
 
     # ------------- GAP FINDING (segments of indices and angles) -------------
     def _scan_to_numpy(self):
@@ -580,7 +629,6 @@ class RedBallTracker(Node):
             'radius'  -> gaps are runs where range > radius
         finite_only (radius mode): True -> only finite > radius; False -> OR with non-finite
         front_only: if True, restrict detection to sensor angles in [-pi/2, +pi/2]
-        returns: list of (start_idx, end_idx, start_ang, end_ang) [angles: sensor frame, rad]
         """
         rng = self._scan_to_numpy()
         if rng is None:
@@ -608,7 +656,14 @@ class RedBallTracker(Node):
             n = rng.size
             idx = np.arange(n, dtype=np.int64)
             ang = self.scan_angle_min + idx * self.scan_angle_increment
-            front_mask = ((ang >= 0) & (ang <= math.pi/2)) | (ang >= 3*math.pi/2)
+            # front_mask = ((ang >= 0) & (ang <= math.pi/2)) | (ang >= 3*math.pi/2)
+            # mask = base & front_mask
+            # Normalize angles to [0, 2π) before masking front
+            ang = self.scan_angle_min + idx * self.scan_angle_increment
+            ang_mod = np.mod(ang, 2.0 * math.pi)
+
+            # Front is 0° ± 90°  => [0, π/2] ∪ [3π/2, 2π)
+            front_mask = ((ang_mod >= 0.0) & (ang_mod <= 0.5 * math.pi)) | (ang_mod >= 1.5 * math.pi)
             mask = base & front_mask
         else:
             mask = base
@@ -713,7 +768,7 @@ class RedBallTracker(Node):
 
         # --- NEW: find gap segments by (B) radius threshold (> radius) ---
         # choose whatever radius makes sense for your environment; e.g., 2.0 m
-        rad_segments = self._find_gap_segments(mode='radius', radius=self.search_gap_radius, finite_only=True, front_only=True)
+        rad_segments = self._find_gap_segments(mode='radius', finite_only=True, front_only=True)
         self._log_gaps_with_thirds(f">{self.search_gap_radius:.1f}m", rad_segments)
         # if rad_segments:
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] count={len(rad_segments)}")
@@ -726,54 +781,121 @@ class RedBallTracker(Node):
         # else:
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] none")
     
+    def _begin_rotation(self):
+        """Reset rotation accounting at the moment a rotate state begins."""
+        self.accum_yaw = 0.0          # fresh accumulated |Δyaw|
+        self.accum_yaw_cd = 0.0       # fresh signed Δyaw (not strictly needed here, but clean)
+        self.prev_odom_yaw = None     # force odom diff to start from next odom tick
+
     def _rotate_z_d(self):
-        # Rotate x in d
+        # Rotate z in d
         self.speed, self.heading = 0.0, self.rotate_speed_ccw if self.search_rotate_d == 'ccw' else self.rotate_speed_cw
-        if abs(self.accum_yaw) > self.search_rotate_z:
+        if abs(self.accum_yaw) >= self.search_rotate_z:
             self.speed, self.heading = 0.0, 0.0
             self.accum_yaw = 0.0
             self.prev_odom_yaw = None
 
-            self.search_state_running = False
+            self.__update_state_running(False)
     
+    def _move_x_d(self):
+        # Move x in d
+        self.speed, self.heading = self.move_speed_fw if self.search_move_d == 'fw' else self.move_speed_bw, 0.0
+        if abs(self.accum_dist) > self.search_move_x:
+            self.speed, self.heading = 0.0, 0.0
+            self.accum_dist = 0.0
+            self.prev_odom_xy = None
+
+            self.__update_state_running(False)
+
     def _find_gaps(self):
         if self.last_seen_gap_pick:
             pass
         else:
-            self.search_gaps = self._find_gap_segments(mode='radius')
+            self.search_gaps = self._find_gap_segments(mode='radius', finite_only=False)
 
-        self.search_state_running = False
+        self.__update_state_running(False)
         self.search_plan.append(SearchStates.pick_a_gap)
         self.get_logger().info(f'[Find Gaps] {self.search_gaps}')
     
-    def __pick_left_most_gap(self):
-        if self.search_gaps is not None:
-            left_most_gaps, right_most_gaps = [], []
-            for (s, e, a_s, a_e) in self.search_gaps:
-                if a_s >=0 and a_e <=90:
-                    left_most_gaps.append((s, e, a_s, a_e))
-                if a_s >= 270 and a_e < 360:
-                    right_most_gaps.append((s, e, a_s, a_e))
+    # def __pick_left_most_gap(self):
+    #     if self.search_gaps is not None:
+    #         left_most_gaps, right_most_gaps = [], []
+    #         for (s, e, a_s, a_e) in self.search_gaps:
+    #             if a_s >=0 and a_e <=90:
+    #                 left_most_gaps.append((s, e, a_s, a_e))
+    #             if a_s >= 270 and a_e < 360:
+    #                 right_most_gaps.append((s, e, a_s, a_e))
             
-            if left_most_gaps:
-                max_s, left_max = None, None
-                for left_most_gap in left_most_gaps:
-                    if max_s is None or max_s < left_most_gap[0]:
-                        max_s = left_most_gap[0]
-                        left_max = left_most_gap
-            elif right_most_gaps:
-                min_s, left_max = None, None
-                for left_most_gap in right_most_gaps:
-                    if min_s is None or min_s > left_most_gap[0]:
-                        min_s = left_most_gap[0]
-                        left_max = left_most_gap
-            else:
-                return None
-            s, e, a_s, a_e = left_max
-            mid = self._mid_index(s, e)
-            a_mid = self._idx_to_ang(mid)
-            return s, e, mid, a_s, a_e, a_mid
-        return None
+    #         if left_most_gaps:
+    #             max_s, left_max = None, None
+    #             for left_most_gap in left_most_gaps:
+    #                 if max_s is None or max_s < left_most_gap[0]:
+    #                     max_s = left_most_gap[0]
+    #                     left_max = left_most_gap
+    #         elif right_most_gaps:
+    #             min_s, left_max = None, None
+    #             for left_most_gap in right_most_gaps:
+    #                 if min_s is None or min_s > left_most_gap[0]:
+    #                     min_s = left_most_gap[0]
+    #                     left_max = left_most_gap
+    #         else:
+    #             return None
+    #         s, e, a_s, a_e = left_max
+    #         mid = self._mid_index(s, e)
+    #         a_mid = self._idx_to_ang(mid)
+    #         return s, e, mid, a_s, a_e, a_mid
+    #     return None
+
+    def _wrap_0_2pi(self, a: float) -> float:
+        """Wrap angle to [0, 2π)."""
+        twopi = 2.0 * math.pi
+        a = a % twopi
+        return a if a >= 0.0 else a + twopi
+
+    def _wrap_mpi_pi(self, a: float) -> float:
+        """Wrap angle to [-π, π]."""
+        return self._ang_wrap_pi(a)
+
+    def __pick_left_most_gap(self):
+        """
+        Choose a front-facing gap whose mid-angle lies in the front-left sector.
+        Fallback to front-right if none. Everything in radians.
+        Sectors (in [0, 2π)): right-front = [0, π/2], left-front = [3π/2, 2π).
+        """
+        if not self.search_gaps:
+            return None
+
+        left_front = []
+        right_front = []
+
+        for (s, e, a_s, a_e) in self.search_gaps:
+            # Compute mid angle robustly (assume small arc, not spanning across big wrap)
+            a_s_m = self._wrap_0_2pi(a_s)
+            a_e_m = self._wrap_0_2pi(a_e)
+
+            # Handle wrap-around segments (e.g., 350°→10°)
+            # Compute shortest-arc mid:
+            da = self._ang_wrap_pi(a_e_m - a_s_m)
+            a_mid = self._wrap_0_2pi(a_s_m + 0.5 * da)
+
+            # Classify by mid angle
+            if a_mid >= 1.5 * math.pi or a_mid < 0.0:      # [3π/2, 2π)
+                left_front.append((s, e, a_s, a_e, a_mid))
+            elif 0.0 <= a_mid <= 0.5 * math.pi:            # [0, π/2]
+                right_front.append((s, e, a_s, a_e, a_mid))
+
+        # If multiple candidates, prefer the one most "left" (closest to 3π/2)
+        if left_front:
+            target = min(left_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 1.5 * math.pi)))
+        elif right_front:
+            # Fallback: choose the one closest to 0 (straight ahead/right)
+            target = min(right_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 0.0)))
+        else:
+            return None
+
+        s, e, a_s, a_e, a_mid = target
+        mid = self._mid_index(s, e)
+        return s, e, mid, a_s, a_e, a_mid
     
     def __pick_left_most_gap_segment(self):
         left_most_gap = self.__pick_left_most_gap()
@@ -790,20 +912,44 @@ class RedBallTracker(Node):
             return s, e, mid, a_s, a_e, a_mid
         return None
 
+    # def _pick_a_gap(self):
+    #     search_gap = None
+    #     if self.last_seen_gap_pick:
+    #         diff = self._ang_diff(self.odom_yaw, self.last_seen_ball_odom_yaw)
+    #         search_gap = None, None, None, None, None, diff
+    #     elif self.search_gap_selection == 'left_most_gap':
+    #         search_gap = self.__pick_left_most_gap()
+    #     elif self.search_gap_selection == 'left_most_gap_segment':
+    #         search_gap = self.__pick_left_most_gap_segment()
     def _pick_a_gap(self):
         search_gap = None
-        if self.last_seen_gap_pick:
-            diff = self._ang_diff(self.odom_yaw, self.last_seen_ball_odom_yaw)
-            search_gap = None, None, None, None, None, diff
-        elif self.search_gap_selection == 'left_most_gap':
-            search_gap = self.__pick_left_most_gap()
-        elif self.search_gap_selection == 'left_most_gap_segment':
-            search_gap = self.__pick_left_most_gap_segment()
+
+        # Use last-seen direction only if BOTH yaws are known; otherwise fall back
+        use_last_seen = (
+            self.last_seen_gap_pick
+            and (self.odom_yaw is not None)
+            and (self.last_seen_ball_odom_yaw is not None)
+        )
+
+        if use_last_seen:
+            # Signed delta from CURRENT -> LAST_SEEN (rotate toward where the ball was)
+            diff = self._ang_diff(self.last_seen_ball_odom_yaw, self.odom_yaw)
+            # Pack into the tuple shape expected later (a_mid sits in the last slot)
+            search_gap = (None, None, None, None, None, diff)
+        else:
+            # If we wanted to use last-seen but can't (no odom yet), disable that path
+            if self.last_seen_gap_pick and not use_last_seen:
+                self.last_seen_gap_pick = False
+
+            if self.search_gap_selection == 'left_most_gap':
+                search_gap = self.__pick_left_most_gap()
+            elif self.search_gap_selection == 'left_most_gap_segment':
+                search_gap = self.__pick_left_most_gap_segment()
 
         if search_gap is None:
             self.search_rotate_z = math.pi/2
             self.search_rotate_d = 'cw'
-            self.search_state_running = False
+            self.__update_state_running(False)
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
             self.get_logger().info(f'[Pick Gap] No Gaps Found! Rotating 90 to turn right to look for new gaps!')
         else:
@@ -812,86 +958,148 @@ class RedBallTracker(Node):
                 self.search_rotate_z = abs(a_mid)
                 self.search_rotate_d = 'ccw' if a_mid > 0 else 'cw'
                 self.last_seen_gap_pick = False
+                self.last_seen_ball_odom_yaw = None
                 self.get_logger().info(f'[Pick Gap] Planning to look in the direction of where the ball was last seen! Rotating {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             else:
-                self.search_rotate_z = a_mid
-                if self.search_rotate_z >= math.pi:
-                    self.search_rotate_z = 2*math.pi - self.search_rotate_z
-                    self.search_rotate_d = 'cw'
-                else:
-                    self.search_rotate_d = 'ccw'
+                # self.search_rotate_z = a_mid
+                # if self.search_rotate_z >= math.pi:
+                #     self.search_rotate_z = 2*math.pi - self.search_rotate_z
+                #     self.search_rotate_d = 'cw'
+                # else:
+                #     self.search_rotate_d = 'ccw'
+                
+                # Normalize to [-π, π] so sign indicates direction from forward
+                a_mid_signed = self._wrap_mpi_pi(a_mid)
+                self.search_rotate_z = abs(a_mid_signed)          # positive magnitude
+                self.search_rotate_d = 'ccw' if a_mid_signed > 0 else 'cw'
                 self.get_logger().info(f'[Pick Gap] Planning to Rotate {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             
-            self.search_state_running = False
+            self.__update_state_running(False)
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
     
-    def __check_for_left_opening(self, left_vals):
-        # moving average
-        m = np.isfinite(left_vals)
-        vals = np.where(m, left_vals, 0.0)
-        k  = int(self.smooth_win)
-        ker = np.ones(k, dtype=float)
+    # def __check_for_left_opening(self, left_vals):
+    #     # moving average
+    #     m = np.isfinite(left_vals)
+    #     vals = np.where(m, left_vals, 0.0)
+    #     k  = int(self.smooth_win)
+    #     ker = np.ones(k, dtype=float)
 
-        num = np.convolve(vals, ker, mode="same")
-        den = np.convolve(m.astype(float), ker, mode="same")
-        smooth = np.where(den > 0.0, num / np.maximum(den, 1e-6), np.nan)
+    #     num = np.convolve(vals, ker, mode="same")
+    #     den = np.convolve(m.astype(float), ker, mode="same")
+    #     smooth = np.where(den > 0.0, num / np.maximum(den, 1e-6), np.nan)
 
-        # --- First-difference on the smoothed signal ---
-        diff = np.diff(smooth)  # positive means distances increasing as angle advances
+    #     # --- First-difference on the smoothed signal ---
+    #     diff = np.diff(smooth)  # positive means distances increasing as angle advances
 
-        # --- Jumps mask: where increase exceeds your threshold ---
-        jumps = diff >= self.change_thresh_m
+    #     # --- Jumps mask: where increase exceeds your threshold ---
+    #     jumps = diff >= self.change_thresh_m
 
-        # --- Optional: ensure the distances around the jump are not garbage and are "open enough" ---
-        # We'll check that at least one side of the jump has finite distance >= REQUIRE_BASE_DIST
-        ok_dist = []
-        for i in range(len(diff)):
-            a = smooth[i]     # before
-            b = smooth[i+1]   # after
-            ok = ((np.isfinite(a) and a >= self.require_base_dist) or
-                (np.isfinite(b) and b >= self.require_base_dist))
-            ok_dist.append(ok)
-        ok_dist = np.array(ok_dist, dtype=bool)
+    #     # --- Optional: ensure the distances around the jump are not garbage and are "open enough" ---
+    #     # We'll check that at least one side of the jump has finite distance >= REQUIRE_BASE_DIST
+    #     ok_dist = []
+    #     for i in range(len(diff)):
+    #         a = smooth[i]     # before
+    #         b = smooth[i+1]   # after
+    #         ok = ((np.isfinite(a) and a >= self.require_base_dist) or
+    #             (np.isfinite(b) and b >= self.require_base_dist))
+    #         ok_dist.append(ok)
+    #     ok_dist = np.array(ok_dist, dtype=bool)
 
-        # Combine both conditions
-        jump_good = jumps & ok_dist
+    #     # Combine both conditions
+    #     jump_good = jumps & ok_dist
 
-        # --- Run-length encode to find the longest consecutive True stretch ---
-        def _max_consecutive_true(mask: np.ndarray) -> int:
-            if mask.size == 0:
-                return 0
-            # Count runs via diff trick
-            # Convert to int, pad zeros on both ends
-            x = mask.astype(int)
-            # Identify start positions of runs
-            starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
-            # Identify end positions of runs (inclusive)
-            ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
-            if starts.size == 0:
-                return 0
-            # Compute max length
-            lengths = (ends - starts + 1)
-            return int(lengths.max())
+    #     # --- Run-length encode to find the longest consecutive True stretch ---
+    #     def _max_consecutive_true(mask: np.ndarray) -> int:
+    #         if mask.size == 0:
+    #             return 0
+    #         # Count runs via diff trick
+    #         # Convert to int, pad zeros on both ends
+    #         x = mask.astype(int)
+    #         # Identify start positions of runs
+    #         starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
+    #         # Identify end positions of runs (inclusive)
+    #         ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
+    #         if starts.size == 0:
+    #             return 0
+    #         # Compute max length
+    #         lengths = (ends - starts + 1)
+    #         return int(lengths.max())
 
-        max_run = _max_consecutive_true(jump_good)
+    #     max_run = _max_consecutive_true(jump_good)
 
-        return (max_run >= self.min_consec_jumps), jump_good
+    #     return (max_run >= self.min_consec_jumps), jump_good
 
-    def __longest_run_span(self, mask: np.ndarray):
-            x = mask.astype(int)
-            starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
-            ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
-            if starts.size == 0:
-                return None
-            lengths = (ends - starts + 1)
-            i = int(np.argmax(lengths))
-            return int(starts[i]), int(ends[i])
+    # def __longest_run_span(self, mask: np.ndarray):
+    #         x = mask.astype(int)
+    #         starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
+    #         ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
+    #         if starts.size == 0:
+    #             return None
+    #         lengths = (ends - starts + 1)
+    #         i = int(np.argmax(lengths))
+    #         return int(starts[i]), int(ends[i])
     
+    # def __check_for_left_opening(self, left_90_val):
+    #     if self.last_left_90_val is not None:
+    #         if left_90_val - self.last_left_90_val > self.search_left_opening_thres:
+    #             self.last_left_90_val = left_90_val
+    #             return True
+    #     return False
+
+    def __check_for_left_opening(self, left_90_val: float) -> bool:
+        """
+        Detect a sudden *increase* in distance at ~+90° (left side).
+        - Initializes a baseline on first finite reading.
+        - Ignores non-finite values.
+        - Uses an EMA to keep baseline current without erasing spikes.
+        Returns True exactly on frames where the upward jump crosses the threshold.
+        """
+        # Ignore non-finite input
+        if left_90_val is None or not math.isfinite(left_90_val):
+            if left_90_val is not None and not math.isfinite(left_90_val):
+                return True
+            return False
+
+        # Initialize baseline on first good sample
+        if self.last_left_90_val is None or not math.isfinite(self.last_left_90_val):
+            self.last_left_90_val = float(left_90_val)
+            return False
+
+        # Compute jump from baseline
+        delta = float(left_90_val) - float(self.last_left_90_val)
+
+        # Opening event if jump >= threshold
+        opening = delta >= self.search_left_opening_thres
+
+        # Update baseline:
+        # - On event: snap baseline to the new higher value (we "accept" the opening as the new normal)
+        # - Otherwise: track slowly toward current with EMA to follow gradual changes
+        if opening:
+            self.last_left_90_val = float(left_90_val)
+        else:
+            b = float(self.last_left_90_val)
+            x = float(left_90_val)
+            beta = getattr(self, "left_opening_ema_beta", 0.20)
+            self.last_left_90_val = (1.0 - beta) * b + beta * x
+
+        return opening
+
+    def _has_scan(self) -> bool:
+        """True iff a LaserScan with usable ranges & angle_increment is available."""
+        return (
+            self.scan is not None
+            and getattr(self.scan, "ranges", None) is not None
+            and len(self.scan.ranges) > 0
+            and math.isfinite(getattr(self.scan, "angle_increment", float("nan")))
+            and self.scan.angle_increment != 0.0
+        )
+
     def _traverse_the_gap(self):
         if self.traverse_first:
             self.get_logger().info('[Traverse] First Traversal!')
             self.accum_yaw_cd = 0.0
             self.accum_dist = 0.0
+            self.last_left_90_val = None
             self.traverse_first = False
 
         if self.accum_dist > self.search_traverse_check_dist:
@@ -902,14 +1110,14 @@ class RedBallTracker(Node):
 
             self.search_rotate_z = 2*math.pi
             self.search_rotate_d = 'ccw'
-            self.search_state_running = False
+            self.__update_state_running(False)
             self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
             self.traverse_first = True
 
             self.get_logger().info(f'[Traverse] Checkpoint Reached! - Last Accum Yaw: {self.last_accum_yaw_cd}')
             return
 
-        if self.scan is not None or not self.scan.ranges:
+        if self._has_scan():
             if self.traversing_paused:
                 self.accum_yaw_cd = self.last_accum_yaw_cd
                 self.traversing_paused = False
@@ -933,19 +1141,21 @@ class RedBallTracker(Node):
             front_region       = np.r_[0:5, 355:360]        # 0 ±5°
             front_left_region  = np.arange(15, 75)          # 45 ±30°
             front_right_region = np.arange(285, 345)        # 315 ±30°
-            left_region = np.arange(45, 135)        #  45-135
+            # left_region = np.arange(45, 135)        #  45-135
+            left_90_point = 90.0  # 90 deg
 
             # --- Extract slices safely ---
             front_vals       = rng[front_region]
             front_left_vals  = rng[front_left_region]
             front_right_vals = rng[front_right_region]
-            left_vals = rng[left_region]
+            # left_vals = rng[left_region]
+            left_90_val = self._scan_value(left_90_point)
 
             # --- Compute safe minima ignoring NaN ---
             front_dist_min       = np.nanmin(front_vals)       if np.any(np.isfinite(front_vals)) else np.inf
             front_left_dist_min  = np.nanmin(front_left_vals)  if np.any(np.isfinite(front_left_vals)) else np.inf
             front_right_dist_min = np.nanmin(front_right_vals) if np.any(np.isfinite(front_right_vals)) else np.inf
-            left_opening_detected, jump_good = self.__check_for_left_opening(left_vals)
+            left_opening_detected = self.__check_for_left_opening(left_90_val)
 
             # Log some diagnostics:
             # self.get_logger().info(
@@ -963,36 +1173,36 @@ class RedBallTracker(Node):
                 self.get_logger().info(f'[Traverse] Left Opening Detected!')
                 self.speed, self.heading = 0.0, 0.0
 
-                span = self.__longest_run_span(jump_good)
-                if span is not None:
-                    i0, i1 = span
-                    # Map back to global scan index if needed:
-                    # global_idx = left_region[i0] .. left_region[i1]
-                    opening_mid_idx = int(left_region[(i0 + i1)//2])
-                    # self.get_logger().info(f"[LeftOpening] mid_idx={opening_mid_idx}")
+                # span = self.__longest_run_span(jump_good)
+                # if span is not None:
+                #     i0, i1 = span
+                #     # Map back to global scan index if needed:
+                #     # global_idx = left_region[i0] .. left_region[i1]
+                #     opening_mid_idx = int(left_region[(i0 + i1)//2])
+                #     # self.get_logger().info(f"[LeftOpening] mid_idx={opening_mid_idx}")
 
-                    self.search_rotate_z = self.scan_angle_min + opening_mid_idx * self.scan_angle_increment
-                    if self.search_rotate_z >= math.pi:
-                        self.search_rotate_z = 2*math.pi - self.search_rotate_z
-                        self.search_rotate_d = 'cw'
-                    else:
-                        self.search_rotate_d = 'ccw'
-                else:
-                    self.search_rotate_z = math.pi/4
-                    self.search_rotate_d = 'ccw'
+                #     self.search_rotate_z = self.scan_angle_min + opening_mid_idx * self.scan_angle_increment
+                #     if self.search_rotate_z >= math.pi:
+                #         self.search_rotate_z = 2*math.pi - self.search_rotate_z
+                #         self.search_rotate_d = 'cw'
+                #     else:
+                #         self.search_rotate_d = 'ccw'
+                # else:
+                self.search_rotate_z = math.pi/4
+                self.search_rotate_d = 'ccw'
                 
-                self.search_state_running = False
+                self.__update_state_running(False)
                 self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
                 self.traverse_first = True
                 self.get_logger().info(f'[Traverse] Rotating {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             else:
-                if front_left_dist_min != np.inf and front_left_dist_min <= self.search_gap_dist_ref/2:
-                    self.speed = self.s_speed_max
-                    self.heading = self.rotate_speed_cw
+                if front_left_dist_min != np.inf and front_left_dist_min <= 0.4*self.search_gap_dist_ref:
+                    self.speed = 0.5*self.s_speed_max
+                    self.heading = 0.5*self.rotate_speed_cw
                     self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Left!')
-                elif front_right_dist_min != np.inf and front_right_dist_min <= self.search_gap_dist_ref/2:
-                    self.speed = self.s_speed_max
-                    self.heading = self.rotate_speed_ccw
+                elif front_right_dist_min != np.inf and front_right_dist_min <= 0.4*self.search_gap_dist_ref:
+                    self.speed = 0.5*self.s_speed_max
+                    self.heading = 0.5*self.rotate_speed_ccw
                     self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Right!')
                 else:
                     if front_dist_min != np.inf:
@@ -1009,9 +1219,9 @@ class RedBallTracker(Node):
                         
                         self.search_rotate_z = 2*math.pi
                         self.search_rotate_d = 'ccw'
-                        self.search_state_running = False
+                        self.__update_state_running(False)
                         self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
-                        # self.search_state_running = False
+                        # self.__update_state_running(False)
                         # self.search_plan.extend([SearchStates.find_gaps])
                         self.traverse_first = True
                         self.get_logger().info(f'[Traverse] Done! Next Cycle!')
@@ -1038,32 +1248,42 @@ class RedBallTracker(Node):
         else:
             self.get_logger().warn('[Traverse] Scan sensor unavailable at the moment!')
 
+    def __update_state_running(self, state):
+        if self.search_state_running is not state:
+            self.search_state_running = state
+            # If we just started a rotate state, reset rotation accounting
+            if state and self.search_state == SearchStates.rotate_z_d:
+                self._begin_rotation()
+    
     def _search_fntr_gf(self):
+        if not self.search_plan:
+            self._reset_ball_found()
         if not self.search_state_running: self.search_plan.pop(0)
         self.search_state = self.search_plan[0]
 
         # Rotate z in d
         if self.search_state in (SearchStates.none, SearchStates.rotate_z_d):
-            if not self.search_state_running:
-                self.search_state_running = True
+            self.__update_state_running(True)
             self._rotate_z_d()
+
+        # Move x in d
+        if self.search_state == SearchStates.move_x_d:
+            self.__update_state_running(True)
+            self._move_x_d()
 
         # Find Gaps
         if self.search_state == SearchStates.find_gaps:
-            if not self.search_state_running:
-                self.search_state_running = True
+            self.__update_state_running(True)
             self._find_gaps()
         
         # Pick a Gap
         if self.search_state == SearchStates.pick_a_gap:
-            if not self.search_state_running:
-                self.search_state_running = True
+            self.__update_state_running(True)
             self._pick_a_gap()
         
         # Traverse the Gap
         if self.search_state == SearchStates.traverse_the_gap:
-            if not self.search_state_running:
-                self.search_state_running = True
+            self.__update_state_running(True)
             self._traverse_the_gap()
 
     def _search(self):
@@ -1098,8 +1318,9 @@ class RedBallTracker(Node):
             self.get_logger().info('Red Ball Detected!')
             
             self._reset_ball_found()
-            self.last_seen_ball_odom_yaw = self.odom_yaw
-            self.last_seen_gap_pick = True
+            if self.odom_yaw is not None:
+                self.last_seen_ball_odom_yaw = self.odom_yaw
+                self.last_seen_gap_pick = True
 
             cx, cy, w, h, (x, y, bw, bh) = result
             # Logging pixels from top-left origin
@@ -1113,6 +1334,15 @@ class RedBallTracker(Node):
         else:
             self.get_logger().info('No Red Ball Detected!')
             self._reset_ball_lost()
+
+            # if self.last_seen_ball_odom_yaw is not None:
+            #     self.search_rotate_d = 'cw' if self.odom_yaw - self.last_seen_ball_odom_yaw < 0 else 'ccw'
+            if (
+                self.last_seen_ball_odom_yaw is not None
+                and not (self.search_state == SearchStates.rotate_z_d and self.search_state_running)
+                and self.odom_yaw is not None
+            ):
+                self.search_rotate_d = 'cw' if (self.odom_yaw - self.last_seen_ball_odom_yaw) < 0 else 'ccw'
             
             if self.search_mode != 'none':
                 self._search()
