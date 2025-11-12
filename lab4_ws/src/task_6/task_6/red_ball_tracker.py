@@ -363,11 +363,11 @@ class RedBallTracker(Node):
         s_kd = self.S_KD_E + sigma_speed * (self.S_KD_H - self.S_KD_E)
         self.pid_speed.set_gains(s_kp, s_ki, s_kd)
 
-        self.get_logger().info(
-            f"[Scheduler] sigma_turn={sigma_turn:.2f} sigma_dist={sigma_dist:.2f} sigma_speed={sigma_speed:.2f} "
-            f"| HeadingGains(Kp,Ki,Kd)=({h_kp:.2f},{h_ki:.2f},{h_kd:.2f}) "
-            f"| SpeedGains(Kp,Ki,Kd)=({s_kp:.2f},{s_ki:.2f},{s_kd:.2f})"
-        )
+        # self.get_logger().info(
+        #     f"[Scheduler] sigma_turn={sigma_turn:.2f} sigma_dist={sigma_dist:.2f} sigma_speed={sigma_speed:.2f} "
+        #     f"| HeadingGains(Kp,Ki,Kd)=({h_kp:.2f},{h_ki:.2f},{h_kd:.2f}) "
+        #     f"| SpeedGains(Kp,Ki,Kd)=({s_kp:.2f},{s_ki:.2f},{s_kd:.2f})"
+        # )
 
         # compute speed and heading with a PID step
         speed = self.pid_speed.step(speed_err, self.dt)
@@ -446,11 +446,11 @@ class RedBallTracker(Node):
 
         self.prev_speed, self.prev_heading = v_cmd, w_cmd
 
-        self.get_logger().info(
-            f"[PP] alpha={alpha:.3f} e={e:.3f} "
-            f"| v_des={v_des:.3f} (fwd_cap={v_fwd_cap:.2f}, back_cap={v_back_cap:.2f}) "
-            f"| kappa={kappa:.3f} omega={omega_des:.3f} -> v={v_cmd:.3f}, w={w_cmd:.3f}"
-        )
+        # self.get_logger().info(
+        #     f"[PP] alpha={alpha:.3f} e={e:.3f} "
+        #     f"| v_des={v_des:.3f} (fwd_cap={v_fwd_cap:.2f}, back_cap={v_back_cap:.2f}) "
+        #     f"| kappa={kappa:.3f} omega={omega_des:.3f} -> v={v_cmd:.3f}, w={w_cmd:.3f}"
+        # )
 
         return v_cmd, w_cmd
 
@@ -510,7 +510,7 @@ class RedBallTracker(Node):
         scan = self.scan
         # Use numpy for fast masking; keep NaN/inf as-is for detection
         rng = np.array(scan.ranges, dtype=float)
-        self.get_logger().info(f'[SCAN] Range Len: {len(rng)}, Angle Min: {scan.angle_min}, Angle Increment: {scan.angle_increment}, Angle Max: {scan.angle_max}')
+        # self.get_logger().info(f'[SCAN] Range Len: {len(rng)}, Angle Min: {scan.angle_min}, Angle Increment: {scan.angle_increment}, Angle Max: {scan.angle_max}')
         
         if not self.capture_scan_params:
             self.scan_angle_min = scan.angle_min
@@ -937,7 +937,7 @@ class RedBallTracker(Node):
                     # Map back to global scan index if needed:
                     # global_idx = left_region[i0] .. left_region[i1]
                     opening_mid_idx = int(left_region[(i0 + i1)//2])
-                    self.get_logger().info(f"[LeftOpening] mid_idx={opening_mid_idx}")
+                    # self.get_logger().info(f"[LeftOpening] mid_idx={opening_mid_idx}")
 
                     self.search_rotate_z = self.scan_angle_min + opening_mid_idx * self.scan_angle_increment
                     if self.search_rotate_z >= math.pi:
