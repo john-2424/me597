@@ -41,7 +41,7 @@ class RedBallTracker(Node):
 
         # Runtime options/ROS Params
         self.declare_parameter('controller', 'pp')     # 'pid', 'pidgs', 'pp'
-        self.declare_parameter('search_mode', 'none')   # 'none', 'frontier', 'wall_following'
+        self.declare_parameter('search_mode', 'fntr-gf')   # 'none', 'fntr-gf'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
 
@@ -56,10 +56,8 @@ class RedBallTracker(Node):
         self.speed_tol = 1
         self.heading_reference = None
         self.heading_tol = 1
-        self.prev_speed = 0.0
-        self.prev_heading = 0.0
-        self.log_prev_speed = 0.0
-        self.log_prev_heading = 0.0
+        self.prev_speed, self.prev_heading = 0.0, 0.0
+        self.log_prev_speed, self.log_prev_heading = 0.0, 0.0
         
         # PID parameters
         self.prev_sec = None
@@ -135,6 +133,7 @@ class RedBallTracker(Node):
         self.search_gap_selection = 'left_most_gap_segment'  # left_most_gap_segment, or left_most_gap
         self.search_gap_dist_ref = 0.5  # m
         self.search_traverse_check_dist = 1.0  # m
+        self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = '', True, []
     
         self.change_thresh_m = 0.25   # meters; "sudden" increase threshold per step
         self.min_consec_jumps = 45     # how many consecutive jumps to call it a real opening
@@ -727,10 +726,10 @@ class RedBallTracker(Node):
         # else:
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] none")
     
-    def _rotate_z_d(self, z, d='ccw'):
+    def _rotate_z_d(self):
         # Rotate x
-        self.speed, self.heading = 0.0, self.rotate_speed_ccw if d == 'ccw' else self.rotate_speed_cw
-        if abs(self.accum_yaw) > z:
+        self.speed, self.heading = 0.0, self.rotate_speed_ccw if self.search_rotate_d == 'ccw' else self.rotate_speed_cw
+        if abs(self.accum_yaw) > self.search_rotate_z:
             self.speed, self.heading = 0.0, 0.0
             self.prev_odom_yaw = None
 
@@ -996,7 +995,7 @@ class RedBallTracker(Node):
         else:
             self.get_logger().warn('Scan sensor unavailable at the moment!')
 
-    def _search_fntr(self):
+    def _search_fntr_gf(self):
         if not self.search_state_running: self.search_plan.pop(0)
         self.search_state = self.search_plan[0]
 
@@ -1025,8 +1024,8 @@ class RedBallTracker(Node):
             self._traverse_the_gap()
 
     def _search(self):
-        if self.search_mode == 'fntr':
-            self._search_fntr()
+        if self.search_mode == 'fntr-gf':
+            self._search_fntr_gf()
 
     def listener_callback(self, msg):
         # Logs the received messages from a topic
@@ -1072,6 +1071,9 @@ class RedBallTracker(Node):
             self.get_logger().info('No Red Ball Detected!')
             self._reset_ball_lost()
             
+            if self.log_prev_search_state != self.search_state or self.log_prev_search_state_running != self.search_state_running or self.log_prev_search_plan != self.search_plan:
+                self.get_logger().info(f'Search State: {self.search_state}; Search State Status: {self.search_state_running}; Search Plan: {self.search_plan}')
+                self.log_prev_search_state, self.log_prev_search_state_running, self.log_prev_search_plan = self.search_state, self.search_state_running, self.search_plan
             if self.search_mode != 'none':
                 self._search()
 
@@ -1092,7 +1094,7 @@ class RedBallTracker(Node):
         ## -- Stop every some distance between the bot's initial position after findig a gap to the gap direction, and perform a 360 to look for the ball.
         ## -- Keep track of the last seen angle of the ball and consider it for the next find gaps state 
 
-        if self.log_prev_speed != self.speed and self.log_prev_heading != self.heading:
+        if self.log_prev_speed != self.speed or self.log_prev_heading != self.heading:
             self.get_logger().info(f'[Robot] Speed: {self.speed}; Heading: {self.heading}')
             self.log_prev_speed, self.log_prev_heading = self.speed, self.heading
         
