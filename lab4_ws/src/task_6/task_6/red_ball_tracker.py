@@ -1,3 +1,4 @@
+import time
 import math
 import numpy as np
 import cv2 as cv
@@ -13,6 +14,7 @@ from nav_msgs.msg import Odometry
 from task_6.utils.detect import find_object_hsv, find_object_hsv_triangle, find_object_hsv_circle, LOWER_RED_1, LOWER_RED_2, UPPER_RED_1, UPPER_RED_2
 from task_6.utils.pid import PID
 from task_6.utils.helper import clamp01
+from task_6.utils.search import SearchStates
 
 class RedBallTracker(Node):
     def __init__(self):
@@ -49,6 +51,7 @@ class RedBallTracker(Node):
         self.frame_height = None
 
         # Tracking Reference params
+        self.dt = 0.0
         self.speed_reference = None
         self.speed_tol = 1
         self.heading_reference = None
@@ -112,15 +115,68 @@ class RedBallTracker(Node):
         self.pp_reverse_ok = True  # allow reverse when too close
 
         self.scan = None
+        self.capture_scan_params = False
+        self.scan_angle_min = None
+        self.scan_angle_max = None
+        self.scan_angle_increment = None
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
 
         # Search params
+        self.search_rotate_z = 2*math.pi
+        self.search_rotate_d = 'ccw'
+        self.search_plan = [SearchStates.rotate_z_d, SearchStates.find_gaps]
+        self.search_state = None
+        self.search_state_running = None
         self.search_rotate = True
+        self.rotate_speed_ccw = 0.6  # rad/s
+        self.rotate_speed_cw = -0.6  # rad/s
+        self.search_gap_radius = 2  # m
+        self.search_gaps = None
+        self.search_gap_selection = 'left_most_gap_segment'  # left_most_gap_segment, or left_most_gap
+        self.search_gap_dist_ref = 0.5  # m
+        self.search_traverse_check_dist = 1.0  # m
+    
+        self.change_thresh_m = 0.25   # meters; "sudden" increase threshold per step
+        self.min_consec_jumps = 45     # how many consecutive jumps to call it a real opening
+        self.smooth_win = 9           # moving-average window (odd is nice), NaN-aware
+        self.require_base_dist = 0.5  # optional: require distances in the opening to be at least this (meters)
 
-        # Odometry / yaw tracking
+        # PID parameters for Search
+        self.s_prev_sec = None
+        self.s_speed_max = 0.20
+        self.s_heading_max = 1.0
+        self.s_turn_coeff = 1.0    # 0.20 coeff to stop bot by zeroing bot vel, 1.0 to ignore this logic
+        self.s_speed_db   = 0.05      # ~5% size error
+        self.s_heading_db = 0.02      # ~2% of half-frame
+        self.s_max_speed_slew   = 0.05     # m/s per cycle
+        self.s_max_heading_slew = 0.20     # rad/s per cycle
+        self.s_prev_max_speed_err = -4.0
+        # PIDs for speed and yaw
+        # normalized-error tuning (err in [-1,1])
+        self.search_pid_speed = PID(
+            kp=0.18, ki=0.03, kd=0.08,
+            i_limit=0.8,
+            out_limit=(-self.s_speed_max, self.s_speed_max)
+        )
+        self.search_pid_heading = PID(
+            kp=1.00, ki=0.02, kd=0.25,
+            i_limit=0.8,
+            out_limit=(-self.s_heading_max, self.s_heading_max)
+        )
+        self.traversing_paused = False
+        self.last_accum_yaw_cd = 0.0
+        
+        # Odometry - dist, yaw tracking
         self.accum_yaw = 0.0        # accumulated rotation magnitude [rad]
+        self.accum_yaw_cd = 0.0  # accumulated rotation magnitude considering direction[rad]
         self.odom_yaw = None
         self.prev_odom_yaw = None
+        self.accum_dist = 0.0          # total path length [m]
+        self.accum_dist_forward = 0.0  # signed forward distance [m] (optional)
+        self.prev_odom_xy = None
+        self.prev_odom_t  = None
+        self.max_step_m   = 0.50       # ignore bigger-than-this single-step jumps
+        self.segment_dist = 0.0
 
         self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
 
@@ -157,8 +213,44 @@ class RedBallTracker(Node):
 
         d = self._ang_diff(self.odom_yaw, self.prev_odom_yaw)
         # accumulate absolute rotation regardless of direction
-        self.accum_yaw += d  # abs(d)
+        self.accum_yaw += abs(d)
+        self.accum_yaw_cd += d  # Considering direction
         self.prev_odom_yaw = self.odom_yaw
+
+        px = msg.pose.pose.position.x
+        py = msg.pose.pose.position.y
+        t = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec if msg.header.stamp else None
+
+        if self.prev_odom_xy is None:
+            self.prev_odom_xy = (px, py)
+            self.prev_odom_t = t
+            return
+
+        x0, y0 = self.prev_odom_xy
+        dx = px - x0
+        dy = py - y0
+        step = math.hypot(dx, dy)
+
+        # --- SMART JUMP FILTER (inserted right here) ---
+        if self.prev_odom_t is not None and t is not None:
+            dt = max(1e-3, t - self.prev_odom_t)
+        else:
+            dt = 0.0
+
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        v_body = math.hypot(vx, vy)
+        v_cap = 1.5 * v_body * dt + 0.05  # allowable step size
+
+        # --- update accumulators only if movement is valid ---
+        if step <= max(self.max_step_m, v_cap):
+            self.accum_dist += step
+            self.accum_dist_forward += (dx * math.cos(self.odom_yaw) + dy * math.sin(self.odom_yaw))
+            self.segment_dist += step
+
+        # --- update previous values ---
+        self.prev_odom_xy = (px, py)
+        self.prev_odom_t = t
 
     def _detect(self, frame):
         if self.detector_mode == 'hsv_circle':
@@ -171,7 +263,7 @@ class RedBallTracker(Node):
         delta = max(-max_delta, min(max_delta, new - prev))
         return prev + delta
     
-    def __plan_pid(self, cx, bw, bh, dt):
+    def __plan_pid(self, cx, bw, bh):
         # now_sec = self.get_clock().now().nanoseconds * 1e-9
         # dt = now_sec - self.prev_sec if self.prev_sec is not None else 1.0 / 10.0
         # self.prev_sec = now_sec
@@ -192,8 +284,8 @@ class RedBallTracker(Node):
         heading_err = max(-1.5, min(1.5, heading_err))
         self.get_logger().info(f'[Heading] Ref: {self.heading_reference}; Curr: {heading_curr}; Err: {heading_err}')
 
-        speed = self.pid_speed.step(speed_err, dt)
-        heading = self.pid_heading.step(heading_err, dt)
+        speed = self.pid_speed.step(speed_err, self.dt)
+        heading = self.pid_heading.step(heading_err, self.dt)
 
         # deadbands (on normalized error)
         if abs(speed_err) < self.speed_db: speed = 0.0
@@ -210,7 +302,7 @@ class RedBallTracker(Node):
 
         return speed, heading
 
-    def __plan_pidgs(self, cx, bw, bh, dt):
+    def __plan_pidgs(self, cx, bw, bh):
         """Mnemonic: “Turn = Tighten heading, Tame speed.” Heading: P↑ D↑ as σ_turn↑. Speed: P↓ I↓ as σ_turn↑."""
         # normalized errors
         speed_curr = bw
@@ -252,8 +344,8 @@ class RedBallTracker(Node):
         )
 
         # compute speed and heading with a PID step
-        speed = self.pid_speed.step(speed_err, dt)
-        heading = self.pid_heading.step(heading_err, dt)
+        speed = self.pid_speed.step(speed_err, self.dt)
+        heading = self.pid_heading.step(heading_err, self.dt)
 
         # deadbands on normalized errors
         if abs(speed_err) < self.speed_db: speed = 0.0
@@ -277,7 +369,7 @@ class RedBallTracker(Node):
 
         return speed, heading
     
-    def __plan_pp(self, cx, bw, bh, dt):
+    def __plan_pp(self, cx, bw, bh):
         # earing (PP)
         u = (cx - 0.5*self.frame_width) / max(0.5*self.frame_width, 1e-6)
         # make left target => positive alpha => CCW (left) turn
@@ -336,13 +428,13 @@ class RedBallTracker(Node):
 
         return v_cmd, w_cmd
 
-    def _plan(self, cx, bw, bh, dt):
+    def _plan(self, cx, bw, bh):
         if self.controller == 'pid':
-            return self.__plan_pid(cx, bw, bh, dt)
+            return self.__plan_pid(cx, bw, bh)
         elif self.controller == 'pidgs':
-            return self.__plan_pidgs(cx, bw, bh, dt)
+            return self.__plan_pidgs(cx, bw, bh)
         elif self.controller == 'pp':
-            return self.__plan_pp(cx, bw, bh, dt)
+            return self.__plan_pp(cx, bw, bh)
         else:
             return 0.0, 0.0
 
@@ -393,7 +485,12 @@ class RedBallTracker(Node):
         # Use numpy for fast masking; keep NaN/inf as-is for detection
         rng = np.array(scan.ranges, dtype=float)
         self.get_logger().info(f'[SCAN] Range Len: {len(rng)}, Angle Min: {scan.angle_min}, Angle Increment: {scan.angle_increment}, Angle Max: {scan.angle_max}')
-        return rng, scan.angle_min, scan.angle_increment, scan.angle_max
+        
+        if not self.capture_scan_params:
+            self.scan_angle_min = scan.angle_min
+            self.scan_angle_max = scan.angle_max
+            self.scan_angle_increment = scan.angle_increment
+        return rng
 
     def _mask_to_segments(self, mask: np.ndarray):
         """
@@ -440,61 +537,27 @@ class RedBallTracker(Node):
 
         return segs
 
-    def _segments_to_angles(self, segs, angle_min, angle_inc):
+    def _segments_to_angles(self, segs):
         """
         For each (start_idx, end_idx) inclusive, compute (ang_start, ang_end) in radians.
         Uses the sensor's native frame: angle = angle_min + idx * angle_inc.
         """
         out = []
         for s, e in segs:
-            ang_s = angle_min + s * angle_inc
-            ang_e = angle_min + e * angle_inc
+            ang_s = self.scan_angle_min + s * self.scan_angle_increment
+            ang_e = self.scan_angle_min + e * self.scan_angle_increment
             out.append((s, e, ang_s, ang_e))
         return out
 
-    # def _find_gap_segments(self, mode='nan', radius=None, finite_only=True):
-    #     """
-    #     mode: 'nan'  -> gaps are runs of non-finite (inf/NaN).
-    #         'radius' -> gaps are runs where range > radius (optionally also must be finite).
-    #     radius: float, used only when mode='radius'.
-    #     finite_only (radius mode): if True, only counts finite readings > radius as gaps;
-    #                             if False, non-finite are also treated as gaps.
-    #     returns: list of tuples (start_idx, end_idx, start_ang, end_ang) inclusive indices,
-    #             angles in sensor frame (radians).
-    #     """
-    #     rng, a_min, a_inc, a_max = self._scan_to_numpy()
-    #     if rng is None:
-    #         return []
-
-    #     if mode == 'nan':
-    #         mask = ~np.isfinite(rng)  # True where inf/NaN
-    #     elif mode == 'radius':
-    #         if radius is None or radius <= 0:
-    #             # Sensible default: slightly less than max range if available
-    #             # If max_range is available in LaserScan, you could use self.scan.range_max.
-    #             radius = getattr(self.scan, 'range_max', np.nanmax(np.where(np.isfinite(rng), rng, 0.0)) * 0.9) or 1.0
-    #         if finite_only:
-    #             mask = (np.isfinite(rng)) & (rng > radius)
-    #         else:
-    #             # treat non-finite also as gaps
-    #             mask = (~np.isfinite(rng)) | (rng > radius)
-    #     else:
-    #         # Unknown mode -> no segments
-    #         return []
-
-    #     segs = self._mask_to_segments(mask)
-    #     return self._segments_to_angles(segs, a_min, a_inc)
-
-    def _find_gap_segments(self, mode='nan', radius=None, finite_only=True, front_only=True):
+    def _find_gap_segments(self, mode='nan', finite_only=True, front_only=True):
         """
         mode: 'nan'     -> gaps are runs of non-finite (inf/NaN)
             'radius'  -> gaps are runs where range > radius
-        radius: threshold used when mode='radius'
         finite_only (radius mode): True -> only finite > radius; False -> OR with non-finite
         front_only: if True, restrict detection to sensor angles in [-pi/2, +pi/2]
         returns: list of (start_idx, end_idx, start_ang, end_ang) [angles: sensor frame, rad]
         """
-        rng, a_min, a_inc, a_max = self._scan_to_numpy()
+        rng = self._scan_to_numpy()
         if rng is None:
             return []
 
@@ -502,16 +565,16 @@ class RedBallTracker(Node):
         if mode == 'nan':
             base = ~np.isfinite(rng)
         elif mode == 'radius':
-            if radius is None or radius <= 0:
-                radius = getattr(self.scan, 'range_max', None)
-                if radius is None or not np.isfinite(radius):
+            if self.search_gap_radius is None or self.search_gap_radius <= 0:
+                self.search_gap_radius = getattr(self.scan, 'range_max', None)
+                if self.search_gap_radius is None or not np.isfinite(self.search_gap_radius):
                     # fallback: 90% of finite max or 1.0
                     finite_vals = rng[np.isfinite(rng)]
-                    radius = (0.9 * finite_vals.max()) if finite_vals.size else 1.0
+                    self.search_gap_radius = (0.9 * finite_vals.max()) if finite_vals.size else 1.0
             if finite_only:
-                base = (np.isfinite(rng)) & (rng > radius)
+                base = (np.isfinite(rng)) & (rng > self.search_gap_radius)
             else:
-                base = (~np.isfinite(rng)) | (rng > radius)
+                base = (~np.isfinite(rng)) | (rng > self.search_gap_radius)
         else:
             return []
 
@@ -519,14 +582,14 @@ class RedBallTracker(Node):
         if front_only:
             n = rng.size
             idx = np.arange(n, dtype=np.int64)
-            ang = a_min + idx * a_inc
+            ang = self.scan_angle_min + idx * self.scan_angle_increment
             front_mask = ((ang >= 0) & (ang <= math.pi/2)) | (ang >= 3*math.pi/2)
             mask = base & front_mask
         else:
             mask = base
 
         segs = self._mask_to_segments(mask)
-        return self._segments_to_angles(segs, a_min, a_inc)
+        return self._segments_to_angles(segs)
 
     # Optional: convert sensor angle (rad) -> your compass style degrees
     def _sensor_rad_to_deg(self, ang_rad: float) -> float:
@@ -625,9 +688,8 @@ class RedBallTracker(Node):
 
         # --- NEW: find gap segments by (B) radius threshold (> radius) ---
         # choose whatever radius makes sense for your environment; e.g., 2.0 m
-        RADIUS = 2.0
-        rad_segments = self._find_gap_segments(mode='radius', radius=RADIUS, finite_only=True, front_only=True)
-        self._log_gaps_with_thirds(f">{RADIUS:.1f}m", rad_segments)
+        rad_segments = self._find_gap_segments(mode='radius', radius=self.search_gap_radius, finite_only=True, front_only=True)
+        self._log_gaps_with_thirds(f">{self.search_gap_radius:.1f}m", rad_segments)
         # if rad_segments:
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] count={len(rad_segments)}")
         #     for (s, e, a_s, a_e) in rad_segments:
@@ -639,6 +701,295 @@ class RedBallTracker(Node):
         # else:
         #     self.get_logger().info(f"[Gaps: >{RADIUS:.1f}m] none")
     
+    def _rotate_z_d(self, z, d='ccw'):
+        # Rotate x
+        self.speed, self.heading = 0.0, self.rotate_speed_ccw if d == 'ccw' else self.rotate_speed_cw
+        if abs(self.accum_yaw) > z:
+            self.speed, self.heading = 0.0, 0.0
+            self.prev_odom_yaw = None
+
+            self.search_state_running = False
+    
+    def _find_gaps(self):
+        self.search_gaps = self._find_gap_segments(mode='radius')
+
+        self.search_state_running = False
+        self.search_plan.append(SearchStates.pick_a_gap)
+    
+    def __pick_left_most_gap(self):
+        if self.search_gaps is not None:
+            left_most_gaps = []
+            for (s, e, a_s, a_e) in self.search_gaps:
+                if a_s >=0 and a_e <=90:
+                    left_most_gaps.append((s, e, a_s, a_e))
+            s, e, a_s, a_e = left_most_gaps[-1]
+            mid = self._mid_index(s, e)
+            a_mid = self._idx_to_ang(mid)
+            return s, e, mid, a_s, a_e, a_mid
+        return None
+    
+    def __pick_left_most_gap_segment(self):
+        left_most_gap = self.__pick_left_most_gap()
+        if left_most_gap is not None:
+            s, e, mid, a_s, a_e, a_mid = left_most_gap
+            thirds = self._split_three_segments(s, e)
+            for (ts, te) in thirds:
+                if ts is None:
+                    continue
+                tmid = self._mid_index(ts, te)
+                a_ts, a_te = self._idx_to_ang(ts), self._idx_to_ang(te)
+                a_tmid = self._idx_to_ang(tmid)
+                return (ts, te, tmid, a_ts, a_te, a_tmid)
+            return s, e, mid, a_s, a_e, a_mid
+        return None
+
+    def _pick_a_gap(self):
+        search_gap = None
+        if self.search_gap_selection == 'left_most_gap':
+            search_gap = self.__pick_left_most_gap()
+        elif self.search_gap_selection == 'left_most_gap_segment':
+            search_gap = self.__pick_left_most_gap_segment()
+
+        if search_gap is None:
+            self.search_rotate_z = math.pi/2
+            self.search_rotate_d = 'cw'
+            self.search_state_running = False
+            self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
+        else:
+            s, e, mid, a_s, a_e, a_mid = search_gap
+            self.search_rotate_z = self.scan_angle_min + a_mid * self.scan_angle_increment
+            if self.search_rotate_z >= math.pi:
+                self.search_rotate_z = 2*math.pi - self.search_rotate_z
+                self.search_rotate_d = 'cw'
+            else:
+                self.search_rotate_d = 'ccw'
+            
+            self.search_state_running = False
+            self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
+    
+    def __check_for_left_opening(self, left_vals):
+        # moving average
+        m = np.isfinite(left_vals)
+        vals = np.where(m, left_vals, 0.0)
+        k  = int(self.smooth_win)
+        ker = np.ones(k, dtype=float)
+
+        num = np.convolve(vals, ker, mode="same")
+        den = np.convolve(m.astype(float), ker, mode="same")
+        smooth = np.where(den > 0.0, num / np.maximum(den, 1e-6), np.nan)
+
+        # --- First-difference on the smoothed signal ---
+        diff = np.diff(smooth)  # positive means distances increasing as angle advances
+
+        # --- Jumps mask: where increase exceeds your threshold ---
+        jumps = diff >= self.change_thresh_m
+
+        # --- Optional: ensure the distances around the jump are not garbage and are "open enough" ---
+        # We'll check that at least one side of the jump has finite distance >= REQUIRE_BASE_DIST
+        ok_dist = []
+        for i in range(len(diff)):
+            a = smooth[i]     # before
+            b = smooth[i+1]   # after
+            ok = ((np.isfinite(a) and a >= self.require_base_dist) or
+                (np.isfinite(b) and b >= self.require_base_dist))
+            ok_dist.append(ok)
+        ok_dist = np.array(ok_dist, dtype=bool)
+
+        # Combine both conditions
+        jump_good = jumps & ok_dist
+
+        # --- Run-length encode to find the longest consecutive True stretch ---
+        def _max_consecutive_true(mask: np.ndarray) -> int:
+            if mask.size == 0:
+                return 0
+            # Count runs via diff trick
+            # Convert to int, pad zeros on both ends
+            x = mask.astype(int)
+            # Identify start positions of runs
+            starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
+            # Identify end positions of runs (inclusive)
+            ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
+            if starts.size == 0:
+                return 0
+            # Compute max length
+            lengths = (ends - starts + 1)
+            return int(lengths.max())
+
+        max_run = _max_consecutive_true(jump_good)
+
+        return (max_run >= self.min_consec_jumps), jump_good
+
+    def __longest_run_span(self, mask: np.ndarray):
+            x = mask.astype(int)
+            starts = np.where(np.diff(np.r_[0, x]) == 1)[0]
+            ends   = np.where(np.diff(np.r_[x, 0]) == -1)[0] - 1
+            if starts.size == 0:
+                return None
+            lengths = (ends - starts + 1)
+            i = int(np.argmax(lengths))
+            return int(starts[i]), int(ends[i])
+    
+    def _traverse_the_gap(self):
+        if self.segment_dist > self.search_traverse_check_dist:
+            self.speed, self.heading = 0.0, 0.0
+            self.traversing_paused = True
+            self.last_accum_yaw_cd = self.accum_yaw_cd
+
+            self.search_rotate_z = 2*math.pi
+            self.search_rotate_d = 'ccw'
+            self.search_state_running = False
+            self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
+            return
+
+        if self.scan is not None or not self.scan.ranges:
+            if self.traversing_paused:
+                self.accum_yaw_cd = self.last_accum_yaw_cd
+                self.traversing_paused = False
+            
+            # scan = self.scan
+            # front_dist = scan.ranges[:5] + scan.ranges[354:]  # Front 0 +- 5
+            # front_dist_min = min(front_dist)
+            # front_left_dist = scan.ranges[35:55]  # Front Left 45 +- 10
+            # front_left_dist_min = min(front_left_dist)
+            # front_right_dist = scan.ranges[305:325]  # Front Right 315 +- 10
+            # front_right_dist_min = min(front_right_dist)
+
+            scan = self.scan
+            rng = np.array(scan.ranges, dtype=float)
+
+            # Replace non-finite (inf, nan) with np.nan for clean masking
+            rng[~np.isfinite(rng)] = np.nan
+
+            # --- Define regions in degrees (assuming len=360; adjust if different) ---
+            front_region       = np.r_[0:5, 355:360]        # 0 ±5°
+            front_left_region  = np.arange(35, 55)          # 45 ±10°
+            front_right_region = np.arange(305, 325)        # 315 ±10°
+            left_region = np.arange(45, 135)        #  45-135
+
+            # --- Extract slices safely ---
+            front_vals       = rng[front_region]
+            front_left_vals  = rng[front_left_region]
+            front_right_vals = rng[front_right_region]
+            left_vals = rng[left_region]
+
+            # --- Compute safe minima ignoring NaN ---
+            front_dist_min       = np.nanmin(front_vals)       if np.any(np.isfinite(front_vals)) else np.inf
+            front_left_dist_min  = np.nanmin(front_left_vals)  if np.any(np.isfinite(front_left_vals)) else np.inf
+            front_right_dist_min = np.nanmin(front_right_vals) if np.any(np.isfinite(front_right_vals)) else np.inf
+            left_opening_detected, jump_good = self.__check_for_left_opening(left_vals)
+
+            # Log some diagnostics:
+            # self.get_logger().info(
+            #     f"[LeftOpening] opening={left_opening_detected} | max_run={max_run} "
+            #     f"| thr={CHANGE_THRESH_M:.2f}m | smooth_win={SMOOTH_WIN} | min_consec={MIN_CONSEC_JUMPS}"
+            # )
+
+            # self.get_logger().info(
+            #     f"[ScanSummary] front={front_dist_min:.2f} | "
+            #     f"left={front_left_dist_min:.2f} | "
+            #     f"right={front_right_dist_min:.2f}"
+            # )
+
+            if left_opening_detected:
+                self.speed, self.heading = 0.0, 0.0
+
+                span = self.__longest_run_span(jump_good)
+                if span is not None:
+                    i0, i1 = span
+                    # Map back to global scan index if needed:
+                    # global_idx = left_region[i0] .. left_region[i1]
+                    opening_mid_idx = int(left_region[(i0 + i1)//2])
+                    self.get_logger().info(f"[LeftOpening] mid_idx={opening_mid_idx}")
+
+                    self.search_rotate_z = self.scan_angle_min + opening_mid_idx * self.scan_angle_increment
+                    if self.search_rotate_z >= math.pi:
+                        self.search_rotate_z = 2*math.pi - self.search_rotate_z
+                        self.search_rotate_d = 'cw'
+                    else:
+                        self.search_rotate_d = 'ccw'
+                else:
+                    self.search_rotate_z = math.pi/4
+                    self.search_rotate_d = 'ccw'
+                
+                self.search_state_running = False
+                self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.traverse_the_gap])
+            else:
+                if front_left_dist_min != np.inf and front_left_dist_min <= self.search_gap_dist_ref/2:
+                    self.speed = 0.0
+                    self.heading = self.rotate_speed_cw
+                elif front_right_dist_min != np.inf and front_right_dist_min <= self.search_gap_dist_ref/2:
+                    self.speed = 0.0
+                    self.heading = self.rotate_speed_ccw
+                else:
+                    if front_dist_min != np.inf:
+                        speed_err = self.search_gap_dist_ref - front_dist_min
+                        if self.s_prev_max_speed_err is None or speed_err > self.s_prev_max_speed_err: self.s_prev_max_speed_err = speed_err
+                    else:
+                        speed_err = self.s_prev_max_speed_err
+                    heading_err = self.accum_yaw_cd
+                    self.get_logger().info(f'[Speed] Ref: {self.search_gap_dist_ref}; Curr: {front_dist_min}; Err: {speed_err}')
+                    self.get_logger().info(f'[Heading] Ref: {0.0}; Curr: {self.prev_odom_yaw}; Err: {heading_err}')
+
+                    if speed_err < 0.1:
+                        self.speed, self.heading = 0.0, 0.0
+                        
+                        self.search_rotate_z = 2*math.pi
+                        self.search_rotate_d = 'ccw'
+                        self.search_state_running = False
+                        self.search_plan.extend([SearchStates.rotate_z_d, SearchStates.find_gaps])
+                    else:
+                        speed = self.search_pid_speed.step(speed_err, self.dt)
+                        heading = self.search_pid_heading.step(heading_err, self.dt)
+
+                        # deadbands (on normalized error)
+                        if abs(speed_err) < self.s_speed_db: speed = 0.0
+                        if abs(heading_err) < self.s_heading_db: heading = 0.0
+                        
+                        if abs(heading) > self.turn_coeff*self.s_heading_max:
+                            speed = 0.0
+                        
+                        # slew-rate limit commands
+                        speed   = self.__slew(self.prev_speed, speed, self.s_max_speed_slew)
+                        heading = self.__slew(self.prev_heading, heading, self.s_max_heading_slew)
+
+                        self.prev_speed, self.prev_heading = speed, heading
+
+                        self.speed, self.heading = speed, heading
+        else:
+            self.get_logger().warn('Scan sensor unavailable at the moment!')
+
+    def _search_fntr(self):
+        if not self.search_state_running: self.search_plan.pop(0)
+        self.search_state = self.search_plan[0]
+
+        # Rotate z in d
+        if self.search_state in (SearchStates.none, SearchStates.rotate_z_d):
+            if not self.search_state_running:
+                self.search_state_running = True
+            self._rotate_z_d()
+
+        # Find Gaps
+        if self.search_state == SearchStates.find_gaps:
+            if not self.search_state_running:
+                self.search_state_running = True
+            self._find_gaps()
+        
+        # Pick a Gap
+        if self.search_state == SearchStates.pick_a_gap:
+            if not self.search_state_running:
+                self.search_state_running = True
+            self._pick_a_gap()
+        
+        # Traverse the Gap
+        if self.search_state == SearchStates.traverse_the_gap:
+            if not self.search_state_running:
+                self.search_state_running = True
+            self._traverse_the_gap()
+
+    def _search(self):
+        if self.search_mode == 'fntr':
+            self._search_fntr()
+
     def listener_callback(self, msg):
         # Logs the received messages from a topic
         # self.get_logger().info(f'Message Type: {type(msg)}')
@@ -648,7 +999,7 @@ class RedBallTracker(Node):
 
         # Compute dt
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        dt = now_sec - self.prev_sec if self.prev_sec is not None else 1.0 / 10.0
+        self.dt = now_sec - self.prev_sec if self.prev_sec is not None else 1.0 / 10.0
         self.prev_sec = now_sec
 
         if self.first_frame:
@@ -673,7 +1024,7 @@ class RedBallTracker(Node):
             cv.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv.circle(frame, (int(cx), int(cy)), 4, (255, 255, 255), -1)
 
-            self.speed, self.heading = self._plan(cx, bw, bh, dt)
+            self.speed, self.heading = self._plan(cx, bw, bh)
         else:
             self.get_logger().info('No Red Ball Detected!')
             if self.controller in ('pid', 'pidgs'):
@@ -686,27 +1037,25 @@ class RedBallTracker(Node):
                     self.prev_heading = 0.0
                     self.get_logger().info('Heading PID Reset!')
             
-            # Rotate 360
-            if self.search_rotate:
-                self.speed, self.heading = 0.0, 0.6
-                if abs(self.accum_yaw) > 2*math.pi:
-                    self.speed, self.heading = 0.0, 0.0
-                    self.search_rotate = False
+            if self.search_mode != 'none':
+                self._search()
 
         # self._log_yaw()
-            
+        
         # self._log_scan()
 
-        self._log_gaps()
+        # self._log_gaps()
 
-        ## Do a 360 to look for the ball
-        ## Find the gaps based on radius mainly and find the first gap on the left and its 2nd segment and its mid angle
-        ## Move towards the gap->segment until that angle distance is less than a distance defined (see how to keep track of that pointttttt or angle which was identified in the gap initially, since you will have to turn to head to that point/angle)
-        ## During the process, lookout for
-        ## ## Obstacles and to avoid it, course correct, by keeping the heading in memory to correct it back to that initial heading
-        ## ## Any change in lidar readings on the left, if detected make a left turn and explore
-        ## If there are no gaps in front facing, then turn right by 90, check for gaps
-        ## Stop every some distance between the bot's initialposition after findig a gap to the gap direction, and perform a 360 to look for the ball.
+        ## -- Do a 360 to look for the ball
+        ## -- Find the gaps based on radius mainly and find the first gap on the left and its 2nd segment and its mid angle
+        ## -- Turn to that gap
+        ## -- Move towards the gap->segment until that angle distance is less than a distance defined
+        ## -- During the process, lookout for
+        ## -- ## Obstacles and to avoid it, course correct, by keeping the heading in memory to correct it back to that initial heading
+        ## -- ## Any change in lidar readings on the left, if detected make a left turn and explore
+        ## -- If there are no gaps in front facing, then turn right by 90, check for gaps
+        ## -- Stop every some distance between the bot's initial position after findig a gap to the gap direction, and perform a 360 to look for the ball.
+        ## Keep track of the last seen angle of the ball and consider it for the next find gaps state 
 
         if self.log_prev_speed != self.speed and self.log_prev_heading != self.heading:
             self.get_logger().info(f'[Robot] Speed: {self.speed}; Heading: {self.heading}')
