@@ -40,7 +40,7 @@ class RedBallTracker(Node):
         self.detector_mode = 'hsv_circle'  # hsv_circle, hsv_triangle or hsv
 
         # Runtime options/ROS Params
-        self.declare_parameter('controller', 'pid')     # 'pid', 'pidgs', 'pp'
+        self.declare_parameter('controller', 'pp')     # 'pid', 'pidgs', 'pp'
         self.declare_parameter('search_mode', 'fntr-gf')   # 'none', 'fntr-gf'
         self.controller  = self.get_parameter('controller').get_parameter_value().string_value
         self.search_mode = self.get_parameter('search_mode').get_parameter_value().string_value
@@ -134,9 +134,10 @@ class RedBallTracker(Node):
         self.move_speed_bw = -0.2
         self.search_gap_radius = 1.0  # m
         self.search_gaps = None
-        self.search_gap_selection = 'left_most_gap_segment'  # left_most_gap_segment, or left_most_gap
-        self.search_gap_dist_ref = 0.7  # m
+        self.search_gap_selection = 'left_most_gap'  # left_most_gap_segment, or left_most_gap
+        self.search_gap_dist_ref = 0.5  # m
         self.search_traverse_check_dist = 4.0  # m
+        self.last_left_sector_baseline = None
         self.last_left_90_val = None
         self.left_opening_ema_beta = 0.20  # how quickly the baseline tracks normal drift (0..1)
         self.search_left_opening_thres = 0.7  # m
@@ -811,8 +812,9 @@ class RedBallTracker(Node):
         if self.last_seen_gap_pick:
             pass
         else:
-            self.search_gaps = self._find_gap_segments(mode='radius', finite_only=False)
-
+            self.search_gaps = self._find_gap_segments(mode='radius', finite_only=False, front_only=True)
+            # self.search_gaps = self._find_gap_segments(mode='nan', finite_only=False, front_only=True)
+        
         self.__update_state_running(False)
         self.search_plan.append(SearchStates.pick_a_gap)
         self.get_logger().info(f'[Find Gaps] {self.search_gaps}')
@@ -865,35 +867,58 @@ class RedBallTracker(Node):
         if not self.search_gaps:
             return None
 
-        left_front = []
-        right_front = []
+        # left_front = []
+        # right_front = []
 
+        # for (s, e, a_s, a_e) in self.search_gaps:
+        #     # Compute mid angle robustly (assume small arc, not spanning across big wrap)
+        #     a_s_m = self._wrap_0_2pi(a_s)
+        #     a_e_m = self._wrap_0_2pi(a_e)
+
+        #     # Handle wrap-around segments (e.g., 350°→10°)
+        #     # Compute shortest-arc mid:
+        #     da = self._ang_wrap_pi(a_e_m - a_s_m)
+        #     a_mid = self._wrap_0_2pi(a_s_m + 0.5 * da)
+
+        #     # Classify by mid angle
+        #     if a_mid >= 1.5 * math.pi or a_mid < 0.0:      # [3π/2, 2π)
+        #         left_front.append((s, e, a_s, a_e, a_mid))
+        #     elif 0.0 <= a_mid <= 0.5 * math.pi:            # [0, π/2]
+        #         right_front.append((s, e, a_s, a_e, a_mid))
+
+        # # If multiple candidates, prefer the one most "left" (closest to 3π/2)
+        # if left_front:
+        #     target = min(left_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 1.5 * math.pi)))
+        # elif right_front:
+        #     # Fallback: choose the one closest to 0 (straight ahead/right)
+        #     target = max(right_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 0.0)))
+        # else:
+        #     return None
+
+        # s, e, a_s, a_e, a_mid = target
+        # mid = self._mid_index(s, e)
+        # return s, e, mid, a_s, a_e, a_mid
+
+        # Build candidates from both front sectors (you already have a_mid computed)
+        cands = []  # (s, e, a_s, a_e, a_mid, a_mid_signed)
         for (s, e, a_s, a_e) in self.search_gaps:
-            # Compute mid angle robustly (assume small arc, not spanning across big wrap)
             a_s_m = self._wrap_0_2pi(a_s)
             a_e_m = self._wrap_0_2pi(a_e)
-
-            # Handle wrap-around segments (e.g., 350°→10°)
-            # Compute shortest-arc mid:
             da = self._ang_wrap_pi(a_e_m - a_s_m)
             a_mid = self._wrap_0_2pi(a_s_m + 0.5 * da)
+            a_mid_signed = self._ang_wrap_pi(a_mid)  # in (-π, π],  left is +, right is -
 
-            # Classify by mid angle
-            if a_mid >= 1.5 * math.pi or a_mid < 0.0:      # [3π/2, 2π)
-                left_front.append((s, e, a_s, a_e, a_mid))
-            elif 0.0 <= a_mid <= 0.5 * math.pi:            # [0, π/2]
-                right_front.append((s, e, a_s, a_e, a_mid))
+            # keep only front ±90°
+            if abs(a_mid_signed) <= 0.5 * math.pi:
+                cands.append((s, e, a_s, a_e, a_mid, a_mid_signed))
 
-        # If multiple candidates, prefer the one most "left" (closest to 3π/2)
-        if left_front:
-            target = min(left_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 1.5 * math.pi)))
-        elif right_front:
-            # Fallback: choose the one closest to 0 (straight ahead/right)
-            target = min(right_front, key=lambda g: abs(self._ang_wrap_pi(g[4] - 0.0)))
-        else:
+        if not cands:
             return None
 
-        s, e, a_s, a_e, a_mid = target
+        # Pick the most left (largest CCW deflection)
+        target = max(cands, key=lambda g: g[5])  # maximize signed angle
+
+        s, e, a_s, a_e, a_mid, _ = target
         mid = self._mid_index(s, e)
         return s, e, mid, a_s, a_e, a_mid
     
@@ -1046,6 +1071,23 @@ class RedBallTracker(Node):
     #             return True
     #     return False
 
+    def __check_for_left_opening_sector(self, angles=range(45, 91)) -> bool:
+        vals = [self._scan_value(a) for a in angles]
+        arr = np.array([v if (v is not None and math.isfinite(v)) else np.nan for v in vals], dtype=float)
+        if np.all(np.isnan(arr)):
+            return True  # treat fully invalid sector as an opening, consistent with prior logic
+        curr = float(np.nanmedian(arr))
+        if not math.isfinite(curr):
+            return False
+        if self.last_left_sector_baseline is None or not math.isfinite(self.last_left_sector_baseline):
+            self.last_left_sector_baseline = curr
+            return False
+        delta = curr - self.last_left_sector_baseline
+        opening = delta >= self.search_left_opening_thres
+        beta = getattr(self, "left_opening_ema_beta", 0.20)
+        self.last_left_sector_baseline = curr if opening else (1.0 - beta) * self.last_left_sector_baseline + beta * curr
+        return opening
+
     def __check_for_left_opening(self, left_90_val: float) -> bool:
         """
         Detect a sudden *increase* in distance at ~+90° (left side).
@@ -1101,6 +1143,7 @@ class RedBallTracker(Node):
             self.accum_dist = 0.0
             self.last_left_90_val = None
             self.traverse_first = False
+            self.last_left_sector_baseline = None
 
         if self.accum_dist > self.search_traverse_check_dist:
             self.speed, self.heading = 0.0, 0.0
@@ -1155,7 +1198,9 @@ class RedBallTracker(Node):
             front_dist_min       = np.nanmin(front_vals)       if np.any(np.isfinite(front_vals)) else np.inf
             front_left_dist_min  = np.nanmin(front_left_vals)  if np.any(np.isfinite(front_left_vals)) else np.inf
             front_right_dist_min = np.nanmin(front_right_vals) if np.any(np.isfinite(front_right_vals)) else np.inf
-            left_opening_detected = self.__check_for_left_opening(left_90_val)
+            # left_opening_detected = self.__check_for_left_opening(left_90_val)
+            left_opening_detected = self.__check_for_left_opening_sector(range(45, 91))
+
 
             # Log some diagnostics:
             # self.get_logger().info(
@@ -1188,7 +1233,7 @@ class RedBallTracker(Node):
                 #     else:
                 #         self.search_rotate_d = 'ccw'
                 # else:
-                self.search_rotate_z = math.pi/4
+                self.search_rotate_z = math.pi/4 + math.pi/8
                 self.search_rotate_d = 'ccw'
                 
                 self.__update_state_running(False)
@@ -1196,13 +1241,13 @@ class RedBallTracker(Node):
                 self.traverse_first = True
                 self.get_logger().info(f'[Traverse] Rotating {self.search_rotate_z} rads in {self.search_rotate_d} direction!')
             else:
-                if front_left_dist_min != np.inf and front_left_dist_min <= 0.4*self.search_gap_dist_ref:
+                if front_left_dist_min != np.inf and front_left_dist_min <= 0.7*self.search_gap_dist_ref:
                     self.speed = 0.5*self.s_speed_max
-                    self.heading = 0.5*self.rotate_speed_cw
+                    self.heading = 1.0*self.rotate_speed_cw
                     self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Left!')
-                elif front_right_dist_min != np.inf and front_right_dist_min <= 0.4*self.search_gap_dist_ref:
+                elif front_right_dist_min != np.inf and front_right_dist_min <= 0.7*self.search_gap_dist_ref:
                     self.speed = 0.5*self.s_speed_max
-                    self.heading = 0.5*self.rotate_speed_ccw
+                    self.heading = 1.0*self.rotate_speed_ccw
                     self.get_logger().info(f'[Traverse] Avoiding Obstacle on the Right!')
                 else:
                     if front_dist_min != np.inf:
@@ -1380,7 +1425,6 @@ class RedBallTracker(Node):
             if cv.waitKey(1) & 0xFF == ord('q'):
                 self.show_video = False
                 cv.destroyAllWindows()
-
 
 def main(args=None):
     # Initialize rclpy library
