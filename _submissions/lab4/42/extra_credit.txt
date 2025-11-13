@@ -1,0 +1,56 @@
+Extra Credit Implementations::
+
+##########################################
+Controller 1: PID Gain Scheduling (PIDGS):
+##########################################
+
+Fixed gains must compromise between straight-line tracking and tight turns. The gain-scheduled controller explicitly adapts to the operating point sensed by the camera, improving tracking accuracy on curves, reducing oscillations near the target, and enabling faster, smoother motion on straights-all without resorting to brute-force retuning for each scenario.
+
+This gain-scheduled PID controller adapts its gains real-time based on the task difficulty inferred from the camera. Instead of one fixed set of PID gains, the controller continuously blends between "easy" and "hard" gain sets using perception-derived context. This lets the robot be smooth and fast when conditions are mild, and cautious and well-damped when conditions are demanding.
+
+Scheduling variables
+1) Turn severity: computed from the target's horizontal offset in the image, normalized by half the image width. Larger normalized error means sharper turns.
+2) Proximity: estimated from the target's bounding-box width in pixels. Larger width implies the object is closer.
+
+For the linear speed loop, I form a single scheduling weight by a weighted sum of turn severity and proximity (then clamp to [0,1]). For the heading loop, scheduling depends only on turn severity to avoid double-penalizing turns. These weights drive a smooth interpolation between two tuned gain sets: an "EASY" set for small errors/far targets and a "HARD" set for large errors/near targets. This produces continuous, non-jerky gain changes without discrete jumps.
+
+Added Stability details:
+- Integral continuity: when the scheduled integral gain changes, I rescale the stored integral state so the integral contribution remains consistent across gain updates, avoiding bumps in the output.
+- Deadbands: small errors produce zero command to prevent dithering around the setpoint.
+- Slew-rate limits: rate-limit both linear and angular commands to respect actuator limits and suppress spikes due to sensor noise.
+- Safety coupling: if the scheduled heading output exceeds a threshold (meaning a very sharp turn), linear speed is temporarily reduced to zero to prevent skidding or overshoot.
+
+
+##########################################
+Controller 2: Pure Pursuit (PP):
+##########################################
+
+Pure pursuit is a path-following technique that continually "looks ahead" and points the robot where it needs to go. The range logic produces the required approach/hold/back-off behavior without oscillation.
+
+This pure pursuit (PP) controller is for heading control and is coupled with a simple range controller for linear speed. The robot constantly "aims" at a look-ahead point defined by the ball's bearing in the camera. The bearing is computed from the horizontal pixel offset of the ball's centroid using the camera's horizontal field of view. This produces a smooth steering command that naturally turns the robot toward the ball and recenters it in the image.
+
+To manage distance (so the robot doesn't just drive into the target), the linear speed is driven by how large the ball appears:
+
+When the ball looks small (far), the robot drives forward.
+When the ball is about the desired size, the robot holds speed near zero (deadband).
+When the ball looks too large (very close), the robot slows or reverses to back away.
+
+The distance behavior uses the bounding-box width as a proxy for range and blends in slowdowns when turns are sharp or the ball is very near, so motion remains stable and deliberate. I also have few safety guards (rate limits, "stop on extreme turn") to prevent abrupt commands.
+
+
+##########################################
+Search Mode: Frontier-Gap Following using /camera/image_raw, /scan and /odom topics or sensors:
+##########################################
+
+In addition to basic ball tracking, I implemented a multi-stage search strategy called "fntr-gf" (Frontier-Gap Following).
+
+The search logic is driven by an explicit Finite State Machine (FSM) over SearchStates:
+none -> rotate_z_d -> find_gaps -> pick_a_gap -> traverse_the_gap, with the plan extended dynamically as new gaps or openings are discovered. When the ball is lost, the node does not just rotate; it executes this search pipeline until the ball is detected again.
+
+Gap detection uses the LIDAR. The raw LaserScan is converted to a NumPy array and filtered to only the front-facing field of view (-90 to +90 degrees in the robot frame). I define "gaps" either as runs of non-finite ranges (NaN/inf) or as contiguous segments where the range exceeds a configurable radius (search_gap_radius). A boolean mask over indices is segmented, with proper handling of wrap-around, and each contiguous region is converted back to index and angle ranges. Each gap is further divided into three sub-segments, and their mid-angles are recorded.
+
+Gap selection (_pick_a_gap) is biased toward useful, informed directions. First, if the ball was seen recently, I store its last odometry yaw (last_seen_ball_odom_yaw) and, during search, compute the signed yaw difference to rotate back toward where it disappeared. If that is not available, I choose a gap whose mid-angle lies in the front sector and is as far to the left as possible. This gives a "left-most front gap" heuristic that prefers safer, more open directions.
+
+The traversal logic (_traverse_the_gap) is also more sophisticated than a simple PID. While moving, I track accumulated yaw (accum_yaw_cd) and distance (accum_dist), and maintain three LIDAR sectors: front, front-left, and front-right. A distance controller tries to keep the front distance near a reference (search_gap_dist_ref), while yaw drift is fed back to keep the heading aligned with the original gap direction. On top of that, I run a sector-based left-opening detector over 45-90 degrees: using an exponential moving average baseline and a threshold on the median range, the robot can identify a sudden new opening on the left and branch into it by scheduling a new rotation and traverse cycle. Periodic checkpoints every few meters trigger a 360 degrees scan and re-planning, so the robot continuously re-evaluates the environment instead of committing blindly to a single gap.
+
+
