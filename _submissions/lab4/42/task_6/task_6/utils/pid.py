@@ -32,3 +32,10 @@ class PID:
         if self.out_limit:
             u = max(self.out_limit[0], min(self.out_limit[1], u))
         return u
+    
+    def set_gains(self, kp, ki, kd):
+        old_ki = self.ki
+        self.kp, self.ki, self.kd = kp, ki, kd
+        # Keep integral contribution roughly continuous if Ki changes
+        if old_ki != 0.0 and self.ki != 0.0:
+            self.i *= (old_ki / self.ki)
