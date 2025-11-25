@@ -108,9 +108,13 @@ class Task1(Node):
     """
 
     # clustering parameters
-    CLUSTER_RADIUS_CELLS = 2      # how far neighbors can be and still be in same cluster
-    MIN_CLUSTER_SIZE = 5          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 12       # minumum distance of frontier from the robot
+    CLUSTER_RADIUS_CELLS = 1      # how far neighbors can be and still be in same cluster
+    MIN_CLUSTER_SIZE = 3          # ignore tiny clusters as noise
+    MIN_GOAL_DIST_CELLS = 4       # minumum distance of frontier from the robot
+    SMOOTHING_CLEARANCE_CELLS = 10  # extra safety margin for path smoothing (in grid cells)
+    # Prefer exploring "local" frontiers before going far away.
+    # With 0.05 m resolution, 40 cells ≈ 2.0 m
+    NEAR_FRONTIER_MAX_DIST_CELLS = 40
 
     def __init__(self):
         super().__init__('task1_node')
@@ -168,23 +172,27 @@ class Task1(Node):
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
-        self.speed_max = 0.22
-        self.speed_min = 0.05
-        self.heading_max = 2.0  # rad/s
+        self.speed_max = 0.40
+        self.speed_min = 0.06      # slight bump, avoids crawling too slowly
+        self.heading_max = 2.0     # keep same, TB3 can handle this
 
-        self.yaw_tol = 0.1        # rad
-        self.slow_down_dist = 0.35 # m
+        self.yaw_tol = 0.1
+        self.slow_down_dist = 0.35  # start braking a bit earlier
 
         self.last_ctrl_time: Optional[float] = None
-        self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
+        self.speed_hist: List[Tuple[float, float, float]] = []
 
         self.pid_speed = PID(
-            kp=2.8, ki=0.10, kd=0.25,
+            kp=2.4,  # slightly less aggressive
+            ki=0.08,
+            kd=0.20,
             i_limit=0.8,
             out_limit=(-self.speed_max, self.speed_max)
         )
         self.pid_heading = PID(
-            kp=2.0, ki=0.01, kd=0.15,
+            kp=2.4,
+            ki=0.01,
+            kd=0.12,
             i_limit=0.8,
             out_limit=(-self.heading_max, self.heading_max)
         )
@@ -193,6 +201,18 @@ class Task1(Node):
         # Exploration state (Stage 6)
         # ---------------------------
         self.state = "WAIT_FOR_MAP"  # or "EXPLORE", "DONE"
+
+        # ---------------------------
+        # Spin-in-place exploration helper
+        # ---------------------------
+        self.spin_enabled = True
+        self.spin_interval_dist = 1.0  # meters between spins
+        self.dist_since_spin = 0.0
+        self.last_pose_for_spin: Optional[Tuple[float, float]] = None
+
+        self.doing_spin = False
+        self.spin_accum_angle = 0.0
+        self.prev_spin_yaw: Optional[float] = None
 
         # ---------------------------
         # Misc counters
@@ -502,6 +522,101 @@ class Task1(Node):
     # A* implementation (Stage 3)
     # -------------------------------------------------------------------------
     
+    def _extend_collinear_segment_world(self, start_idx: int, tol: float = 1e-6) -> int:
+        """
+        From start_idx, look forward in current_path_world and find the longest
+        contiguous run of points that lie on the same infinite line defined by
+        points[start_idx] and points[start_idx+1]. Returns the last index of that run.
+        """
+        if self.current_path_world is None:
+            return start_idx
+
+        pts = self.current_path_world
+        N = len(pts)
+        i = start_idx
+
+        if i >= N - 1:
+            return i  # nothing to extend
+
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        dx = x1 - x0
+        dy = y1 - y0
+
+        # If direction is (near) zero (duplicate points), just move one step.
+        if abs(dx) < tol and abs(dy) < tol:
+            return min(i + 1, N - 1)
+
+        last_good = i + 1
+        # Check collinearity of each subsequent point with the line through (x0, y0) and direction (dx, dy)
+        for j in range(i + 1, N):
+            xj, yj = pts[j]
+            rx = xj - x0
+            ry = yj - y0
+            # 2D cross product of d and (rx, ry)
+            cross = rx * dy - ry * dx
+            if abs(cross) > tol:
+                # first non-collinear point → stop, previous was last collinear
+                break
+            last_good = j
+
+        return last_good
+
+    def select_path_waypoint_index(self) -> Optional[int]:
+        """
+        Choose a waypoint index along current_path_world using the same
+        logic as your WayPoints.choose_next:
+
+          - Only consider waypoints strictly AFTER the last index.
+          - Among those, pick the closest to the robot.
+          - Then extend over the collinear segment starting at that index.
+          - Enforce monotonic progress along the path.
+        """
+        if self.current_path_world is None or not self.current_path_world:
+            return None
+        if self.robot_x is None or self.robot_y is None:
+            return None
+
+        pts = self.current_path_world
+        N = len(pts)
+
+        if self.path_idx is None:
+            self.path_idx = 0
+
+        rx, ry = self.robot_x, self.robot_y
+
+        # Compute squared distances from robot to all waypoints
+        d2_list = []
+        for (wx, wy) in pts:
+            dx = wx - rx
+            dy = wy - ry
+            d2_list.append(dx * dx + dy * dy)
+
+        '''# Only consider waypoints strictly after current index
+        best_idx = None
+        best_d2 = float('inf')
+        for i, d2 in enumerate(d2_list):
+            if i <= self.path_idx:
+                continue  # don't go backwards
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = i'''
+
+        # Near the end, there may be no "future" index; stay where we are
+        best_idx = self.path_idx
+
+        # Extend over collinear segment, like your WayPoints._extend_collinear_segment
+        best_idx = self._extend_collinear_segment_world(best_idx)
+
+        # Enforce monotonic progress and clamp
+        if best_idx < self.path_idx:
+            best_idx = self.path_idx
+        if best_idx >= N:
+            best_idx = N - 1
+
+        self.path_idx = best_idx
+        return best_idx
+
     def bresenham_line(self, x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
         """
         Integer grid line between (x0, y0) and (x1, y1) using Bresenham's algorithm.
@@ -540,9 +655,14 @@ class Task1(Node):
 
     def has_line_of_sight(self, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
         """
-        Return True if there is a collision-free straight line between cells a and b.
-        We treat any occupied cell as blocking. Unknown is optional; here we allow it
-        because A* already stays in known-free cells.
+        Return True if there is a collision-free, *inflated* straight line between
+        cells a and b.
+
+        Instead of only checking for hard collisions with occupied cells, we also
+        require each cell along the line to have a safety buffer from obstacles
+        (via is_safe_frontier_cell with a larger clearance).
+
+        This prevents smoothing from pulling the path too close to walls/obstacles.
         """
         if not self.map_received or self.map_data is None:
             return False
@@ -555,12 +675,11 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            v = self.cell_value(mx, my)
-            if v is None:
-                return False
-
-            # block if it is clearly occupied
-            if v >= 50:
+            # Require an inflated safe cell (free + clearance from occupied)
+            if not self.is_safe_frontier_cell(
+                mx, my,
+                clearance_cells=self.SMOOTHING_CLEARANCE_CELLS
+            ):
                 return False
 
         return True
@@ -998,107 +1117,76 @@ class Task1(Node):
         return None
 
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
-        """
-        Choose a frontier goal by:
-        1) For each cluster, compute the closest distance from the robot
-            to any cell in that cluster. Use that to pick the "closest cluster".
-        2) Within the chosen cluster, pick a frontier cell that is at least
-            MIN_GOAL_DIST_CELLS away from the robot (in grid), preferring
-            the *closest* among those that satisfy the minimum distance.
-        3) If no cell satisfies the minimum distance, fall back to the truly
-            closest cell in the cluster, but pulled back to a safe cell
-            if it is too close to obstacles.
-        """
         if not clusters:
             return None
         if self.robot_mx is None or self.robot_my is None:
             return None
 
-        # 1) pick the closest cluster (by any traversable cell)
-        best_cluster_idx = None
-        best_cluster_min_dist2 = float('inf')
+        near_limit2 = self.NEAR_FRONTIER_MAX_DIST_CELLS ** 2
+        min_goal_dist2 = self.MIN_GOAL_DIST_CELLS ** 2
 
-        for idx, cluster in enumerate(clusters):
-            cluster_min_dist2 = float('inf')
-            for (mx, my) in cluster:
-                # only consider traversable cells when ranking clusters
-                if not self.is_traversable(mx, my):
-                    continue
+        best_far_cell: Optional[Tuple[int, int]] = None
+        best_far_score: Optional[Tuple[int, float]] = None
 
-                dx = mx - self.robot_mx
-                dy = my - self.robot_my
-                dist2 = dx * dx + dy * dy
-                if dist2 < cluster_min_dist2:
-                    cluster_min_dist2 = dist2
+        best_any_cell: Optional[Tuple[int, int]] = None
+        best_any_score: Optional[Tuple[int, float]] = None
 
-            if cluster_min_dist2 < best_cluster_min_dist2:
-                best_cluster_min_dist2 = cluster_min_dist2
-                best_cluster_idx = idx
+        def consider_candidate(tx: int, ty: int):
+            nonlocal best_far_cell, best_far_score, best_any_cell, best_any_score
 
-        if best_cluster_idx is None:
-            return None
-
-        chosen_cluster = clusters[best_cluster_idx]
-
-        # 2) within this cluster, prefer cells at least MIN_GOAL_DIST_CELLS away
-        #    AND 'safe' from nearby obstacles (possibly after backoff).
-        min_dist2_required = self.MIN_GOAL_DIST_CELLS ** 2
-
-        candidate_cell = None
-        candidate_dist2 = float('inf')
-
-        fallback_cell = None          # closest usable cell (possibly backed off)
-        fallback_dist2 = float('inf')
-
-        safe_fallback_cell = None     # closest safe cell (even if too close to robot)
-        safe_fallback_dist2 = float('inf')
-
-        for (mx, my) in chosen_cluster:
-            # Start from the frontier cell
-            tx, ty = mx, my
-
-            # Prefer a "known-safe" cell (already explored, away from obstacles).
-            # If the frontier itself is not such a cell, back off toward the robot.
-            if not self.is_safe_known_cell(tx, ty, clearance_cells=6):
-                backed = self.backoff_to_known_safe_cell(
-                    tx, ty,
-                    max_back_cells=6,
-                    clearance_cells=6,
-                )
-                if backed is None:
-                    # No suitable known-safe cell for this frontier point
-                    continue
-                tx, ty = backed
-
-            # From here, (tx, ty) is a "safe" target cell
             dx = tx - self.robot_mx
             dy = ty - self.robot_my
             dist2 = dx * dx + dy * dy
 
-            # always track the absolute closest safe cell as fallback
-            if dist2 < fallback_dist2:
-                fallback_dist2 = dist2
-                fallback_cell = (tx, ty)
+            # avoid selecting the robot's own cell
+            if dist2 < 1.0:
+                return
 
-            # also track closest safe cell regardless of MIN_GOAL_DIST_CELLS
-            if dist2 < safe_fallback_dist2:
-                safe_fallback_dist2 = dist2
-                safe_fallback_cell = (tx, ty)
+            near_flag = 0 if dist2 < near_limit2 else 1
+            score = (near_flag, dist2)
 
-            # prefer cells that are not too close to the robot
-            if dist2 >= min_dist2_required and dist2 < candidate_dist2:
-                candidate_dist2 = dist2
-                candidate_cell = (tx, ty)
+            # Track best "far enough" candidate
+            if dist2 >= min_goal_dist2:
+                if best_far_score is None or score < best_far_score:
+                    best_far_score = score
+                    best_far_cell = (tx, ty)
 
-        # Priority:
-        # 1) safe + not too close
-        if candidate_cell is not None:
-            return candidate_cell
-        # 2) closest safe cell (backed off if needed)
-        if safe_fallback_cell is not None:
-            return safe_fallback_cell
-        # 3) last-resort fallback (should already be safe if set)
-        return fallback_cell
+            # Track best overall candidate (for fallback)
+            if best_any_score is None or score < best_any_score:
+                best_any_score = score
+                best_any_cell = (tx, ty)
+
+        # Main loop: same as before, just call consider_candidate(tx, ty)
+        for cluster in clusters:
+            for (mx, my) in cluster:
+                if self.map_index(mx, my) is None:
+                    continue
+
+                tx, ty = mx, my
+
+                # 1) Try known-safe interior cell
+                if not self.is_safe_known_cell(tx, ty, clearance_cells=6):
+                    backed = self.backoff_to_known_safe_cell(
+                        tx, ty,
+                        max_back_cells=6,
+                        clearance_cells=6,
+                    )
+                    if backed is not None:
+                        tx, ty = backed
+                    else:
+                        # 2) Fallback: safe frontier cell
+                        if not self.is_safe_frontier_cell(mx, my, clearance_cells=5):
+                            continue
+                        tx, ty = mx, my
+
+                consider_candidate(tx, ty)
+
+        # Prefer goals that are at least MIN_GOAL_DIST_CELLS away
+        if best_far_cell is not None:
+            return best_far_cell
+
+        # Fallback if literally nothing satisfies the min distance
+        return best_any_cell
 
     # -------------------------------------------------------------------------
     # Visualization helpers (Stage 4)
@@ -1239,6 +1327,12 @@ class Task1(Node):
         self.current_path_world = None
         self.path_idx = None
         self.publish_cmd_vel(0.0, 0.0)
+        # Reset spin distance tracking when we fully stop / replan
+        self.last_pose_for_spin = None
+        self.dist_since_spin = 0.0
+        self.doing_spin = False
+        self.spin_accum_angle = 0.0
+        self.prev_spin_yaw = None
 
     def publish_cmd_vel(self, linear_x: float, angular_z: float):
         msg = Twist()
@@ -1287,7 +1381,7 @@ class Task1(Node):
         cell = self.map_resolution if self.map_resolution is not None else 0.05
         # be more forgiving: ~1 cell for waypoints, ~1.5–2 cells for goal
         waypoint_tol = 1.0 * cell
-        goal_tol     = 1.5 * cell
+        goal_tol     = 0.75 * cell
         min_goal_speed = 0.02  # keep as is
 
         if (self.current_path_world is None or
@@ -1299,6 +1393,50 @@ class Task1(Node):
                 self.robot_yaw is None):
             # Nothing to do or no pose: stop for safety
             self.publish_cmd_vel(0.0, 0.0)
+            return
+
+        # --- SPIN-IN-PLACE LOGIC (for better coverage) ---
+        rx = self.robot_x
+        ry = self.robot_y
+        ryaw = self.robot_yaw
+
+        # Update distance traveled since last spin
+        if self.last_pose_for_spin is None:
+            self.last_pose_for_spin = (rx, ry)
+        else:
+            px, py = self.last_pose_for_spin
+            self.dist_since_spin += math.hypot(rx - px, ry - py)
+            self.last_pose_for_spin = (rx, ry)
+
+        # If we're currently spinning, continue until we accumulate ~360 degrees
+        if self.doing_spin and self.spin_enabled:
+            if self.prev_spin_yaw is None:
+                self.prev_spin_yaw = ryaw
+
+            dyaw = wrap_angle(ryaw - self.prev_spin_yaw)
+            self.spin_accum_angle += abs(dyaw)
+            self.prev_spin_yaw = ryaw
+
+            # Slightly more than 2*pi to avoid off-by-a-bit due to noise
+            if self.spin_accum_angle >= 2.2 * math.pi:
+                # Done spinning, reset and resume path following
+                self.doing_spin = False
+                self.spin_accum_angle = 0.0
+                self.prev_spin_yaw = None
+                self.dist_since_spin = 0.0
+            else:
+                # Keep spinning in place
+                self.publish_cmd_vel(0.0, 0.6)
+                return  # skip normal path following while spinning
+
+        # Not currently spinning: check if it's time to start one
+        if (not self.doing_spin and self.spin_enabled and
+                self.dist_since_spin >= self.spin_interval_dist):
+            self.doing_spin = True
+            self.spin_accum_angle = 0.0
+            self.prev_spin_yaw = ryaw
+            # Issue first spin command immediately
+            self.publish_cmd_vel(0.0, 0.6)
             return
 
         # --- UNION OBSTACLE CRITERIA ---
@@ -1355,20 +1493,19 @@ class Task1(Node):
         else:
             speed_curr = 0.0
 
-        # Advance waypoint index when close to current waypoint
-        while self.path_idx < len(self.current_path_world) - 1:
-            gx, gy = self.current_path_world[self.path_idx]
-            dist_to_wp = math.hypot(gx - rx, gy - ry)
-            if dist_to_wp < waypoint_tol:  # waypoint tolerance
-                self.path_idx += 1
-            else:
-                break
+        # --- SELECT WAYPOINT USING TASK4-STYLE LOGIC ---
+        idx = self.select_path_waypoint_index()
+        if idx is None:
+            self.publish_cmd_vel(0.0, 0.0)
+            return
 
-        # Check final goal
-        gx, gy = self.current_path_world[self.path_idx]
+        gx, gy = self.current_path_world[idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
-        # if self.path_idx == len(self.current_path_world) - 1 and dist_to_goal < self.stop_dist_tol:
-        if (self.path_idx == len(self.current_path_world) - 1 and dist_to_goal < goal_tol and speed_curr < min_goal_speed):
+
+        # Check if we've reached the final goal
+        if (idx == len(self.current_path_world) - 1 and
+            dist_to_goal < goal_tol and
+            speed_curr < min_goal_speed):
             self.get_logger().info(
                 'Reached current path goal. Stopping and clearing path.',
                 throttle_duration_sec=2.0
@@ -1402,7 +1539,7 @@ class Task1(Node):
         speed_cmd = self.pid_speed.step(speed_err, dt)
 
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 1.0:
+        if abs(heading_err) > 0.5:
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
@@ -1503,7 +1640,7 @@ class Task1(Node):
             else:
                 self.publish_cmd_vel(0.0, 0.0)
                 return
-
+        
         # DONE: just stop and do nothing else
         if self.state == "DONE":
             self.publish_cmd_vel(0.0, 0.0)
