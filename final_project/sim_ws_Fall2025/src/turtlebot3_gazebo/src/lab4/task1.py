@@ -261,7 +261,11 @@ class Task1(Node):
         if first_time:
             resized = True
         else:
-            if info.width != self.map_width or info.height != self.map_height:
+            if (info.width != self.map_width or
+                info.height != self.map_height or
+                info.resolution != self.map_resolution or
+                info.origin.position.x != self.map_origin_x or
+                info.origin.position.y != self.map_origin_y):
                 resized = True
 
         if resized:
@@ -273,6 +277,14 @@ class Task1(Node):
 
             self.map_data = list(msg.data)
             self.map_received = True
+
+            # Invalidate the current path on any geometry change
+            if self.current_path is not None:
+                self.get_logger().info(
+                    'Map geometry changed (size/origin/resolution). '
+                    'Clearing current path to replan on updated grid.'
+                )
+                self.clear_current_path()
 
             self.get_logger().info(
                 f'/map received: size=({self.map_width} x {self.map_height}), '
@@ -1252,7 +1264,12 @@ class Task1(Node):
 
         for i in range(start_idx, end_idx):
             mx, my = self.current_path[i]
-            # only hard-block on occupied cells
+
+            # If the cell is outside the current map, path is no longer valid.
+            if self.map_index(mx, my) is None:
+                return False
+
+            # Only hard-block on occupied cells (unknown allowed for exploration)
             if self.is_occupied(mx, my):
                 return False
 
