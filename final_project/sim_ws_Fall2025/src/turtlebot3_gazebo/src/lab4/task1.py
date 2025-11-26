@@ -85,8 +85,8 @@ class Task1(Node):
     # clustering parameters
     CLUSTER_RADIUS_CELLS = 2      # how far neighbors can be and still be in same cluster
     MIN_CLUSTER_SIZE = 5          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 4      # minimum distance of frontier from the robot (in grid cells)
-    PATH_CLEARANCE_CELLS = 6      # inflation radius for safe path planning
+    MIN_GOAL_DIST_CELLS = 1      # minimum distance of frontier from the robot (in grid cells)
+    PATH_CLEARANCE_CELLS = 5      # inflation radius for safe path planning
 
     def __init__(self):
         super().__init__('task1_node')
@@ -141,13 +141,13 @@ class Task1(Node):
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
         # self.obstacle_stop_dist: float = 0.4  # m
-        self.obstacle_stop_dist = 0.24
+        self.obstacle_stop_dist = 0.30
 
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
         # keep fast linear speed but soften heading
-        self.speed_max = 0.70      # linear speed cap
+        self.speed_max = 0.60      # linear speed cap
         self.speed_min = 0.10      # minimum creeping speed
         # Smooth + stable turning
         self.heading_max = 0.9      # rad/s  (much calmer, still agile)
@@ -981,8 +981,8 @@ class Task1(Node):
         self,
         mx: int,
         my: int,
-        max_back_cells: int = 5,
-        clearance_cells: int = 6,
+        max_back_cells: int = 4,
+        clearance_cells: int = 5,
     ) -> Optional[Tuple[int, int]]:
         """
         Given a frontier cell (mx, my), step back along the line from
@@ -1046,7 +1046,7 @@ class Task1(Node):
                 # Prefer a known-safe cell slightly inside explored space
                 backed = self.backoff_to_known_safe_cell(
                     tx, ty,
-                    max_back_cells=6,
+                    max_back_cells=4,
                     clearance_cells=self.PATH_CLEARANCE_CELLS,
                 )
                 if backed is not None:
@@ -1259,8 +1259,8 @@ class Task1(Node):
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
         # be more forgiving: ~1 cell for waypoints, ~1.5–2 cells for goal
-        waypoint_tol = 1.0 * cell
-        goal_tol     = 1.5 * cell
+        waypoint_tol = 0.5 * cell
+        goal_tol     = 0.8 * cell
         min_goal_speed = 0.02  # keep as is
 
         if (self.current_path_world is None or
@@ -1292,7 +1292,6 @@ class Task1(Node):
             self.front_range_filt is not None and
             self.front_range_filt < self.obstacle_stop_dist
         ):
-            # Remember that the current frontier goal is problematic
             if self.frontier_goal is not None:
                 self.blocked_goals.append(self.frontier_goal)
                 self.get_logger().warn(
@@ -1374,7 +1373,6 @@ class Task1(Node):
             dist_to_goal < goal_tol and
             speed_curr < min_goal_speed):
 
-            # Mark this goal as "done" so we don't re-select it forever
             if self.frontier_goal is not None:
                 self.blocked_goals.append(self.frontier_goal)
                 self.get_logger().info(
