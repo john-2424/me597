@@ -82,11 +82,16 @@ class Task1(Node):
     Task 1 – Autonomous Mapping
     """
 
-    # clustering parameters
-    CLUSTER_RADIUS_CELLS = 2      # how far neighbors can be and still be in same cluster
-    MIN_CLUSTER_SIZE = 5          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 1      # minimum distance of frontier from the robot (in grid cells)
-    PATH_CLEARANCE_CELLS = 5      # inflation radius for safe path planning
+    # clustering / planning parameters
+    CLUSTER_RADIUS_CELLS = 2       # how far neighbors can be and still be in same cluster
+    MIN_CLUSTER_SIZE = 5           # ignore tiny clusters as noise
+    MIN_GOAL_DIST_CELLS = 2        # minimum distance of goal from the robot (in grid cells)
+
+    # main inflation radius for A* / traversability
+    PATH_CLEARANCE_CELLS = 6       # 6 cells * 0.05 m ≈ 0.30 m
+
+    # extra safety for frontier / goal cells (pulled slightly further from walls)
+    FRONTIER_CLEARANCE_CELLS = PATH_CLEARANCE_CELLS + 2
 
     def __init__(self):
         super().__init__('task1_node')
@@ -140,37 +145,36 @@ class Task1(Node):
         # ---------------------------
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
-        # self.obstacle_stop_dist: float = 0.4  # m
-        self.obstacle_stop_dist = 0.30
+        self.obstacle_stop_dist = 0.30  # m
 
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
-        # keep fast linear speed but soften heading
-        self.speed_max = 0.60      # linear speed cap
-        self.speed_min = 0.10      # minimum creeping speed
-        # Smooth + stable turning
-        self.heading_max = 0.9      # rad/s  (much calmer, still agile)
-        self.heading_deadband = 0.05  # rad ≈ 3 degrees
+        # slightly slower but smoother body motion
+        self.speed_max = 0.45      # linear speed cap
+        self.speed_min = 0.08      # minimum creeping speed
 
-        self.yaw_tol = 0.1        # rad
-        # self.slow_down_dist = 0.50 # m, was 0.35 to give more braking room
-        self.slow_down_dist = 0.60
+        # sharper heading control
+        self.heading_max = 1.0     # rad/s (faster turning allowed)
+        self.heading_deadband = 0.04  # rad ≈ 2.3 degrees
+
+        self.yaw_tol = 0.1         # rad
+        self.slow_down_dist = 0.80 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
 
         self.pid_speed = PID(
-            kp=4.8,     # stays aggressive for speed
-            ki=0.15,
-            kd=0.35,
+            kp=3.0,
+            ki=0.10,
+            kd=0.20,
             i_limit=1.0,
             out_limit=(-self.speed_max, self.speed_max)
         )
         self.pid_heading = PID(
-            kp=0.75,     # gentle but responsive
-            ki=0.008,    # tiny integral – prevents drift, no wobble
-            kd=0.22,     # BIGGER damping → kills oscillations
+            kp=0.9,
+            ki=0.008,
+            kd=0.24,
             i_limit=0.6,
             out_limit=(-self.heading_max, self.heading_max)
         )
@@ -235,7 +239,10 @@ class Task1(Node):
         # ---------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)  # 10 Hz control
 
-        self.get_logger().info('Task1 node initialized (Stage 1–6).')
+        self.get_logger().info(
+            f'Task1 node initialized. PATH_CLEARANCE_CELLS={self.PATH_CLEARANCE_CELLS}, '
+            f'FRONTIER_CLEARANCE_CELLS={self.FRONTIER_CLEARANCE_CELLS}'
+        )
 
     # -------------------------------------------------------------------------
     # Map callbacks (Stage 1)
@@ -288,8 +295,8 @@ class Task1(Node):
                 '/map updated with same size (refresh).',
                 throttle_duration_sec=5.0
             )
-        
-        if self.map_received:
+
+        if self.map_received and self.map_resolution is not None:
             self.stop_dist_tol = 0.6 * self.map_resolution
 
     def map_update_callback(self, msg: OccupancyGridUpdate):
@@ -398,7 +405,7 @@ class Task1(Node):
     # -------------------------------------------------------------------------
     # Scan callback (Stage 5)
     # -------------------------------------------------------------------------
-    
+
     def scan_callback(self, msg: LaserScan):
         """
         Store min range in front sector to detect close obstacles.
@@ -491,7 +498,7 @@ class Task1(Node):
     # -------------------------------------------------------------------------
     # A* implementation (Stage 3)
     # -------------------------------------------------------------------------
-    
+
     def bresenham_line(self, x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
         """
         Integer grid line between (x0, y0) and (x1, y1) using Bresenham's algorithm.
@@ -810,13 +817,16 @@ class Task1(Node):
         return False
 
     def is_safe_known_cell(self, mx: int, my: int,
-                           clearance_cells: int = 5) -> bool:
+                           clearance_cells: Optional[int] = None) -> bool:
         """
         A 'safe known' cell:
         - is free
         - is NOT a frontier (so it is fully in explored space)
         - has no occupied cells within the given clearance radius.
         """
+        if clearance_cells is None:
+            clearance_cells = self.FRONTIER_CLEARANCE_CELLS
+
         # must be free
         if not self.is_free(mx, my):
             return False
@@ -903,13 +913,16 @@ class Task1(Node):
                 clusters.append(cluster)
 
         return clusters
-    
+
     def is_safe_frontier_cell(self, mx: int, my: int,
-                              clearance_cells: int = 5) -> bool:
+                              clearance_cells: Optional[int] = None) -> bool:
         """
         A 'safe' frontier cell is free AND has no occupied cells
         within a given radius in grid space.
         """
+        if clearance_cells is None:
+            clearance_cells = self.FRONTIER_CLEARANCE_CELLS
+
         if not self.is_free(mx, my):
             return False
 
@@ -925,18 +938,17 @@ class Task1(Node):
                 v = self.cell_value(nx, ny)
                 if v is None:
                     continue
-                # treat anything above occ_threshold as obstacle
                 if v >= 50:
                     return False
 
         return True
-    
+
     def backoff_from_obstacle(
         self,
         mx: int,
         my: int,
         max_back_cells: int = 5,
-        clearance_cells: int = 6,
+        clearance_cells: Optional[int] = None,
     ) -> Optional[Tuple[int, int]]:
         """
         Given a (possibly unsafe) frontier cell (mx, my),
@@ -946,6 +958,9 @@ class Task1(Node):
 
         Returns (bx, by) or None if no suitable cell found.
         """
+        if clearance_cells is None:
+            clearance_cells = self.FRONTIER_CLEARANCE_CELLS
+
         if self.robot_mx is None or self.robot_my is None:
             return None
 
@@ -976,13 +991,13 @@ class Task1(Node):
                 return (bx, by)
 
         return None
-    
+
     def backoff_to_known_safe_cell(
         self,
         mx: int,
         my: int,
         max_back_cells: int = 4,
-        clearance_cells: int = 5,
+        clearance_cells: Optional[int] = None,
     ) -> Optional[Tuple[int, int]]:
         """
         Given a frontier cell (mx, my), step back along the line from
@@ -992,6 +1007,9 @@ class Task1(Node):
         - not a frontier (already explored)
         - has clearance from obstacles (is_safe_known_cell).
         """
+        if clearance_cells is None:
+            clearance_cells = self.FRONTIER_CLEARANCE_CELLS
+
         if self.robot_mx is None or self.robot_my is None:
             return None
 
@@ -1047,7 +1065,7 @@ class Task1(Node):
                 backed = self.backoff_to_known_safe_cell(
                     tx, ty,
                     max_back_cells=4,
-                    clearance_cells=self.PATH_CLEARANCE_CELLS,
+                    clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
                 )
                 if backed is not None:
                     tx, ty = backed
@@ -1258,10 +1276,9 @@ class Task1(Node):
         """
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
-        # be more forgiving: ~1 cell for waypoints, ~1.5–2 cells for goal
-        waypoint_tol = 0.5 * cell
-        goal_tol     = 0.8 * cell
-        min_goal_speed = 0.02  # keep as is
+        waypoint_tol = 0.5 * cell  # for intermediate waypoints
+        goal_tol     = 0.8 * cell  # for final goal
+        min_goal_speed = 0.02
 
         if (self.current_path_world is None or
                 not self.current_path_world or
@@ -1277,17 +1294,6 @@ class Task1(Node):
         # --- UNION OBSTACLE CRITERIA ---
 
         # 1) /scan-based obstacle
-        '''if (
-            self.front_range_filt is not None and
-            self.front_range_filt < self.obstacle_stop_dist
-        ):
-            self.get_logger().warn(
-                f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
-                f'Stopping and clearing path for replanning.',
-                throttle_duration_sec=1.0
-            )
-            self.clear_current_path()
-            return'''
         if (
             self.front_range_filt is not None and
             self.front_range_filt < self.obstacle_stop_dist
@@ -1352,7 +1358,7 @@ class Task1(Node):
         while self.path_idx < len(self.current_path_world) - 1:
             gx, gy = self.current_path_world[self.path_idx]
             dist_to_wp = math.hypot(gx - rx, gy - ry)
-            if dist_to_wp < waypoint_tol:  # waypoint tolerance
+            if dist_to_wp < waypoint_tol:
                 self.path_idx += 1
             else:
                 break
@@ -1360,16 +1366,8 @@ class Task1(Node):
         # Check final goal
         gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
-        '''if (self.path_idx == len(self.current_path_world) - 1 and
-                dist_to_goal < goal_tol and
-                speed_curr < min_goal_speed):
-            self.get_logger().info(
-                'Reached current path goal. Stopping and clearing path.',
-                throttle_duration_sec=2.0
-            )
-            self.clear_current_path()
-            return'''
-        if (self.path_idx == len(self.current_path_world) - 1 and 
+
+        if (self.path_idx == len(self.current_path_world) - 1 and
             dist_to_goal < goal_tol and
             speed_curr < min_goal_speed):
 
@@ -1388,7 +1386,7 @@ class Task1(Node):
 
             self.clear_current_path()
             return
-        
+
         # Desired heading
         dx = gx - rx
         dy = gy - ry
@@ -1400,28 +1398,27 @@ class Task1(Node):
             heading_err = 0.0
 
         # Extra stability: slow down more when turning sharply
-        turn_ratio = max(0.2, 1.0 - abs(heading_err))  
-        # heading_err = 90° → linear speed allowed = 20%
+        turn_ratio = max(0.2, 1.0 - abs(heading_err))
 
         # Angular velocity from heading PID
         heading_cmd = self.pid_heading.step(heading_err, dt)
 
-        # Scale desired speed by how well we are aligned with the goal.
-        # cos(|err|) = 1 when perfectly aligned, ~0 when sideways, negative when backwards.
+        # Heading factor: penalize misalignment but not too aggressively
         heading_factor = max(0.0, math.cos(heading_err))
 
         if dist_to_goal > self.slow_down_dist:
             speed_goal = self.speed_max * heading_factor * turn_ratio
         else:
             base = self.speed_max * (dist_to_goal / max(self.slow_down_dist, 1e-3))
-            speed_goal = max(self.speed_min * heading_factor, base * heading_factor) * turn_ratio
+            speed_goal = max(self.speed_min * heading_factor,
+                             base * heading_factor) * turn_ratio
 
         # Speed PID on (speed_goal - current_estimated_speed)
         speed_err = speed_goal - speed_curr
         speed_cmd = self.pid_speed.step(speed_err, dt)
 
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 0.8:   # was 1.0
+        if abs(heading_err) > 1.0:   # allow bigger error before freezing linear speed
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
@@ -1432,7 +1429,7 @@ class Task1(Node):
     # -------------------------------------------------------------------------
     # Timer callback - behavior loop (Stage 6)
     # -------------------------------------------------------------------------
-    
+
     def which_cluster_contains(
         self,
         clusters: List[List[Tuple[int, int]]],
@@ -1554,6 +1551,7 @@ class Task1(Node):
                     while remaining_clusters and not found_valid_goal:
                         goal_cell = self.choose_frontier_goal(remaining_clusters)
                         if goal_cell is None:
+                            # no more acceptable cells under current filters
                             break
 
                         gx, gy = goal_cell
@@ -1563,7 +1561,6 @@ class Task1(Node):
                             self.get_logger().warn(
                                 f'Frontier goal {goal_cell} not traversable — skipping this cluster.'
                             )
-                            # remove the cluster that produced this goal
                             cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
                             if cluster_to_remove:
                                 remaining_clusters.remove(cluster_to_remove)
@@ -1593,6 +1590,10 @@ class Task1(Node):
                         found_valid_goal = True
 
                     if not found_valid_goal:
+                        # No goal could satisfy traversability / blocked-goal / distance constraints.
+                        # Clear any stale goal marker so RViz matches planner state.
+                        self.frontier_goal = None
+                        self.clear_current_path()
                         self.get_logger().warn('No valid frontier goal in ANY cluster.')
 
             # 4) Visualization
