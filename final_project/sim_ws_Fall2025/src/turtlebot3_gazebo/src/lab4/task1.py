@@ -141,18 +141,17 @@ class Task1(Node):
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
         # self.obstacle_stop_dist: float = 0.4  # m
-        self.obstacle_stop_dist = 0.50
+        self.obstacle_stop_dist = 0.40
 
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
-        # >>> 2x speed tweak <<<
-        '''self.speed_max = 0.44    # was 0.22
-        self.speed_min = 0.08    # was 0.05
-        self.heading_max = 2.5   # was 2.0'''
+        # keep fast linear speed but soften heading
         self.speed_max = 0.70      # linear speed cap
         self.speed_min = 0.10      # minimum creeping speed
-        self.heading_max = 6.0     # angular speed cap
+        # Smooth + stable turning
+        self.heading_max = 0.9      # rad/s  (much calmer, still agile)
+        self.heading_deadband = 0.05  # rad ≈ 3 degrees
 
         self.yaw_tol = 0.1        # rad
         # self.slow_down_dist = 0.50 # m, was 0.35 to give more braking room
@@ -161,28 +160,18 @@ class Task1(Node):
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
 
-        '''self.pid_speed = PID(
-            kp=2.8, ki=0.10, kd=0.25,
-            i_limit=0.8,
-            out_limit=(-self.speed_max, self.speed_max)
-        )
-        self.pid_heading = PID(
-            kp=2.3, ki=0.01, kd=0.18,   # slightly more aggressive than before
-            i_limit=0.8,
-            out_limit=(-self.heading_max, self.heading_max)
-        )'''
         self.pid_speed = PID(
-            kp=4.8,     # used to be ~2.8
-            ki=0.15,    # used to be 0.10
-            kd=0.35,    # used to be 0.25
+            kp=4.8,     # stays aggressive for speed
+            ki=0.15,
+            kd=0.35,
             i_limit=1.0,
             out_limit=(-self.speed_max, self.speed_max)
         )
         self.pid_heading = PID(
-            kp=3.5,     # more aggressive turning
-            ki=0.02,
-            kd=0.25,
-            i_limit=1.0,
+            kp=0.75,     # gentle but responsive
+            ki=0.008,    # tiny integral – prevents drift, no wobble
+            kd=0.22,     # BIGGER damping → kills oscillations
+            i_limit=0.6,
             out_limit=(-self.heading_max, self.heading_max)
         )
 
@@ -1390,6 +1379,14 @@ class Task1(Node):
         desired_yaw = math.atan2(dy, dx)
         heading_err = wrap_angle(desired_yaw - ryaw)
 
+        # Deadband to eliminate micro-oscillations
+        if abs(heading_err) < self.heading_deadband:
+            heading_err = 0.0
+
+        # Extra stability: slow down more when turning sharply
+        turn_ratio = max(0.2, 1.0 - abs(heading_err))  
+        # heading_err = 90° → linear speed allowed = 20%
+
         # Angular velocity from heading PID
         heading_cmd = self.pid_heading.step(heading_err, dt)
 
@@ -1398,19 +1395,17 @@ class Task1(Node):
         heading_factor = max(0.0, math.cos(heading_err))
 
         if dist_to_goal > self.slow_down_dist:
-            # Far from goal → go faster, but not if we're badly misaligned.
-            speed_goal = self.speed_max * heading_factor
+            speed_goal = self.speed_max * heading_factor * turn_ratio
         else:
-            # Near goal → slow down proportional to distance, still modulated by heading
             base = self.speed_max * (dist_to_goal / max(self.slow_down_dist, 1e-3))
-            speed_goal = max(self.speed_min * heading_factor, base * heading_factor)
+            speed_goal = max(self.speed_min * heading_factor, base * heading_factor) * turn_ratio
 
         # Speed PID on (speed_goal - current_estimated_speed)
         speed_err = speed_goal - speed_curr
         speed_cmd = self.pid_speed.step(speed_err, dt)
 
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 1.0:
+        if abs(heading_err) > 0.8:   # was 1.0
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
