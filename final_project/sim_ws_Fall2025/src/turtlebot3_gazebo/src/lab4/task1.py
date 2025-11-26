@@ -80,37 +80,13 @@ def wrap_angle(angle: float) -> float:
 class Task1(Node):
     """
     Task 1 – Autonomous Mapping
-
-    Stage 1:
-        - Maintain an up-to-date occupancy grid using /map and /map_updates.
-
-    Stage 2:
-        - Use TF (map -> base_footprint) to track robot pose in the map frame,
-          and convert that to grid indices on the occupancy grid.
-
-    Stage 3:
-        - Implement a grid-based A* planner that can compute a path between
-          two cells on the occupancy grid.
-
-    Stage 4:
-        - Detect frontier cells (free adjacent to unknown), cluster them,
-          select a frontier goal (closest cluster + closest point in it),
-          and visualize clusters, chosen goal, and A* path in RViz.
-
-    Stage 5:
-        - Follow the current A* path using PID control for speed and heading,
-          publish /cmd_vel, and perform simple obstacle avoidance using /scan.
-
-    Stage 6:
-        - Add a simple exploration state machine:
-            WAIT_FOR_MAP -> EXPLORE -> DONE
-          Stop exploring only when there are no more frontiers.
     """
 
     # clustering parameters
     CLUSTER_RADIUS_CELLS = 2      # how far neighbors can be and still be in same cluster
     MIN_CLUSTER_SIZE = 5          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 12       # minumum distance of frontier from the robot
+    MIN_GOAL_DIST_CELLS = 12      # minimum distance of frontier from the robot (in grid cells)
+    PATH_CLEARANCE_CELLS = 6      # inflation radius for safe path planning
 
     def __init__(self):
         super().__init__('task1_node')
@@ -154,6 +130,7 @@ class Task1(Node):
         # ---------------------------
         self.frontier_clusters: List[List[Tuple[int, int]]] = []
         self.frontier_goal: Optional[Tuple[int, int]] = None
+        self.last_frontier_goal: Optional[Tuple[int, int]] = None  # remember last goal
         self.current_path: Optional[List[Tuple[int, int]]] = None
         self.current_path_world: Optional[List[Tuple[float, float]]] = None
         self.path_idx: Optional[int] = None
@@ -299,7 +276,8 @@ class Task1(Node):
                 throttle_duration_sec=5.0
             )
         
-        if self.map_received: self.stop_dist_tol = 0.6 * self.map_resolution
+        if self.map_received:
+            self.stop_dist_tol = 0.6 * self.map_resolution
 
     def map_update_callback(self, msg: OccupancyGridUpdate):
         """
@@ -402,8 +380,7 @@ class Task1(Node):
         - must be free
         - must have some clearance to occupied cells
         """
-        # tune clearance_cells as needed (2–3 is typical with 5cm resolution)
-        return self.is_safe_frontier_cell(mx, my, clearance_cells=5)
+        return self.is_safe_for_path(mx, my, clearance_cells=self.PATH_CLEARANCE_CELLS)
 
     # -------------------------------------------------------------------------
     # Scan callback (Stage 5)
@@ -540,9 +517,12 @@ class Task1(Node):
 
     def has_line_of_sight(self, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
         """
-        Return True if there is a collision-free straight line between cells a and b.
-        We treat any occupied cell as blocking. Unknown is optional; here we allow it
-        because A* already stays in known-free cells.
+        Return True if there is a collision-free *inflated* straight line
+        between cells a and b.
+
+        We require every cell along the line to be safe for path planning
+        (free + clearance to obstacles). This preserves the inflation
+        radius even after smoothing.
         """
         if not self.map_received or self.map_data is None:
             return False
@@ -555,12 +535,8 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            v = self.cell_value(mx, my)
-            if v is None:
-                return False
-
-            # block if it is clearly occupied
-            if v >= 50:
+            # require inflated safety, not just "not occupied"
+            if not self.is_safe_for_path(mx, my, self.PATH_CLEARANCE_CELLS):
                 return False
 
         return True
@@ -568,7 +544,7 @@ class Task1(Node):
     def smooth_path(self, path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """
         Simplify an A* path by removing intermediate waypoints where possible,
-        keeping the path collision-free using has_line_of_sight.
+        keeping the path collision-free AND inflated using has_line_of_sight.
 
         Returns a new, shorter list of (mx, my) cells.
         """
@@ -632,6 +608,33 @@ class Task1(Node):
                 break
 
         return best_cell
+
+    def is_safe_for_path(self, mx: int, my: int,
+                         clearance_cells: int) -> bool:
+        """
+        A cell is safe for path planning if:
+        - it is free
+        - there is no occupied cell within `clearance_cells` in grid space.
+        """
+        if not self.is_free(mx, my):
+            return False
+
+        if self.map_width is None or self.map_height is None:
+            return False
+
+        for dx in range(-clearance_cells, clearance_cells + 1):
+            for dy in range(-clearance_cells, clearance_cells + 1):
+                nx = mx + dx
+                ny = my + dy
+                if self.map_index(nx, ny) is None:
+                    continue
+                v = self.cell_value(nx, ny)
+                if v is None:
+                    continue
+                if v >= 50:     # treat as obstacle
+                    return False
+
+        return True
 
     def astar_plan(
         self,
@@ -779,7 +782,7 @@ class Task1(Node):
         return False
 
     def is_safe_known_cell(self, mx: int, my: int,
-                        clearance_cells: int = 5) -> bool:
+                           clearance_cells: int = 5) -> bool:
         """
         A 'safe known' cell:
         - is free
@@ -878,9 +881,6 @@ class Task1(Node):
         """
         A 'safe' frontier cell is free AND has no occupied cells
         within a given radius in grid space.
-
-        This acts like a cheap inflation layer: we avoid goals that are
-        right next to walls/obstacles.
         """
         if not self.is_free(mx, my):
             return False
@@ -963,9 +963,6 @@ class Task1(Node):
         - free
         - not a frontier (already explored)
         - has clearance from obstacles (is_safe_known_cell).
-
-        This gives a goal slightly inside explored space but still close
-        to the original frontier cell.
         """
         if self.robot_mx is None or self.robot_my is None:
             return None
@@ -999,106 +996,97 @@ class Task1(Node):
 
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         """
-        Choose a frontier goal by:
-        1) For each cluster, compute the closest distance from the robot
-            to any cell in that cluster. Use that to pick the "closest cluster".
-        2) Within the chosen cluster, pick a frontier cell that is at least
-            MIN_GOAL_DIST_CELLS away from the robot (in grid), preferring
-            the *closest* among those that satisfy the minimum distance.
-        3) If no cell satisfies the minimum distance, fall back to the truly
-            closest cell in the cluster, but pulled back to a safe cell
-            if it is too close to obstacles.
+        Frontier-goal selection based on individual frontier cells (not centroids).
+
+        Strategy:
+          - For each frontier cell in each cluster, try to find a "known safe" backed-off cell
+            (inside explored, obstacle-free space) using backoff_to_known_safe_cell.
+          - Use that backed-off cell as the candidate goal if possible; otherwise, skip if unsafe.
+          - Rank candidates by:
+              1) at least MIN_GOAL_DIST_CELLS away from robot (preferred),
+              2) not too close to the last chosen goal (to avoid reusing the same point),
+              3) distance from the robot (closer is better).
+          - If no candidate meets the distance and "not last goal" constraints, fall back to the
+            closest safe cell we have.
         """
+
         if not clusters:
             return None
         if self.robot_mx is None or self.robot_my is None:
             return None
 
-        # 1) pick the closest cluster (by any traversable cell)
-        best_cluster_idx = None
-        best_cluster_min_dist2 = float('inf')
-
-        for idx, cluster in enumerate(clusters):
-            cluster_min_dist2 = float('inf')
-            for (mx, my) in cluster:
-                # only consider traversable cells when ranking clusters
-                if not self.is_traversable(mx, my):
-                    continue
-
-                dx = mx - self.robot_mx
-                dy = my - self.robot_my
-                dist2 = dx * dx + dy * dy
-                if dist2 < cluster_min_dist2:
-                    cluster_min_dist2 = dist2
-
-            if cluster_min_dist2 < best_cluster_min_dist2:
-                best_cluster_min_dist2 = cluster_min_dist2
-                best_cluster_idx = idx
-
-        if best_cluster_idx is None:
-            return None
-
-        chosen_cluster = clusters[best_cluster_idx]
-
-        # 2) within this cluster, prefer cells at least MIN_GOAL_DIST_CELLS away
-        #    AND 'safe' from nearby obstacles (possibly after backoff).
         min_dist2_required = self.MIN_GOAL_DIST_CELLS ** 2
+        # Treat "same as last goal" as within ~2 cells
+        same_goal_dist2 = 4
 
-        candidate_cell = None
-        candidate_dist2 = float('inf')
+        best_far: Optional[Tuple[int, int]] = None
+        best_far_dist2: float = float('inf')
 
-        fallback_cell = None          # closest usable cell (possibly backed off)
-        fallback_dist2 = float('inf')
+        best_any_not_last: Optional[Tuple[int, int]] = None
+        best_any_not_last_dist2: float = float('inf')
 
-        safe_fallback_cell = None     # closest safe cell (even if too close to robot)
-        safe_fallback_dist2 = float('inf')
+        best_any: Optional[Tuple[int, int]] = None
+        best_any_dist2: float = float('inf')
 
-        for (mx, my) in chosen_cluster:
-            # Start from the frontier cell
-            tx, ty = mx, my
+        for cluster in clusters:
+            if not cluster:
+                continue
 
-            # Prefer a "known-safe" cell (already explored, away from obstacles).
-            # If the frontier itself is not such a cell, back off toward the robot.
-            if not self.is_safe_known_cell(tx, ty, clearance_cells=6):
+            for (mx, my) in cluster:
+                # Start from the frontier cell
+                tx, ty = mx, my
+
+                # Prefer a "known-safe" cell inside explored space, away from obstacles
                 backed = self.backoff_to_known_safe_cell(
                     tx, ty,
                     max_back_cells=6,
-                    clearance_cells=6,
+                    clearance_cells=self.PATH_CLEARANCE_CELLS,
                 )
-                if backed is None:
-                    # No suitable known-safe cell for this frontier point
+                if backed is not None:
+                    tx, ty = backed
+
+                # Check traversability with inflated obstacles
+                if not self.is_traversable(tx, ty):
                     continue
-                tx, ty = backed
 
-            # From here, (tx, ty) is a "safe" target cell
-            dx = tx - self.robot_mx
-            dy = ty - self.robot_my
-            dist2 = dx * dx + dy * dy
+                dx = tx - self.robot_mx
+                dy = ty - self.robot_my
+                dist2 = dx * dx + dy * dy
 
-            # always track the absolute closest safe cell as fallback
-            if dist2 < fallback_dist2:
-                fallback_dist2 = dist2
-                fallback_cell = (tx, ty)
+                # Track the absolute closest safe candidate as a last-resort fallback
+                if dist2 < best_any_dist2:
+                    best_any_dist2 = dist2
+                    best_any = (tx, ty)
 
-            # also track closest safe cell regardless of MIN_GOAL_DIST_CELLS
-            if dist2 < safe_fallback_dist2:
-                safe_fallback_dist2 = dist2
-                safe_fallback_cell = (tx, ty)
+                # If we have a last goal, try not to select almost the same cell again
+                is_too_close_to_last = False
+                if self.last_frontier_goal is not None:
+                    lgx, lgy = self.last_frontier_goal
+                    ddx = tx - lgx
+                    ddy = ty - lgy
+                    if ddx * ddx + ddy * ddy <= same_goal_dist2:
+                        is_too_close_to_last = True
 
-            # prefer cells that are not too close to the robot
-            if dist2 >= min_dist2_required and dist2 < candidate_dist2:
-                candidate_dist2 = dist2
-                candidate_cell = (tx, ty)
+                if not is_too_close_to_last and dist2 < best_any_not_last_dist2:
+                    best_any_not_last_dist2 = dist2
+                    best_any_not_last = (tx, ty)
+
+                # Prefer goals that are at least MIN_GOAL_DIST_CELLS away
+                if dist2 >= min_dist2_required and dist2 < best_far_dist2:
+                    # Also avoid picking exactly the last goal as "far"
+                    if not is_too_close_to_last:
+                        best_far_dist2 = dist2
+                        best_far = (tx, ty)
 
         # Priority:
-        # 1) safe + not too close
-        if candidate_cell is not None:
-            return candidate_cell
-        # 2) closest safe cell (backed off if needed)
-        if safe_fallback_cell is not None:
-            return safe_fallback_cell
-        # 3) last-resort fallback (should already be safe if set)
-        return fallback_cell
+        # 1) sufficiently far and not near the last goal
+        if best_far is not None:
+            return best_far
+        # 2) closest safe cell that isn't near the last goal
+        if best_any_not_last is not None:
+            return best_any_not_last
+        # 3) closest safe cell we have (even if it's near the last goal or close to robot)
+        return best_any
 
     # -------------------------------------------------------------------------
     # Visualization helpers (Stage 4)
@@ -1251,10 +1239,9 @@ class Task1(Node):
         Check if the upcoming part of the current path remains safe
         in the occupancy grid for *local* execution.
 
-        For exploration, we only treat *occupied* cells as hard obstacles.
-        Unknown (-1) is allowed, so the robot can still move toward frontiers.
-        If any upcoming path cell becomes occupied, the path is considered
-        invalid and we should replan.
+        We now re-check full traversability (inflated safety), not just
+        "not occupied", so if an obstacle appears near the path, the
+        path becomes invalid and we replan.
         """
         if self.current_path is None or self.path_idx is None:
             return False
@@ -1269,8 +1256,8 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            # Only hard-block on occupied cells (unknown allowed for exploration)
-            if self.is_occupied(mx, my):
+            # require traversability (free + clearance), not just non-occupied
+            if not self.is_traversable(mx, my):
                 return False
 
         return True
@@ -1316,10 +1303,10 @@ class Task1(Node):
             self.clear_current_path()
             return
 
-        # 2) map-based obstacle along path (occupied cells only)
+        # 2) map-based obstacle along path (traversability including clearance)
         if not self.is_path_still_valid():
             self.get_logger().warn(
-                'Current path intersects newly occupied/unknown cells in map. '
+                'Current path cells lost traversability (new obstacles / reduced clearance). '
                 'Clearing path for replanning.',
                 throttle_duration_sec=1.0
             )
@@ -1367,8 +1354,9 @@ class Task1(Node):
         # Check final goal
         gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
-        # if self.path_idx == len(self.current_path_world) - 1 and dist_to_goal < self.stop_dist_tol:
-        if (self.path_idx == len(self.current_path_world) - 1 and dist_to_goal < goal_tol and speed_curr < min_goal_speed):
+        if (self.path_idx == len(self.current_path_world) - 1 and
+                dist_to_goal < goal_tol and
+                speed_curr < min_goal_speed):
             self.get_logger().info(
                 'Reached current path goal. Stopping and clearing path.',
                 throttle_duration_sec=2.0
@@ -1423,10 +1411,6 @@ class Task1(Node):
         """
         Find the cluster whose cells are closest to 'cell', as long as the
         minimum distance is within max_dist_cells (in grid units).
-
-        This is robust to goals that have been 'backed off' a bit from
-        the original frontier cells, so their exact grid index might not
-        be in the cluster.
         """
         mx, my = cell
         best_cluster = None
@@ -1573,6 +1557,7 @@ class Task1(Node):
                             f'start={smoothed[0]}, end={smoothed[-1]}'
                         )
                         self.frontier_goal = goal_cell
+                        self.last_frontier_goal = goal_cell
                         self.set_current_path(smoothed)
                         found_valid_goal = True
 
