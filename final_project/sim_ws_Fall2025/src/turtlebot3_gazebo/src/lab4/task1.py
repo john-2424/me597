@@ -85,7 +85,7 @@ class Task1(Node):
     # clustering parameters
     CLUSTER_RADIUS_CELLS = 2      # how far neighbors can be and still be in same cluster
     MIN_CLUSTER_SIZE = 5          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 12      # minimum distance of frontier from the robot (in grid cells)
+    MIN_GOAL_DIST_CELLS = 4      # minimum distance of frontier from the robot (in grid cells)
     PATH_CLEARANCE_CELLS = 6      # inflation radius for safe path planning
 
     def __init__(self):
@@ -141,7 +141,7 @@ class Task1(Node):
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
         # self.obstacle_stop_dist: float = 0.4  # m
-        self.obstacle_stop_dist = 0.40
+        self.obstacle_stop_dist = 0.24
 
         # ---------------------------
         # PID controllers (Stage 5)
@@ -179,6 +179,10 @@ class Task1(Node):
         # Exploration state (Stage 6)
         # ---------------------------
         self.state = "WAIT_FOR_MAP"  # or "EXPLORE", "DONE"
+
+        # Blocked frontier goals (cells that caused repeated failures)
+        self.blocked_goals: List[Tuple[int, int]] = []
+        self.BLOCKED_GOAL_RADIUS_CELLS = 8   # ~8 cells ≈ 0.4 m with 0.05 m resolution
 
         # ---------------------------
         # Misc counters
@@ -770,6 +774,21 @@ class Task1(Node):
     # Frontier detection & clustering (Stage 4)
     # -------------------------------------------------------------------------
 
+    def is_blocked_goal_cell(self, mx: int, my: int) -> bool:
+        """
+        Return True if (mx, my) is inside the 'blocked' region around
+        any previously failed frontier goal.
+        """
+        if not self.blocked_goals:
+            return False
+
+        for bx, by in self.blocked_goals:
+            dx = mx - bx
+            dy = my - by
+            if dx * dx + dy * dy <= self.BLOCKED_GOAL_RADIUS_CELLS ** 2:
+                return True
+        return False
+
     def is_frontier_cell(self, mx: int, my: int) -> bool:
         """
         A frontier cell is:
@@ -1005,47 +1024,26 @@ class Task1(Node):
 
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         """
-        Frontier-goal selection based on individual frontier cells (not centroids).
-
-        Strategy:
-          - For each frontier cell in each cluster, try to find a "known safe" backed-off cell
-            (inside explored, obstacle-free space) using backoff_to_known_safe_cell.
-          - Use that backed-off cell as the candidate goal if possible; otherwise, skip if unsafe.
-          - Rank candidates by:
-              1) at least MIN_GOAL_DIST_CELLS away from robot (preferred),
-              2) not too close to the last chosen goal (to avoid reusing the same point),
-              3) distance from the robot (closer is better).
-          - If no candidate meets the distance and "not last goal" constraints, fall back to the
-            closest safe cell we have.
+        Choose the **nearest** safe frontier-related cell to the robot,
+        ignoring any cells in blocked regions and any that are too close.
         """
-
         if not clusters:
             return None
         if self.robot_mx is None or self.robot_my is None:
             return None
 
-        min_dist2_required = self.MIN_GOAL_DIST_CELLS ** 2
-        # Treat "same as last goal" as within ~2 cells
-        same_goal_dist2 = 4
-
-        best_far: Optional[Tuple[int, int]] = None
-        best_far_dist2: float = float('inf')
-
-        best_any_not_last: Optional[Tuple[int, int]] = None
-        best_any_not_last_dist2: float = float('inf')
-
-        best_any: Optional[Tuple[int, int]] = None
-        best_any_dist2: float = float('inf')
+        best_goal: Optional[Tuple[int, int]] = None
+        best_dist2: float = float('inf')
 
         for cluster in clusters:
             if not cluster:
                 continue
 
             for (mx, my) in cluster:
-                # Start from the frontier cell
+                # start from the frontier cell
                 tx, ty = mx, my
 
-                # Prefer a "known-safe" cell inside explored space, away from obstacles
+                # Prefer a known-safe cell slightly inside explored space
                 backed = self.backoff_to_known_safe_cell(
                     tx, ty,
                     max_back_cells=6,
@@ -1054,48 +1052,27 @@ class Task1(Node):
                 if backed is not None:
                     tx, ty = backed
 
-                # Check traversability with inflated obstacles
+                # Must be traversable with inflation
                 if not self.is_traversable(tx, ty):
+                    continue
+
+                # Skip if this goal is in a blocked region
+                if self.is_blocked_goal_cell(tx, ty):
                     continue
 
                 dx = tx - self.robot_mx
                 dy = ty - self.robot_my
                 dist2 = dx * dx + dy * dy
 
-                # Track the absolute closest safe candidate as a last-resort fallback
-                if dist2 < best_any_dist2:
-                    best_any_dist2 = dist2
-                    best_any = (tx, ty)
+                # Skip goals that are too close to the robot
+                if dist2 < self.MIN_GOAL_DIST_CELLS ** 2:
+                    continue
 
-                # If we have a last goal, try not to select almost the same cell again
-                is_too_close_to_last = False
-                if self.last_frontier_goal is not None:
-                    lgx, lgy = self.last_frontier_goal
-                    ddx = tx - lgx
-                    ddy = ty - lgy
-                    if ddx * ddx + ddy * ddy <= same_goal_dist2:
-                        is_too_close_to_last = True
+                if dist2 < best_dist2:
+                    best_dist2 = dist2
+                    best_goal = (tx, ty)
 
-                if not is_too_close_to_last and dist2 < best_any_not_last_dist2:
-                    best_any_not_last_dist2 = dist2
-                    best_any_not_last = (tx, ty)
-
-                # Prefer goals that are at least MIN_GOAL_DIST_CELLS away
-                if dist2 >= min_dist2_required and dist2 < best_far_dist2:
-                    # Also avoid picking exactly the last goal as "far"
-                    if not is_too_close_to_last:
-                        best_far_dist2 = dist2
-                        best_far = (tx, ty)
-
-        # Priority:
-        # 1) sufficiently far and not near the last goal
-        if best_far is not None:
-            return best_far
-        # 2) closest safe cell that isn't near the last goal
-        if best_any_not_last is not None:
-            return best_any_not_last
-        # 3) closest safe cell we have (even if it's near the last goal or close to robot)
-        return best_any
+        return best_goal
 
     # -------------------------------------------------------------------------
     # Visualization helpers (Stage 4)
@@ -1300,7 +1277,7 @@ class Task1(Node):
         # --- UNION OBSTACLE CRITERIA ---
 
         # 1) /scan-based obstacle
-        if (
+        '''if (
             self.front_range_filt is not None and
             self.front_range_filt < self.obstacle_stop_dist
         ):
@@ -1309,6 +1286,27 @@ class Task1(Node):
                 f'Stopping and clearing path for replanning.',
                 throttle_duration_sec=1.0
             )
+            self.clear_current_path()
+            return'''
+        if (
+            self.front_range_filt is not None and
+            self.front_range_filt < self.obstacle_stop_dist
+        ):
+            # Remember that the current frontier goal is problematic
+            if self.frontier_goal is not None:
+                self.blocked_goals.append(self.frontier_goal)
+                self.get_logger().warn(
+                    f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
+                    f'Marking frontier {self.frontier_goal} as blocked and replanning.',
+                    throttle_duration_sec=1.0
+                )
+            else:
+                self.get_logger().warn(
+                    f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
+                    f'Stopping and clearing path for replanning.',
+                    throttle_duration_sec=1.0
+                )
+
             self.clear_current_path()
             return
 
@@ -1363,13 +1361,33 @@ class Task1(Node):
         # Check final goal
         gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
-        if (self.path_idx == len(self.current_path_world) - 1 and
+        '''if (self.path_idx == len(self.current_path_world) - 1 and
                 dist_to_goal < goal_tol and
                 speed_curr < min_goal_speed):
             self.get_logger().info(
                 'Reached current path goal. Stopping and clearing path.',
                 throttle_duration_sec=2.0
             )
+            self.clear_current_path()
+            return'''
+        if (self.path_idx == len(self.current_path_world) - 1 and 
+            dist_to_goal < goal_tol and
+            speed_curr < min_goal_speed):
+
+            # Mark this goal as "done" so we don't re-select it forever
+            if self.frontier_goal is not None:
+                self.blocked_goals.append(self.frontier_goal)
+                self.get_logger().info(
+                    f'Reached current path goal {self.frontier_goal}. '
+                    f'Marking it as blocked and clearing path.',
+                    throttle_duration_sec=2.0
+                )
+            else:
+                self.get_logger().info(
+                    'Reached current path goal. Stopping and clearing path.',
+                    throttle_duration_sec=2.0
+                )
+
             self.clear_current_path()
             return
         
