@@ -140,6 +140,9 @@ class Task1(Node):
         self.current_path_world: Optional[List[Tuple[float, float]]] = None
         self.path_idx: Optional[int] = None
 
+        # dynamic goal tolerance (meters), computed when we set a new path
+        self.current_goal_tol: Optional[float] = None
+
         # ---------------------------
         # Scan / obstacle state (Stage 5)
         # ---------------------------
@@ -148,10 +151,14 @@ class Task1(Node):
         self.obstacle_stop_dist = 0.30  # m
 
         # ---------------------------
-        # PID controllers (Stage 5)
+        # PID & Pure Pursuit controllers (Stage 5)
         # ---------------------------
-        # slightly slower but smoother body motion
-        self.speed_max = 0.45      # linear speed cap
+
+        # controller mode toggle: "PID" or "PURE_PURSUIT"
+        self.control_mode = "PURE_PURSUIT"
+
+        # slightly faster body motion
+        self.speed_max = 0.60      # linear speed cap (increased)
         self.speed_min = 0.08      # minimum creeping speed
 
         # sharper heading control
@@ -164,6 +171,7 @@ class Task1(Node):
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
 
+        # PID controller (still available as an option)
         self.pid_speed = PID(
             kp=3.0,
             ki=0.10,
@@ -178,6 +186,10 @@ class Task1(Node):
             i_limit=0.6,
             out_limit=(-self.heading_max, self.heading_max)
         )
+
+        # Pure pursuit parameters
+        self.pp_lookahead = 0.5   # meters
+        self.pp_speed = 0.55      # desired cruising speed
 
         # ---------------------------
         # Exploration state (Stage 6)
@@ -241,7 +253,8 @@ class Task1(Node):
 
         self.get_logger().info(
             f'Task1 node initialized. PATH_CLEARANCE_CELLS={self.PATH_CLEARANCE_CELLS}, '
-            f'FRONTIER_CLEARANCE_CELLS={self.FRONTIER_CLEARANCE_CELLS}'
+            f'FRONTIER_CLEARANCE_CELLS={self.FRONTIER_CLEARANCE_CELLS}, '
+            f'control_mode={self.control_mode}'
         )
 
     # -------------------------------------------------------------------------
@@ -1040,57 +1053,70 @@ class Task1(Node):
 
         return None
 
-    def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
+    # -------------------------------------------------------------------------
+    # Cluster planning based on A* path cost ONLY
+    # -------------------------------------------------------------------------
+
+    def plan_to_cluster(self, cluster: List[Tuple[int, int]]
+                        ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]], float]]:
         """
-        Choose the **nearest** safe frontier-related cell to the robot,
-        ignoring any cells in blocked regions and any that are too close.
+        For a given cluster, try all its cells (with safety/backoff),
+        run A* from the robot to each candidate, and keep the candidate
+        with the lowest A* path cost (length).
+
+        Returns (goal_cell, path_cells, cost) or None if no path works.
         """
-        if not clusters:
-            return None
         if self.robot_mx is None or self.robot_my is None:
             return None
 
         best_goal: Optional[Tuple[int, int]] = None
-        best_dist2: float = float('inf')
+        best_path: Optional[List[Tuple[int, int]]] = None
+        best_cost: float = float('inf')
 
-        for cluster in clusters:
-            if not cluster:
+        for (mx, my) in cluster:
+            tx, ty = mx, my
+
+            # Prefer a known-safe cell slightly inside explored space
+            backed = self.backoff_to_known_safe_cell(
+                tx, ty,
+                max_back_cells=4,
+                clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
+            )
+            if backed is not None:
+                tx, ty = backed
+
+            # Must be traversable with inflation
+            if not self.is_traversable(tx, ty):
                 continue
 
-            for (mx, my) in cluster:
-                # start from the frontier cell
-                tx, ty = mx, my
+            # Skip if this goal is in a blocked region
+            if self.is_blocked_goal_cell(tx, ty):
+                continue
 
-                # Prefer a known-safe cell slightly inside explored space
-                backed = self.backoff_to_known_safe_cell(
-                    tx, ty,
-                    max_back_cells=4,
-                    clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
-                )
-                if backed is not None:
-                    tx, ty = backed
+            # Skip goals too close to the robot
+            dx = tx - self.robot_mx
+            dy = ty - self.robot_my
+            dist2 = dx * dx + dy * dy
+            if dist2 < self.MIN_GOAL_DIST_CELLS ** 2:
+                continue
 
-                # Must be traversable with inflation
-                if not self.is_traversable(tx, ty):
-                    continue
+            # Run A* and use path length as cost
+            path = self.astar_plan((self.robot_mx, self.robot_my), (tx, ty))
+            if path is None:
+                continue
 
-                # Skip if this goal is in a blocked region
-                if self.is_blocked_goal_cell(tx, ty):
-                    continue
+            # path cost ~ length in cells (or meters = length*resolution)
+            cost = float(len(path))
 
-                dx = tx - self.robot_mx
-                dy = ty - self.robot_my
-                dist2 = dx * dx + dy * dy
+            if cost < best_cost:
+                best_cost = cost
+                best_goal = (tx, ty)
+                best_path = path
 
-                # Skip goals that are too close to the robot
-                if dist2 < self.MIN_GOAL_DIST_CELLS ** 2:
-                    continue
+        if best_goal is None or best_path is None:
+            return None
 
-                if dist2 < best_dist2:
-                    best_dist2 = dist2
-                    best_goal = (tx, ty)
-
-        return best_goal
+        return best_goal, best_path, best_cost
 
     # -------------------------------------------------------------------------
     # Visualization helpers (Stage 4)
@@ -1210,6 +1236,61 @@ class Task1(Node):
     # Path following & obstacle handling (Stage 5 + grid-based)
     # -------------------------------------------------------------------------
 
+    def compute_dynamic_goal_tolerance(self, goal_mx: int, goal_my: int) -> float:
+        """
+        Compute a dynamic goal tolerance (in meters) based on how close
+        the goal cell is to unknown or occupied cells.
+
+        - In "safe" open areas: small tolerance (~0.8 * cell).
+        - Near walls / unknown: larger tolerance (~2.0 * cell) so we
+          stop earlier and avoid hugging obstacles.
+        """
+        cell = self.map_resolution if self.map_resolution is not None else 0.05
+        base_tol = 0.8 * cell       # original value
+        high_tol = 2.0 * cell       # relaxed when near obstacles/unknown
+
+        if self.map_width is None or self.map_height is None:
+            return base_tol
+
+        # find min distance (in cells) from goal to unknown/occupied cells
+        R = self.PATH_CLEARANCE_CELLS + 3
+        min_d2 = float('inf')
+
+        for dx in range(-R, R + 1):
+            for dy in range(-R, R + 1):
+                nx = goal_mx + dx
+                ny = goal_my + dy
+                if self.map_index(nx, ny) is None:
+                    continue
+                v = self.cell_value(nx, ny)
+                if v is None:
+                    continue
+                if v == -1 or v >= 50:
+                    d2 = dx * dx + dy * dy
+                    if d2 < min_d2:
+                        min_d2 = d2
+
+        if min_d2 == float('inf'):
+            # No nearby obstacles/unknowns
+            tol = base_tol
+            return tol
+
+        dist_cells = math.sqrt(min_d2)
+
+        # If within (PATH_CLEARANCE + 1 cell) of obstacles/unknowns,
+        # we enlarge the goal tolerance.
+        if dist_cells <= self.PATH_CLEARANCE_CELLS + 1:
+            tol = high_tol
+        else:
+            tol = base_tol
+
+        self.get_logger().info(
+            f'Setting dynamic goal tolerance to {tol:.3f} m '
+            f'(clearance ≈ {dist_cells:.1f} cells).',
+            throttle_duration_sec=2.0
+        )
+        return tol
+
     def set_current_path(self, path_cells: List[Tuple[int, int]]):
         """Store new current path, reset indices and convert to world."""
         self.current_path = path_cells
@@ -1219,6 +1300,13 @@ class Task1(Node):
                 world = self.map_to_world(mx, my)
                 if world is not None:
                     self.current_path_world.append(world)
+
+            # compute dynamic goal tolerance based on final goal cell
+            goal_mx, goal_my = path_cells[-1]
+            self.current_goal_tol = self.compute_dynamic_goal_tolerance(goal_mx, goal_my)
+        else:
+            self.current_goal_tol = None
+
         self.path_idx = 0
         self.pid_speed.reset()
         self.pid_heading.reset()
@@ -1230,6 +1318,7 @@ class Task1(Node):
         self.current_path = None
         self.current_path_world = None
         self.path_idx = None
+        self.current_goal_tol = None
         self.publish_cmd_vel(0.0, 0.0)
 
     def publish_cmd_vel(self, linear_x: float, angular_z: float):
@@ -1266,9 +1355,134 @@ class Task1(Node):
 
         return True
 
+    # ----------------- controllers -----------------
+
+    def pure_pursuit_target(self, rx: float, ry: float) -> Optional[Tuple[float, float]]:
+        """Return a lookahead target on the path for pure pursuit."""
+        if not self.current_path_world:
+            return None
+
+        lookahead = self.pp_lookahead
+
+        # find closest point on path
+        best_idx = 0
+        best_d2 = float('inf')
+        for i, (px, py) in enumerate(self.current_path_world):
+            d2 = (px - rx) ** 2 + (py - ry) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = i
+
+        # from closest point, look forward until we reach lookahead distance
+        for i in range(best_idx, len(self.current_path_world)):
+            tx, ty = self.current_path_world[i]
+            if math.hypot(tx - rx, ty - ry) >= lookahead:
+                return tx, ty
+
+        # if path is shorter than lookahead, just aim at final goal
+        return self.current_path_world[-1]
+
+    def follow_path_pid_controller(self,
+                                   rx: float, ry: float, ryaw: float,
+                                   speed_curr: float, dt: float,
+                                   waypoint_tol: float):
+        """Original PID-based path follower."""
+        if (self.current_path_world is None or
+                self.path_idx is None or
+                not self.current_path_world):
+            self.publish_cmd_vel(0.0, 0.0)
+            return
+
+        # Advance waypoint index when close to current waypoint
+        while self.path_idx < len(self.current_path_world) - 1:
+            gx_wp, gy_wp = self.current_path_world[self.path_idx]
+            dist_to_wp = math.hypot(gx_wp - rx, gy_wp - ry)
+            if dist_to_wp < waypoint_tol:
+                self.path_idx += 1
+            else:
+                break
+
+        gx, gy = self.current_path_world[self.path_idx]
+
+        # Desired heading
+        dx = gx - rx
+        dy = gy - ry
+        desired_yaw = math.atan2(dy, dx)
+        heading_err = wrap_angle(desired_yaw - ryaw)
+
+        # Deadband to eliminate micro-oscillations
+        if abs(heading_err) < self.heading_deadband:
+            heading_err = 0.0
+
+        # Extra stability: slow down more when turning sharply
+        turn_ratio = max(0.2, 1.0 - abs(heading_err))
+
+        # Angular velocity from heading PID
+        heading_cmd = self.pid_heading.step(heading_err, dt)
+
+        # Heading factor: penalize misalignment but not too aggressively
+        heading_factor = max(0.0, math.cos(heading_err))
+
+        # Distance to final goal for slowdown logic
+        goal_x, goal_y = self.current_path_world[-1]
+        dist_to_goal = math.hypot(goal_x - rx, goal_y - ry)
+
+        if dist_to_goal > self.slow_down_dist:
+            speed_goal = self.speed_max * heading_factor * turn_ratio
+        else:
+            base = self.speed_max * (dist_to_goal / max(self.slow_down_dist, 1e-3))
+            speed_goal = max(self.speed_min * heading_factor,
+                             base * heading_factor) * turn_ratio
+
+        # Speed PID on (speed_goal - current_estimated_speed)
+        speed_err = speed_goal - speed_curr
+        speed_cmd = self.pid_speed.step(speed_err, dt)
+
+        # Extra safety: if very misaligned, stop and only rotate
+        if abs(heading_err) > 1.0:
+            speed_cmd = 0.0
+
+        # never go backwards, clamp to limits
+        speed_cmd = max(0.0, min(self.speed_max, speed_cmd))
+
+        self.publish_cmd_vel(speed_cmd, heading_cmd)
+
+    def follow_path_pure_pursuit(self,
+                                 rx: float, ry: float, ryaw: float,
+                                 speed_curr: float, dt: float):
+        """Pure pursuit path follower for faster, smoother motion."""
+        target = self.pure_pursuit_target(rx, ry)
+        if target is None:
+            self.publish_cmd_vel(0.0, 0.0)
+            return
+
+        tx, ty = target
+        dx = tx - rx
+        dy = ty - ry
+
+        # angle to target in world
+        target_yaw = math.atan2(dy, dx)
+        alpha = wrap_angle(target_yaw - ryaw)
+        Ld = max(0.05, math.hypot(dx, dy))
+
+        # pure pursuit curvature
+        curvature = 2.0 * math.sin(alpha) / Ld
+
+        v = min(self.pp_speed, self.speed_max)
+        w = v * curvature
+
+        # clamp angular velocity
+        w = max(-self.heading_max, min(self.heading_max, w))
+
+        # if very misaligned, stop and rotate in place
+        if abs(alpha) > 1.2:
+            v = 0.0
+
+        self.publish_cmd_vel(v, w)
+
     def follow_current_path(self):
         """
-        Follow the current path using PID on speed and heading.
+        Follow the current path using either PID or Pure Pursuit.
         Uses BOTH:
           - /scan front distance
           - occupancy grid along the path
@@ -1277,7 +1491,13 @@ class Task1(Node):
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
         waypoint_tol = 0.5 * cell  # for intermediate waypoints
-        goal_tol     = 0.8 * cell  # for final goal
+
+        # dynamic goal tolerance (meters)
+        if self.current_goal_tol is not None:
+            goal_tol = self.current_goal_tol
+        else:
+            goal_tol = 0.8 * cell  # fallback
+
         min_goal_speed = 0.02
 
         if (self.current_path_world is None or
@@ -1329,7 +1549,7 @@ class Task1(Node):
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
 
-        # dt for PID
+        # dt for controllers
         if self.last_ctrl_time is None:
             dt = 0.1  # ~10 Hz fallback
         else:
@@ -1354,110 +1574,34 @@ class Task1(Node):
         else:
             speed_curr = 0.0
 
-        # Advance waypoint index when close to current waypoint
-        while self.path_idx < len(self.current_path_world) - 1:
-            gx, gy = self.current_path_world[self.path_idx]
-            dist_to_wp = math.hypot(gx - rx, gy - ry)
-            if dist_to_wp < waypoint_tol:
-                self.path_idx += 1
-            else:
-                break
+        # --- goal reached check using dynamic tolerance ---
 
-        # Check final goal
-        gx, gy = self.current_path_world[self.path_idx]
-        dist_to_goal = math.hypot(gx - rx, gy - ry)
+        goal_x, goal_y = self.current_path_world[-1]
+        dist_to_goal = math.hypot(goal_x - rx, goal_y - ry)
 
-        if (self.path_idx == len(self.current_path_world) - 1 and
-            dist_to_goal < goal_tol and
+        if (dist_to_goal < goal_tol and
             speed_curr < min_goal_speed):
 
-            if self.frontier_goal is not None:
-                self.blocked_goals.append(self.frontier_goal)
-                self.get_logger().info(
-                    f'Reached current path goal {self.frontier_goal}. '
-                    f'Marking it as blocked and clearing path.',
-                    throttle_duration_sec=2.0
-                )
-            else:
-                self.get_logger().info(
-                    'Reached current path goal. Stopping and clearing path.',
-                    throttle_duration_sec=2.0
-                )
+            self.get_logger().info(
+                f'Reached current path goal (within {goal_tol:.3f} m). '
+                f'Clearing path and selecting a new frontier.',
+                throttle_duration_sec=2.0
+            )
 
+            # Note: we DO NOT mark this goal as blocked; we succeeded.
             self.clear_current_path()
             return
 
-        # Desired heading
-        dx = gx - rx
-        dy = gy - ry
-        desired_yaw = math.atan2(dy, dx)
-        heading_err = wrap_angle(desired_yaw - ryaw)
+        # --- controller selection ---
 
-        # Deadband to eliminate micro-oscillations
-        if abs(heading_err) < self.heading_deadband:
-            heading_err = 0.0
-
-        # Extra stability: slow down more when turning sharply
-        turn_ratio = max(0.2, 1.0 - abs(heading_err))
-
-        # Angular velocity from heading PID
-        heading_cmd = self.pid_heading.step(heading_err, dt)
-
-        # Heading factor: penalize misalignment but not too aggressively
-        heading_factor = max(0.0, math.cos(heading_err))
-
-        if dist_to_goal > self.slow_down_dist:
-            speed_goal = self.speed_max * heading_factor * turn_ratio
+        if self.control_mode == "PURE_PURSUIT":
+            self.follow_path_pure_pursuit(rx, ry, ryaw, speed_curr, dt)
         else:
-            base = self.speed_max * (dist_to_goal / max(self.slow_down_dist, 1e-3))
-            speed_goal = max(self.speed_min * heading_factor,
-                             base * heading_factor) * turn_ratio
-
-        # Speed PID on (speed_goal - current_estimated_speed)
-        speed_err = speed_goal - speed_curr
-        speed_cmd = self.pid_speed.step(speed_err, dt)
-
-        # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 1.0:   # allow bigger error before freezing linear speed
-            speed_cmd = 0.0
-
-        # never go backwards, clamp to limits
-        speed_cmd = max(0.0, min(self.speed_max, speed_cmd))
-
-        self.publish_cmd_vel(speed_cmd, heading_cmd)
+            self.follow_path_pid_controller(rx, ry, ryaw, speed_curr, dt, waypoint_tol)
 
     # -------------------------------------------------------------------------
     # Timer callback - behavior loop (Stage 6)
     # -------------------------------------------------------------------------
-
-    def which_cluster_contains(
-        self,
-        clusters: List[List[Tuple[int, int]]],
-        cell: Tuple[int, int],
-        max_dist_cells: int = 2
-    ) -> Optional[List[Tuple[int, int]]]:
-        """
-        Find the cluster whose cells are closest to 'cell', as long as the
-        minimum distance is within max_dist_cells (in grid units).
-        """
-        mx, my = cell
-        best_cluster = None
-        best_dist2 = float('inf')
-
-        for cluster in clusters:
-            for (cx, cy) in cluster:
-                dx = cx - mx
-                dy = cy - my
-                dist2 = dx * dx + dy * dy
-                if dist2 < best_dist2:
-                    best_dist2 = dist2
-                    best_cluster = cluster
-
-        # Only accept if reasonably close to some cluster cell
-        if best_cluster is not None and best_dist2 <= max_dist_cells * max_dist_cells:
-            return best_cluster
-
-        return None
 
     def timer_cb(self):
         """
@@ -1542,65 +1686,46 @@ class Task1(Node):
                     self.publish_cmd_vel(0.0, 0.0)
                     return
 
-                # If no current path, choose new goal and plan
+                # If no current path, choose new goal and plan based on A* cost
                 if self.current_path is None:
-                    # iterate through clusters in order of distance
-                    remaining_clusters = list(clusters)
+                    best_candidate = None  # (goal_cell, path, cost)
 
-                    found_valid_goal = False
-                    while remaining_clusters and not found_valid_goal:
-                        goal_cell = self.choose_frontier_goal(remaining_clusters)
-                        if goal_cell is None:
-                            # no more acceptable cells under current filters
-                            break
-
-                        gx, gy = goal_cell
-
-                        # If the chosen goal is not traversable, REMOVE THAT CLUSTER
-                        if not self.is_traversable(gx, gy):
-                            self.get_logger().warn(
-                                f'Frontier goal {goal_cell} not traversable — skipping this cluster.'
-                            )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
+                    for cluster in clusters:
+                        result = self.plan_to_cluster(cluster)
+                        if result is None:
                             continue
 
-                        # Try A*
-                        path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
-                        if path is None:
-                            self.get_logger().warn(
-                                f'A*: no path to frontier {goal_cell} — skipping this cluster.'
-                            )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
-                            continue
+                        goal_cell, path, cost = result
 
-                        # Smooth the path
-                        smoothed = self.smooth_path(path)
+                        if best_candidate is None or cost < best_candidate[2]:
+                            best_candidate = (goal_cell, path, cost)
 
-                        self.get_logger().info(
-                            f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
-                            f'start={smoothed[0]}, end={smoothed[-1]}'
-                        )
-                        self.frontier_goal = goal_cell
-                        self.last_frontier_goal = goal_cell
-                        self.set_current_path(smoothed)
-                        found_valid_goal = True
-
-                    if not found_valid_goal:
+                    if best_candidate is None:
                         # No goal could satisfy traversability / blocked-goal / distance constraints.
                         # Clear any stale goal marker so RViz matches planner state.
                         self.frontier_goal = None
                         self.clear_current_path()
-                        self.get_logger().warn('No valid frontier goal in ANY cluster.')
+                        self.get_logger().warn('No valid frontier goal in ANY cluster (A*-based selection).')
+                    else:
+                        goal_cell, path, cost = best_candidate
+                        gx, gy = goal_cell
+
+                        smoothed = self.smooth_path(path)
+                        self.get_logger().info(
+                            f'A* to best frontier (by cost): raw_len={len(path)}, '
+                            f'smooth_len={len(smoothed)}, start={smoothed[0]}, end={smoothed[-1]}, '
+                            f'cost={cost:.1f}'
+                        )
+
+                        self.frontier_goal = goal_cell
+                        self.last_frontier_goal = goal_cell
+                        self.set_current_path(smoothed)
 
             # 4) Visualization
             self.publish_frontier_markers()
             self.publish_global_plan()
 
-            # 5) Follow current path using PID + union of obstacle criteria
+            # 5) Follow current path using chosen controller + union of obstacle criteria
             self.follow_current_path()
 
 

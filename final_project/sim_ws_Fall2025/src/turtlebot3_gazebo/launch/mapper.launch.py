@@ -60,7 +60,7 @@ def generate_launch_description():
         # Launch mapping algorithm
         Node(
             package='turtlebot3_gazebo',
-            executable='task1',
+            executable='task1.py',
             name='task1_algorithm',
             output='screen',
             parameters=[{'use_sim_time': use_sim_time}]

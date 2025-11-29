@@ -1,0 +1,1 @@
+chmod +x ./turtlebot3_gazebo/src/lab4/*.py
