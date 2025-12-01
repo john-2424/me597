@@ -938,24 +938,20 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # 0) Early safety check: if obstacle too close ahead, trigger replanning
-            if self._obstacle_too_close_ahead():
-                blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
-                if start_idx is None or goal_idx is None:
-                    # Fall back: replan globally to whole goal
-                    self.state = 'PLAN_GLOBAL'
-                    self._publish_stop()
-                    return
+            # 1) Check if the path ahead is actually blocked in the map
+            blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
+            if blocked:
                 self.local_replan_start_index = start_idx
                 self.local_replan_goal_index = goal_idx
                 self.get_logger().info(
-                    'FOLLOW_PATH: obstacle too close ahead. Forcing local replanning.'
+                    f'FOLLOW_PATH: path blocked. Triggering local replanning '
+                    f'from index {start_idx} to {goal_idx}.'
                 )
                 self.state = 'REPLAN_LOCAL'
                 self._publish_stop()
                 return
 
-            # 2) Follow active path using controller
+            # 2) Otherwise, follow the current active path
             self._follow_active_path()
             return
 
