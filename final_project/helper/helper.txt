@@ -1,0 +1,3 @@
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+
+ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "name: {data: 'map'}"
