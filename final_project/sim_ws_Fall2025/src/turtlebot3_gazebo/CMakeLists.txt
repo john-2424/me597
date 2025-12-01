@@ -57,45 +57,38 @@ install(
   PROGRAMS
     src/lab4/task1.py
     DESTINATION lib/${PROJECT_NAME}
-    RENAME task1
 )
 install(
   PROGRAMS
     src/lab4/task2.py
     DESTINATION lib/${PROJECT_NAME}
-    RENAME task2
 )
 install(
   PROGRAMS
     src/lab4/task3.py
     DESTINATION lib/${PROJECT_NAME}
-    RENAME task3
 )
 install(
   PROGRAMS
     src/lab4/spawn_objects.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME spawn_objects
 )
 install(
   PROGRAMS
     src/lab4/task2_bonus.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME task2_bonus
 )
 
 install(
   PROGRAMS
     src/lab4/static_obstacles.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME static_obstacles
 )
 
 install(
   PROGRAMS
     src/lab4/static_obstacles_task3.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME static_obstacles_task3
 )
 
 ################################################################################
