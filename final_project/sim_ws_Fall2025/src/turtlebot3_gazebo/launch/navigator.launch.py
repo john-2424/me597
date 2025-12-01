@@ -13,7 +13,7 @@ from launch.conditions import IfCondition, UnlessCondition
 def generate_launch_description():
     # Set the directory paths
     package_dir = get_package_share_directory('turtlebot3_gazebo')
-    map_file_path = os.path.join(package_dir, 'maps', 'sync_classroom_map.yaml')
+    map_file_path = os.path.join(package_dir, 'maps', 'map.yaml')
 
     # Declare launch arguments
     return LaunchDescription([
