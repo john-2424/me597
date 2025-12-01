@@ -30,6 +30,7 @@ class Task2(Node):
     Step 5: Blocked-path detection & trigger for local replanning
     Step 6: Local RRT* planner for detours around static obstacles
     Step 7: Path-following controller (pure-pursuit-ish) to generate cmd_vel
+    Step 8: Goal detection + timing & navigation_time publication
     """
 
     def __init__(self):
@@ -140,12 +141,12 @@ class Task2(Node):
         self.current_path_index = 0        # index into active_path_points
 
         # For local replanning (RRT*)
-        self.blockage_radius = 2   # cells to check around each waypoint
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
 
-        # Timing (used later in Step 8)
+        # Timing
         self.navigation_start_time = None
+        self.navigation_time_reported = False   # Step 8: ensure we publish only once
         self.navigation_time_pub_msg = Float32()
 
         # -------------------------
@@ -205,7 +206,7 @@ class Task2(Node):
         self.timer = self.create_timer(0.1, self.timer_cb)
 
         self.get_logger().info(
-            'Task2 node initialized: IO + map + A* + dynamic obstacles + blockage + RRT* + controller ready.'
+            'Task2 node initialized: IO + map + A* + dynamic obstacles + blockage + RRT* + controller + timing ready.'
         )
 
     # ----------------------------------------------------------------------
@@ -563,29 +564,11 @@ class Task2(Node):
         return best_idx, best_dist2
 
     def _is_waypoint_blocked(self, x, y) -> bool:
-        """
-        Determine if a waypoint is blocked by *dynamic* obstacles (trash cans),
-        ignoring static map walls (A* already accounts for those).
-        """
-        if self.dynamic_occupancy is None:
-            return False
-
         idx = self.world_to_grid(x, y)
         if idx is None:
-            # If waypoint is off-map, let A* handle it, don't treat as dynamically blocked
-            return False
-
+            return True
         row, col = idx
-
-        R = self.blockage_radius  # e.g., 2 or 3 cells
-        for rr in range(row - R, row + R + 1):
-            for cc in range(col - R, col + R + 1):
-                if rr < 0 or cc < 0 or rr >= self.map_height or cc >= self.map_width:
-                    continue
-                if self.dynamic_occupancy[rr, cc] != 0:
-                    return True
-
-        return False
+        return not self.is_cell_free(row, col)
 
     def _check_path_blocked_ahead(self):
         if not self.active_path_points or self.current_pose is None:
@@ -793,6 +776,7 @@ class Task2(Node):
         self.current_goal = msg
         self.goal_active = True
         self.navigation_start_time = self.get_clock().now()
+        self.navigation_time_reported = False  # Step 8: reset timing flag
         self.state = 'PLAN_GLOBAL'
         self.get_logger().info(
             f'New goal received at '
@@ -855,7 +839,8 @@ class Task2(Node):
             return
 
         if self.state == 'GOAL_REACHED':
-            # Step 8 will add timing/report; for now just hold still.
+            # Step 8: publish navigation time once, keep robot stopped
+            self._handle_goal_reached()
             self._publish_stop()
             return
 
@@ -1040,7 +1025,7 @@ class Task2(Node):
         heading_factor = max(0.0, 1.0 - abs(heading_error) / math.pi)
         linear_speed = self.max_linear_vel * heading_factor
 
-        # A bit of extra damping near the goal so we don't overshoot
+        # Extra damping near the goal
         if dist_to_goal < 0.5:
             linear_speed *= dist_to_goal / 0.5
 
@@ -1061,6 +1046,38 @@ class Task2(Node):
             f'v={linear_speed:.2f}, w={angular_speed:.2f}',
             throttle_duration_sec=0.5
         )
+
+    # ----------------------------------------------------------------------
+    # Goal reached timing & reporting (Step 8)
+    # ----------------------------------------------------------------------
+    def _handle_goal_reached(self):
+        """
+        When in GOAL_REACHED state:
+        - Publish navigation time once.
+        - Keep everything ready for the next goal (goal_callback will override).
+        """
+        if self.navigation_time_reported:
+            return
+
+        if self.navigation_start_time is None:
+            self.get_logger().warn('GOAL_REACHED: no navigation_start_time recorded.')
+            self.navigation_time_reported = True
+            return
+
+        now = self.get_clock().now()
+        dt = now - self.navigation_start_time
+        elapsed_seconds = dt.nanoseconds / 1e9
+
+        self.navigation_time_pub_msg.data = float(elapsed_seconds)
+        self.navigation_time_pub.publish(self.navigation_time_pub_msg)
+
+        self.get_logger().info(
+            f'GOAL_REACHED: navigation time = {elapsed_seconds:.3f} s (published on navigation_time topic).'
+        )
+
+        self.navigation_time_reported = True
+        # We deliberately do NOT reset state to WAIT_FOR_GOAL here,
+        # because a new goal will come via goal_callback and reset everything.
 
 
 def main(args=None):
