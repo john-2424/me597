@@ -45,12 +45,12 @@ class Task2(Node):
         # How many future waypoints to check for blockage
         self.declare_parameter('block_check_lookahead_points', 30)
 
-        # RRT* parameters
-        self.declare_parameter('rrt_max_iterations', 500)
+        # RRT* parameters (slightly more generous defaults)
+        self.declare_parameter('rrt_max_iterations', 1200)
         self.declare_parameter('rrt_step_size', 0.25)         # meters
-        self.declare_parameter('rrt_goal_sample_rate', 0.2)   # probability [0,1]
-        self.declare_parameter('rrt_neighbor_radius', 0.75)   # meters
-        self.declare_parameter('rrt_local_range', 2.5)        # meters (sampling window radius)
+        self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
+        self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
+        self.declare_parameter('rrt_local_range', 3.5)        # meters (sampling window radius)
 
         # Path-following controller parameters
         self.declare_parameter('max_linear_vel', 0.20)        # m/s
@@ -143,6 +143,7 @@ class Task2(Node):
         # For local replanning (RRT*)
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
+        self.rrt_fail_count = 0  # count consecutive local failures
 
         # Timing
         self.navigation_start_time = None
@@ -570,7 +571,7 @@ class Task2(Node):
         row, col = idx
         return not self.is_cell_free(row, col)
 
-    def _check_path_blocked_ahead(self):
+    '''def _check_path_blocked_ahead(self):
         if not self.active_path_points or self.current_pose is None:
             return False, None, None
 
@@ -604,6 +605,74 @@ class Task2(Node):
         self.get_logger().info(
             f'Path blocked detected: nearest_idx={nearest_idx}, '
             f'first_blocked_idx={first_blocked_idx}, reconnect_idx={reconnect_idx}'
+        )
+
+        return True, nearest_idx, reconnect_idx'''
+    
+    def _check_path_blocked_ahead(self):
+        """
+        Check if the active path is blocked within a lookahead window.
+
+        Returns:
+            (blocked: bool,
+             nearest_idx: int or None,
+             reconnect_idx: int or None)
+
+        If blocked is True, reconnect_idx is chosen as the first FREE waypoint
+        after the blocked run, so that RRT* goal is not inside an obstacle.
+        """
+        if not self.active_path_points or self.current_pose is None:
+            return False, None, None
+
+        rx = self.current_pose.pose.pose.position.x
+        ry = self.current_pose.pose.pose.position.y
+
+        nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
+        if nearest_idx is None:
+            return False, None, None
+
+        max_idx = min(
+            nearest_idx + self.block_check_lookahead_points,
+            len(self.active_path_points) - 1
+        )
+
+        blocked_run = False
+        first_blocked_idx = None
+        last_blocked_idx = None
+
+        for i in range(nearest_idx, max_idx + 1):
+            x, y = self.active_path_points[i]
+            if self._is_waypoint_blocked(x, y):
+                if not blocked_run:
+                    blocked_run = True
+                    first_blocked_idx = i
+                last_blocked_idx = i
+            else:
+                # Once we've entered a blocked run and then see a free point,
+                # we can break – we've captured the blocked segment.
+                if blocked_run:
+                    break
+
+        if not blocked_run:
+            # No blocked waypoint in the lookahead window
+            return False, nearest_idx, max_idx
+
+        # Find a reconnect index: first FREE waypoint after the blocked run
+        reconnect_idx = last_blocked_idx + 1
+
+        while reconnect_idx < len(self.active_path_points):
+            x, y = self.active_path_points[reconnect_idx]
+            if not self._is_waypoint_blocked(x, y):
+                break
+            reconnect_idx += 1
+
+        # Clamp to valid range
+        reconnect_idx = min(reconnect_idx, len(self.active_path_points) - 1)
+
+        self.get_logger().info(
+            f'Path blocked detected: nearest_idx={nearest_idx}, '
+            f'first_blocked_idx={first_blocked_idx}, last_blocked_idx={last_blocked_idx}, '
+            f'reconnect_idx={reconnect_idx}'
         )
 
         return True, nearest_idx, reconnect_idx
@@ -910,6 +979,25 @@ class Task2(Node):
         goal_xy = self.active_path_points[goal_idx]
         center_xy = (rx, ry)
 
+        # Debug: log whether start/goal cells are free
+        start_idx_cell = self.world_to_grid(start_xy[0], start_xy[1])
+        goal_idx_cell = self.world_to_grid(goal_xy[0], goal_xy[1])
+        if start_idx_cell is not None:
+            sr, sc = start_idx_cell
+            self.get_logger().info(
+                f'REPLAN_LOCAL: start cell ({sr},{sc}) free={self.is_cell_free(sr, sc)}'
+            )
+        else:
+            self.get_logger().info('REPLAN_LOCAL: start cell is outside map.')
+
+        if goal_idx_cell is not None:
+            gr, gc = goal_idx_cell
+            self.get_logger().info(
+                f'REPLAN_LOCAL: goal cell ({gr},{gc}) free={self.is_cell_free(gr, gc)}'
+            )
+        else:
+            self.get_logger().info('REPLAN_LOCAL: goal cell is outside map.')
+
         self.get_logger().info(
             f'REPLAN_LOCAL: running RRT* from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) '
             f'to ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
@@ -919,16 +1007,24 @@ class Task2(Node):
         local_path = self.plan_rrt_star(start_xy, goal_xy, center_xy)
 
         if local_path is None or len(local_path) < 2:
+            # --- KEY CHANGE: fall back to global replanning ---
+            self.rrt_fail_count += 1
             self.get_logger().warn(
-                'REPLAN_LOCAL: RRT* failed or local path too short. '
-                'Returning to FOLLOW_PATH without modifying path.'
+                f'REPLAN_LOCAL: RRT* failed or local path too short (fail_count={self.rrt_fail_count}). '
+                'Falling back to global A* replanning.'
             )
-            self.state = 'FOLLOW_PATH'
+            # Go back to a full global plan from current pose to the original goal
+            self.state = 'PLAN_GLOBAL'
             return
 
+        # If we succeeded, reset fail counter
+        self.rrt_fail_count = 0
+
+        # Publish local detour
         local_path_msg = self.build_path_msg(local_path)
         self.local_path_pub.publish(local_path_msg)
 
+        # Splice local detour into active_path_points
         prefix = self.active_path_points[:start_idx]
         suffix = self.active_path_points[goal_idx + 1:]
 
