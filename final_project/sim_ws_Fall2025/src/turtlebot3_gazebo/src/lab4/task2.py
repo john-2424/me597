@@ -25,6 +25,7 @@ class Task2(Node):
     Step 1: ROS I/O + state machine skeleton
     Step 2: Map loading (Task 1 map) + world <-> grid conversions
     Step 3: Global path planner (A*) using inflated occupancy grid
+    Step 4: Dynamic obstacle layer from LaserScan (trash cans)
     """
 
     def __init__(self):
@@ -55,8 +56,9 @@ class Task2(Node):
         self.map_width = None          # cols
         self.map_height = None         # rows
 
-        self.static_occupancy = None    # 0 free, 1 occupied
-        self.inflated_occupancy = None  # 0 free, 1 occupied (inflated)
+        self.static_occupancy = None     # 0 free, 1 occupied
+        self.inflated_occupancy = None   # 0 free, 1 occupied (inflated)
+        self.dynamic_occupancy = None    # 0 free, 1 occupied (from LaserScan)
 
         # Load map from Task 1
         self._load_map_from_yaml()
@@ -135,7 +137,7 @@ class Task2(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task2 node initialized: ROS I/O + map + A* ready.')
+        self.get_logger().info('Task2 node initialized: ROS I/O + map + A* + dynamic obstacles ready.')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -215,14 +217,19 @@ class Task2(Node):
             f'origin = ({self.map_origin[0]:.2f}, {self.map_origin[1]:.2f}, {self.map_origin[2]:.2f})'
         )
 
+        # Inflate static obstacles
         kernel_size = max(1, int(self.inflation_kernel))
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         inflated = cv2.dilate(self.static_occupancy, kernel, iterations=1)
         self.inflated_occupancy = inflated
 
+        # Initialize dynamic occupancy layer (all free initially)
+        self.dynamic_occupancy = np.zeros_like(self.static_occupancy, dtype=np.uint8)
+
         self.map_loaded = True
         self.get_logger().info(
-            f'Obstacle inflation done with kernel size {kernel_size}.'
+            f'Obstacle inflation done with kernel size {kernel_size}. '
+            'Dynamic obstacle layer initialized.'
         )
 
     # ----------------------------------------------------------------------
@@ -261,20 +268,110 @@ class Task2(Node):
         return x, y
 
     # ----------------------------------------------------------------------
+    # Pose utilities
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _quat_to_yaw(q):
+        """
+        Convert geometry_msgs Quaternion to yaw angle (rad) in 2D.
+        """
+        x = q.x
+        y = q.y
+        z = q.z
+        w = q.w
+
+        # Yaw from quaternion (assuming roll, pitch ~ 0)
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    # ----------------------------------------------------------------------
+    # Dynamic obstacle layer from LaserScan
+    # ----------------------------------------------------------------------
+    def update_dynamic_occupancy_from_scan(self):
+        """
+        Use the latest LaserScan and current_pose (AMCL) to update dynamic_occupancy.
+        Assumptions:
+        - Laser frame is coincident with base_link, oriented with the robot's yaw.
+        - Static obstacles are already in the map; new obstacles (trash cans)
+          will appear in scan but not in static_occupancy.
+        """
+        if not self.map_loaded or self.latest_scan is None or self.current_pose is None:
+            return
+
+        # Clear previous dynamic obstacles (static trash cans -> always seen)
+        # We recompute from scratch on each scan.
+        self.dynamic_occupancy.fill(0)
+
+        # Robot pose in map frame
+        pose = self.current_pose.pose.pose
+        rx = pose.position.x
+        ry = pose.position.y
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        scan = self.latest_scan
+        angle = scan.angle_min
+
+        # Iterate over beams
+        for r in scan.ranges:
+            # Skip invalid ranges
+            if math.isinf(r) or math.isnan(r):
+                angle += scan.angle_increment
+                continue
+            if r < scan.range_min or r > scan.range_max:
+                angle += scan.angle_increment
+                continue
+
+            # Point in robot (base_scan) frame
+            lx = r * math.cos(angle)
+            ly = r * math.sin(angle)
+
+            # Transform to world/map frame (2D rotation + translation)
+            wx = rx + math.cos(yaw) * lx - math.sin(yaw) * ly
+            wy = ry + math.sin(yaw) * lx + math.cos(yaw) * ly
+
+            # Convert to grid cell
+            idx = self.world_to_grid(wx, wy)
+            if idx is not None:
+                row, col = idx
+                # Mark as dynamically occupied
+                self.dynamic_occupancy[row, col] = 1
+
+            angle += scan.angle_increment
+
+        # Optional debug (throttled)
+        num_dyn = int(self.dynamic_occupancy.sum())
+        self.get_logger().info(
+            f'Updated dynamic occupancy. Occupied cells (approx): {num_dyn}',
+            throttle_duration_sec=2.0
+        )
+
+    # ----------------------------------------------------------------------
     # A* global path planner
     # ----------------------------------------------------------------------
     def is_cell_free(self, row: int, col: int) -> bool:
-        """Check if a cell is free in the inflated occupancy grid."""
+        """
+        Check if a cell is free considering both inflated static map and dynamic obstacles.
+        """
         if (
             row < 0 or row >= self.map_height or
             col < 0 or col >= self.map_width
         ):
             return False
-        return self.inflated_occupancy[row, col] == 0
+
+        # Static: inflated occupancy
+        if self.inflated_occupancy[row, col] != 0:
+            return False
+
+        # Dynamic: trash cans / unseen stuff
+        if self.dynamic_occupancy is not None and self.dynamic_occupancy[row, col] != 0:
+            return False
+
+        return True
 
     def astar_plan(self, start_world, goal_world):
         """
-        Run A* on the inflated occupancy grid.
+        Run A* on the inflated occupancy grid (and dynamic layer if present).
 
         :param start_world: (x, y) in world frame
         :param goal_world:  (x, y) in world frame
@@ -295,11 +392,11 @@ class Task2(Node):
         g_row, g_col = goal_idx
 
         if not self.is_cell_free(s_row, s_col):
-            self.get_logger().warn('Start cell is occupied after inflation.')
+            self.get_logger().warn('Start cell is occupied (static or dynamic).')
             return None
 
         if not self.is_cell_free(g_row, g_col):
-            self.get_logger().warn('Goal cell is occupied after inflation.')
+            self.get_logger().warn('Goal cell is occupied (static or dynamic).')
             return None
 
         # 8-connected neighbors: (dr, dc, cost)
@@ -326,7 +423,7 @@ class Task2(Node):
         closed_set = set()
 
         iterations = 0
-        max_iterations = self.map_width * self.map_height  # very loose cap
+        max_iterations = self.map_width * self.map_height  # loose cap
 
         while open_set and iterations < max_iterations:
             iterations += 1
@@ -336,7 +433,6 @@ class Task2(Node):
                 continue
 
             if (cur_row, cur_col) == (g_row, g_col):
-                # Reconstruct path
                 return self._reconstruct_path(came_from, (cur_row, cur_col))
 
             closed_set.add((cur_row, cur_col))
@@ -363,9 +459,6 @@ class Task2(Node):
         return None
 
     def _reconstruct_path(self, came_from, current_cell):
-        """
-        Reconstruct a world-frame path from A* came_from dict and final cell.
-        """
         path_cells = [current_cell]
         while current_cell in came_from:
             current_cell = came_from[current_cell]
@@ -373,7 +466,6 @@ class Task2(Node):
 
         path_cells.reverse()
 
-        # Convert grid cells to world coordinates
         path_world = []
         for (r, c) in path_cells:
             world_xy = self.grid_to_world(r, c)
@@ -384,9 +476,6 @@ class Task2(Node):
         return path_world
 
     def build_path_msg(self, path_points):
-        """
-        Build a nav_msgs/Path from a list of (x, y) points in world coordinates.
-        """
         msg = Path()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
@@ -397,7 +486,6 @@ class Task2(Node):
             pose.pose.position.x = x
             pose.pose.position.y = y
             pose.pose.position.z = 0.0
-            # Orientation: we can leave as default; controller will handle yaw.
             pose.pose.orientation.w = 1.0
             msg.poses.append(pose)
 
@@ -425,7 +513,8 @@ class Task2(Node):
 
     def scan_callback(self, msg: LaserScan):
         self.latest_scan = msg
-        # Will be used later for dynamic obstacles.
+        # Update dynamic occupancy as soon as we get new scan
+        self.update_dynamic_occupancy_from_scan()
 
     # ----------------------------------------------------------------------
     # Main timer callback / state machine
@@ -455,7 +544,7 @@ class Task2(Node):
 
         if self.state == 'FOLLOW_PATH':
             # For now, we only publish zero cmd_vel to keep robot stationary
-            # while we focus on global planning. Path following comes later.
+            # while we focus on planning and perception.
             twist = Twist()
             self.cmd_vel_pub.publish(twist)
             return
@@ -469,9 +558,6 @@ class Task2(Node):
             return
 
     def _handle_plan_global(self):
-        """
-        Called in PLAN_GLOBAL state: run A* from current pose to goal, publish Path, then switch to FOLLOW_PATH.
-        """
         if self.current_pose is None or self.current_goal is None:
             self.get_logger().warn('PLAN_GLOBAL: missing pose or goal.')
             return
@@ -493,11 +579,9 @@ class Task2(Node):
             self.get_logger().warn('PLAN_GLOBAL: A* failed or path too short. Staying in PLAN_GLOBAL.')
             return
 
-        # Store path and reset index
         self.global_path_points = path_world
         self.current_path_index = 0
 
-        # Publish Path for visualization
         path_msg = self.build_path_msg(path_world)
         self.global_path_pub.publish(path_msg)
 
