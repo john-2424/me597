@@ -44,6 +44,7 @@ class Task2(Node):
         self.declare_parameter('inflation_kernel', 5)
         # How many future waypoints to check for blockage
         self.declare_parameter('block_check_lookahead_points', 30)
+        self.declare_parameter('dynamic_inflation_kernel', 1)
 
         # RRT* parameters (slightly more generous defaults)
         self.declare_parameter('rrt_max_iterations', 1200)
@@ -51,6 +52,7 @@ class Task2(Node):
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
         self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
         self.declare_parameter('rrt_local_range', 3.5)        # meters (sampling window radius)
+        self.declare_parameter('rrt_clearance_cells', 1)
 
         # Path-following controller parameters
         self.declare_parameter('max_linear_vel', 0.20)        # m/s
@@ -72,6 +74,10 @@ class Task2(Node):
             self.get_parameter('block_check_lookahead_points')
             .get_parameter_value().integer_value
         )
+        self.dynamic_inflation_kernel = (
+            self.get_parameter('dynamic_inflation_kernel')
+                .get_parameter_value().integer_value
+        )
 
         self.rrt_max_iterations = (
             self.get_parameter('rrt_max_iterations').get_parameter_value().integer_value
@@ -87,6 +93,9 @@ class Task2(Node):
         )
         self.rrt_local_range = (
             self.get_parameter('rrt_local_range').get_parameter_value().double_value
+        )
+        self.rrt_clearance_cells = (
+            self.get_parameter('rrt_clearance_cells').get_parameter_value().integer_value
         )
 
         self.max_linear_vel = (
@@ -404,6 +413,13 @@ class Task2(Node):
 
             angle += scan.angle_increment
 
+        # --- inflate dynamic obstacles ONCE per scan ---
+        if self.dynamic_inflation_kernel > 1:
+            k = max(1, int(self.dynamic_inflation_kernel))
+            kernel = np.ones((k, k), np.uint8)
+            cv2.dilate(self.dynamic_occupancy, kernel,
+                    dst=self.dynamic_occupancy, iterations=1)
+        
         num_dyn = int(self.dynamic_occupancy.sum())
         self.get_logger().info(
             f'Updated dynamic occupancy. Occupied cells (approx): {num_dyn}',
@@ -431,6 +447,14 @@ class Task2(Node):
 
         return True
 
+    def is_cell_free_rrt(self, row: int, col: int) -> bool:
+        k = max(0, int(self.rrt_clearance_cells))
+        for r in range(row - k, row + k + 1):
+            for c in range(col - k, col + k + 1):
+                if not self.is_cell_free(r, c):
+                    return False
+        return True
+
     def astar_plan(self, start_world, goal_world):
         if not self.map_loaded:
             self.get_logger().error('Cannot run A*: map not loaded.')
@@ -446,9 +470,13 @@ class Task2(Node):
         s_row, s_col = start_idx
         g_row, g_col = goal_idx
 
+        # Allow planning even if the start cell is in inflated/dynamic collision.
+        # This can happen in narrow corridors or close to obstacles.
         if not self.is_cell_free(s_row, s_col):
-            self.get_logger().warn('Start cell is occupied (static or dynamic).')
-            return None
+            self.get_logger().warn(
+                'Start cell is occupied (static or dynamic); '
+                'continuing A* planning anyway.'
+            )
 
         if not self.is_cell_free(g_row, g_col):
             self.get_logger().warn('Goal cell is occupied (static or dynamic).')
@@ -689,6 +717,28 @@ class Task2(Node):
             self.parent = parent
             self.cost = cost
 
+    def _obstacle_too_close_ahead(self, max_distance=0.5, fov_deg=40.0):
+        """
+        Returns True if there is an obstacle closer than max_distance
+        within +/- fov_deg around the robot's heading.
+        """
+        if self.latest_scan is None:
+            return False
+
+        scan = self.latest_scan
+        half_fov = math.radians(fov_deg / 2.0)
+
+        angle = scan.angle_min
+        for r in scan.ranges:
+            if math.isinf(r) or math.isnan(r):
+                angle += scan.angle_increment
+                continue
+            if abs(angle) <= half_fov and scan.range_min < r < max_distance:
+                return True
+            angle += scan.angle_increment
+
+        return False
+
     def _segment_collision_free(self, x1, y1, x2, y2) -> bool:
         dx = x2 - x1
         dy = y2 - y1
@@ -698,7 +748,8 @@ class Task2(Node):
             if idx is None:
                 return False
             r, c = idx
-            return self.is_cell_free(r, c)
+            # stricter clearance for RRT*
+            return self.is_cell_free_rrt(r, c)
 
         step = max(self.map_resolution * 0.5, 0.01)
         n_steps = max(int(dist / step), 1)
@@ -711,7 +762,8 @@ class Task2(Node):
             if idx is None:
                 return False
             r, c = idx
-            if not self.is_cell_free(r, c):
+            # stricter clearance for every sample along the segment
+            if not self.is_cell_free_rrt(r, c):
                 return False
 
         return True
@@ -886,14 +938,18 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # 1) Check if path ahead is blocked
-            blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
-            if blocked:
+            # 0) Early safety check: if obstacle too close ahead, trigger replanning
+            if self._obstacle_too_close_ahead():
+                blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
+                if start_idx is None or goal_idx is None:
+                    # Fall back: replan globally to whole goal
+                    self.state = 'PLAN_GLOBAL'
+                    self._publish_stop()
+                    return
                 self.local_replan_start_index = start_idx
                 self.local_replan_goal_index = goal_idx
                 self.get_logger().info(
-                    f'FOLLOW_PATH: path blocked. Triggering local replanning '
-                    f'from index {start_idx} to {goal_idx}.'
+                    'FOLLOW_PATH: obstacle too close ahead. Forcing local replanning.'
                 )
                 self.state = 'REPLAN_LOCAL'
                 self._publish_stop()
