@@ -3,6 +3,7 @@
 import math
 import os
 import heapq
+import random
 
 import cv2
 import numpy as np
@@ -27,6 +28,7 @@ class Task2(Node):
     Step 3: Global path planner (A*) using inflated occupancy grid
     Step 4: Dynamic obstacle layer from LaserScan (trash cans)
     Step 5: Blocked-path detection & trigger for local replanning
+    Step 6: Local RRT* planner for detours around static obstacles
     """
 
     def __init__(self):
@@ -41,6 +43,13 @@ class Task2(Node):
         # How many future waypoints to check for blockage
         self.declare_parameter('block_check_lookahead_points', 30)
 
+        # RRT* parameters
+        self.declare_parameter('rrt_max_iterations', 500)
+        self.declare_parameter('rrt_step_size', 0.25)         # meters
+        self.declare_parameter('rrt_goal_sample_rate', 0.2)   # probability [0,1]
+        self.declare_parameter('rrt_neighbor_radius', 0.75)   # meters
+        self.declare_parameter('rrt_local_range', 2.5)        # meters (sampling window radius)
+
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
             self.ns = '/' + self.ns
@@ -52,6 +61,22 @@ class Task2(Node):
         self.block_check_lookahead_points = (
             self.get_parameter('block_check_lookahead_points')
             .get_parameter_value().integer_value
+        )
+
+        self.rrt_max_iterations = (
+            self.get_parameter('rrt_max_iterations').get_parameter_value().integer_value
+        )
+        self.rrt_step_size = (
+            self.get_parameter('rrt_step_size').get_parameter_value().double_value
+        )
+        self.rrt_goal_sample_rate = (
+            self.get_parameter('rrt_goal_sample_rate').get_parameter_value().double_value
+        )
+        self.rrt_neighbor_radius = (
+            self.get_parameter('rrt_neighbor_radius').get_parameter_value().double_value
+        )
+        self.rrt_local_range = (
+            self.get_parameter('rrt_local_range').get_parameter_value().double_value
         )
 
         # -------------------------
@@ -86,7 +111,7 @@ class Task2(Node):
         self.active_path_points = []       # list[(x, y)]
         self.current_path_index = 0        # index into active_path_points
 
-        # For local replanning (RRT*) we will need these indices
+        # For local replanning (RRT*)
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
 
@@ -150,7 +175,7 @@ class Task2(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task2 node initialized: IO + map + A* + dynamic obstacles + blockage detection ready.')
+        self.get_logger().info('Task2 node initialized: IO + map + A* + dynamic obstacles + blockage + RRT* ready.')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -301,7 +326,7 @@ class Task2(Node):
         if not self.map_loaded or self.latest_scan is None or self.current_pose is None:
             return
 
-        # Reset dynamic obstacles each scan; we treat trash cans as "always seen"
+        # Reset dynamic obstacles each scan
         self.dynamic_occupancy.fill(0)
 
         pose = self.current_pose.pose.pose
@@ -479,10 +504,6 @@ class Task2(Node):
     # Path blockage detection helpers
     # ----------------------------------------------------------------------
     def _nearest_path_index(self, x, y, path_points):
-        """
-        Find index of the path point closest to (x, y).
-        Returns (idx, squared_distance) or (None, inf) if path empty.
-        """
         if not path_points:
             return None, float('inf')
 
@@ -500,30 +521,16 @@ class Task2(Node):
         return best_idx, best_dist2
 
     def _is_waypoint_blocked(self, x, y) -> bool:
-        """
-        Check whether the waypoint at (x, y) lies in a dynamically or statically occupied cell.
-        """
         idx = self.world_to_grid(x, y)
         if idx is None:
-            # Outside map => treat as blocked for safety
             return True
         row, col = idx
         return not self.is_cell_free(row, col)
 
     def _check_path_blocked_ahead(self):
-        """
-        Check whether the active path ahead of the robot is blocked by dynamic obstacles.
-
-        Returns:
-            (blocked: bool, start_idx: int, goal_idx: int)
-            - blocked: whether any waypoint in the lookahead window is blocked
-            - start_idx: nearest path index to robot (for RRT* start)
-            - goal_idx: a future index to reconnect to (for RRT* goal)
-        """
         if not self.active_path_points or self.current_pose is None:
             return False, None, None
 
-        # Find nearest path index to current pose
         rx = self.current_pose.pose.pose.position.x
         ry = self.current_pose.pose.pose.position.y
 
@@ -531,7 +538,6 @@ class Task2(Node):
         if nearest_idx is None:
             return False, None, None
 
-        # Look ahead some number of points
         max_idx = min(
             nearest_idx + self.block_check_lookahead_points,
             len(self.active_path_points) - 1
@@ -550,8 +556,6 @@ class Task2(Node):
         if not blocked:
             return False, nearest_idx, max_idx
 
-        # Choose a reconnect goal index slightly beyond the first blocked point,
-        # if possible, to encourage RRT* to bypass and rejoin later.
         reconnect_idx = min(first_blocked_idx + 5, len(self.active_path_points) - 1)
 
         self.get_logger().info(
@@ -560,6 +564,190 @@ class Task2(Node):
         )
 
         return True, nearest_idx, reconnect_idx
+
+    # ----------------------------------------------------------------------
+    # RRT* helpers
+    # ----------------------------------------------------------------------
+    class _RRTNode:
+        __slots__ = ('x', 'y', 'parent', 'cost')
+
+        def __init__(self, x, y, parent=None, cost=0.0):
+            self.x = x
+            self.y = y
+            self.parent = parent
+            self.cost = cost
+
+    def _segment_collision_free(self, x1, y1, x2, y2) -> bool:
+        """
+        Check if the line segment between (x1,y1) and (x2,y2) is collision-free
+        using the static+dynamic occupancy grids.
+        """
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.hypot(dx, dy)
+        if dist == 0.0:
+            idx = self.world_to_grid(x1, y1)
+            if idx is None:
+                return False
+            r, c = idx
+            return self.is_cell_free(r, c)
+
+        # Sample along the segment at about half a grid resolution
+        step = max(self.map_resolution * 0.5, 0.01)
+        n_steps = max(int(dist / step), 1)
+
+        for i in range(n_steps + 1):
+            t = i / float(n_steps)
+            x = x1 + t * dx
+            y = y1 + t * dy
+            idx = self.world_to_grid(x, y)
+            if idx is None:
+                return False
+            r, c = idx
+            if not self.is_cell_free(r, c):
+                return False
+
+        return True
+
+    def _rrt_sample(self, center_x, center_y, goal_x, goal_y):
+        """
+        Sample a random free point in a local square window around center,
+        occasionally sampling the goal directly (goal bias).
+        """
+        if random.random() < self.rrt_goal_sample_rate:
+            return goal_x, goal_y
+
+        for _ in range(100):
+            # Uniform sample in local square around robot
+            dx = (random.random() * 2.0 - 1.0) * self.rrt_local_range
+            dy = (random.random() * 2.0 - 1.0) * self.rrt_local_range
+            x = center_x + dx
+            y = center_y + dy
+
+            idx = self.world_to_grid(x, y)
+            if idx is None:
+                continue
+            r, c = idx
+            if self.is_cell_free(r, c):
+                return x, y
+
+        # Fallback
+        return goal_x, goal_y
+
+    def _rrt_nearest(self, nodes, x, y):
+        best_node = None
+        best_dist2 = float('inf')
+        for node in nodes:
+            dx = node.x - x
+            dy = node.y - y
+            d2 = dx * dx + dy * dy
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_node = node
+        return best_node
+
+    def _rrt_steer(self, from_node, x, y):
+        dx = x - from_node.x
+        dy = y - from_node.y
+        dist = math.hypot(dx, dy)
+        if dist <= self.rrt_step_size:
+            return x, y
+
+        scale = self.rrt_step_size / dist
+        return from_node.x + dx * scale, from_node.y + dy * scale
+
+    def _rrt_neighbors(self, nodes, new_node):
+        """
+        Return nodes within neighbor_radius of new_node.
+        """
+        neighbors = []
+        radius2 = self.rrt_neighbor_radius * self.rrt_neighbor_radius
+        for node in nodes:
+            dx = node.x - new_node.x
+            dy = node.y - new_node.y
+            if dx * dx + dy * dy <= radius2:
+                neighbors.append(node)
+        return neighbors
+
+    def plan_rrt_star(self, start_xy, goal_xy, center_xy):
+        """
+        Plan a local path from start_xy to goal_xy using RRT* within a local window.
+        :param start_xy: (x, y) start in world frame (robot or path start)
+        :param goal_xy: (x, y) goal in world frame (reconnect point on global path)
+        :param center_xy: (x, y) center of local window (robot pose)
+        :return: list[(x, y)] from start to goal, or None if failed
+        """
+        sx, sy = start_xy
+        gx, gy = goal_xy
+        cx, cy = center_xy
+
+        start_node = self._RRTNode(sx, sy, parent=None, cost=0.0)
+        nodes = [start_node]
+        goal_node = None
+
+        for it in range(self.rrt_max_iterations):
+            # 1) Sample
+            sample_x, sample_y = self._rrt_sample(cx, cy, gx, gy)
+
+            # 2) Nearest
+            nearest = self._rrt_nearest(nodes, sample_x, sample_y)
+            if nearest is None:
+                continue
+
+            # 3) Steer
+            new_x, new_y = self._rrt_steer(nearest, sample_x, sample_y)
+
+            # 4) Collision check
+            if not self._segment_collision_free(nearest.x, nearest.y, new_x, new_y):
+                continue
+
+            new_node = self._RRTNode(new_x, new_y, parent=None, cost=float('inf'))
+
+            # 5) Choose best parent among neighbors
+            neighbors = self._rrt_neighbors(nodes, new_node)
+            best_parent = nearest
+            best_cost = nearest.cost + math.hypot(nearest.x - new_x, nearest.y - new_y)
+
+            for nb in neighbors:
+                d = math.hypot(nb.x - new_x, nb.y - new_y)
+                if nb.cost + d < best_cost and self._segment_collision_free(nb.x, nb.y, new_x, new_y):
+                    best_parent = nb
+                    best_cost = nb.cost + d
+
+            new_node.parent = best_parent
+            new_node.cost = best_cost
+            nodes.append(new_node)
+
+            # 6) Rewire neighbors
+            for nb in neighbors:
+                d = math.hypot(nb.x - new_node.x, nb.y - new_node.y)
+                if new_node.cost + d < nb.cost and self._segment_collision_free(new_node.x, new_node.y, nb.x, nb.y):
+                    nb.parent = new_node
+                    nb.cost = new_node.cost + d
+
+            # 7) Check if we can connect to goal
+            dist_to_goal = math.hypot(new_node.x - gx, new_node.y - gy)
+            if dist_to_goal <= self.rrt_step_size * 2.0:
+                if self._segment_collision_free(new_node.x, new_node.y, gx, gy):
+                    goal_node = self._RRTNode(gx, gy, parent=new_node,
+                                              cost=new_node.cost + dist_to_goal)
+                    self.get_logger().info(f'RRT*: reached goal at iteration {it}.')
+                    break
+
+        if goal_node is None:
+            self.get_logger().warn('RRT*: failed to find a local path.')
+            return None
+
+        # Reconstruct path from goal_node back to start
+        path = []
+        node = goal_node
+        while node is not None:
+            path.append((node.x, node.y))
+            node = node.parent
+        path.reverse()
+
+        self.get_logger().info(f'RRT*: local path length = {len(path)} waypoints.')
+        return path
 
     # ----------------------------------------------------------------------
     # Subscriber callbacks
@@ -612,7 +800,7 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # Step 5: check if current active path is blocked ahead
+            # Check if path ahead is blocked
             blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
             if blocked:
                 self.local_replan_start_index = start_idx
@@ -624,18 +812,13 @@ class Task2(Node):
                 self.state = 'REPLAN_LOCAL'
                 return
 
-            # For now, we still keep robot stationary. Controller will come later.
+            # Controller will be added later; keep robot stopped for now.
             twist = Twist()
             self.cmd_vel_pub.publish(twist)
             return
 
         if self.state == 'REPLAN_LOCAL':
-            # Placeholder: RRT* local replanning will be implemented in Step 6.
-            self.get_logger().info(
-                'REPLAN_LOCAL: local replanning (RRT*) not implemented yet. '
-                'Switching back to FOLLOW_PATH.'
-            )
-            self.state = 'FOLLOW_PATH'
+            self._handle_replan_local()
             return
 
         if self.state == 'GOAL_REACHED':
@@ -677,6 +860,90 @@ class Task2(Node):
         self.global_path_pub.publish(path_msg)
 
         self.get_logger().info('PLAN_GLOBAL: A* path computed and published. Switching to FOLLOW_PATH.')
+        self.state = 'FOLLOW_PATH'
+
+    def _handle_replan_local(self):
+        """
+        Called in REPLAN_LOCAL state: run RRT* between two points on the active path
+        using the robot pose as the sampling center, then splice the result into
+        active_path_points and publish local_plan.
+        """
+        if (
+            self.current_pose is None or
+            not self.active_path_points or
+            self.local_replan_start_index is None or
+            self.local_replan_goal_index is None
+        ):
+            self.get_logger().warn('REPLAN_LOCAL: missing data for replanning. Returning to FOLLOW_PATH.')
+            self.state = 'FOLLOW_PATH'
+            return
+
+        # Clamp indices
+        start_idx = max(0, min(self.local_replan_start_index, len(self.active_path_points) - 1))
+        goal_idx = max(0, min(self.local_replan_goal_index, len(self.active_path_points) - 1))
+
+        if start_idx >= goal_idx:
+            self.get_logger().warn(
+                f'REPLAN_LOCAL: invalid indices start={start_idx}, goal={goal_idx}. '
+                'Returning to FOLLOW_PATH.'
+            )
+            self.state = 'FOLLOW_PATH'
+            return
+
+        # Start: use current robot pose (for realism)
+        rx = self.current_pose.pose.pose.position.x
+        ry = self.current_pose.pose.pose.position.y
+        start_xy = (rx, ry)
+
+        # Goal: reconnect point on the original active path
+        goal_xy = self.active_path_points[goal_idx]
+
+        center_xy = (rx, ry)
+
+        self.get_logger().info(
+            f'REPLAN_LOCAL: running RRT* from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) '
+            f'to ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
+            f'with local_range={self.rrt_local_range:.2f}.'
+        )
+
+        local_path = self.plan_rrt_star(start_xy, goal_xy, center_xy)
+
+        if local_path is None or len(local_path) < 2:
+            self.get_logger().warn(
+                'REPLAN_LOCAL: RRT* failed or local path too short. '
+                'Returning to FOLLOW_PATH without modifying path.'
+            )
+            self.state = 'FOLLOW_PATH'
+            return
+
+        # Build Path message for visualization
+        local_path_msg = self.build_path_msg(local_path)
+        self.local_path_pub.publish(local_path_msg)
+
+        # Splice local RRT* path into active_path_points
+        prefix = self.active_path_points[:start_idx]
+        suffix = self.active_path_points[goal_idx + 1:]
+
+        # Avoid duplicating the reconnect goal if the last local point is very close
+        if math.hypot(local_path[-1][0] - goal_xy[0], local_path[-1][1] - goal_xy[1]) < 0.1:
+            local_splice = local_path
+        else:
+            local_splice = local_path + [goal_xy]
+
+        new_active = prefix + local_splice + suffix
+        self.active_path_points = new_active
+
+        # Reset indices & go back to FOLLOW_PATH
+        self.current_path_index = 0
+        self.local_replan_start_index = None
+        self.local_replan_goal_index = None
+
+        self.get_logger().info(
+            f'REPLAN_LOCAL: local detour spliced into active path. '
+            f'New active path length = {len(self.active_path_points)}. '
+            'Returning to FOLLOW_PATH.'
+        )
+
         self.state = 'FOLLOW_PATH'
 
 
