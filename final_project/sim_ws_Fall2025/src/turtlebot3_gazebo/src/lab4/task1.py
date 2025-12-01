@@ -2,6 +2,7 @@
 
 import math
 import heapq
+import numpy as np
 from typing import Optional, Tuple, List, Dict, Set
 
 import rclpy
@@ -84,8 +85,7 @@ class Task1(Node):
 
     # clustering / planning parameters
     CLUSTER_RADIUS_CELLS = 2       # how far neighbors can be and still be in same cluster
-    MIN_CLUSTER_SIZE = 5           # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 2        # minimum distance of goal from the robot (in grid cells)
+    MIN_GOAL_DIST_CELLS = 12        # minimum distance of goal from the robot (in grid cells)
 
     # main inflation radius for A* / traversability
     PATH_CLEARANCE_CELLS = 6       # 6 cells * 0.05 m ≈ 0.30 m
@@ -187,6 +187,9 @@ class Task1(Node):
         # Blocked frontier goals (cells that caused repeated failures)
         self.blocked_goals: List[Tuple[int, int]] = []
         self.BLOCKED_GOAL_RADIUS_CELLS = 8   # ~8 cells ≈ 0.4 m with 0.05 m resolution
+
+        # Frontier visit counts: how many times each frontier goal has been reached
+        self.frontier_visit_counts: Dict[Tuple[int, int], int] = {}
 
         # ---------------------------
         # Misc counters
@@ -908,9 +911,7 @@ class Task1(Node):
                         visited.add(neighbor)
                         queue.append(neighbor)
 
-            # ignore tiny clusters as noise
-            if len(cluster) >= self.MIN_CLUSTER_SIZE:
-                clusters.append(cluster)
+            clusters.append(cluster)
 
         return clusters
 
@@ -1043,7 +1044,10 @@ class Task1(Node):
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         """
         Choose the **nearest** safe frontier-related cell to the robot,
-        ignoring any cells in blocked regions and any that are too close.
+        but bias toward frontier goals that have been visited the least.
+
+        - First minimize visit count (0 visits preferred over 1, etc.)
+        - Among those with the same visit count, pick the nearest to the robot.
         """
         if not clusters:
             return None
@@ -1052,6 +1056,7 @@ class Task1(Node):
 
         best_goal: Optional[Tuple[int, int]] = None
         best_dist2: float = float('inf')
+        best_visits: Optional[int] = None
 
         for cluster in clusters:
             if not cluster:
@@ -1074,10 +1079,6 @@ class Task1(Node):
                 if not self.is_traversable(tx, ty):
                     continue
 
-                # Skip if this goal is in a blocked region
-                if self.is_blocked_goal_cell(tx, ty):
-                    continue
-
                 dx = tx - self.robot_mx
                 dy = ty - self.robot_my
                 dist2 = dx * dx + dy * dy
@@ -1086,9 +1087,25 @@ class Task1(Node):
                 if dist2 < self.MIN_GOAL_DIST_CELLS ** 2:
                     continue
 
-                if dist2 < best_dist2:
-                    best_dist2 = dist2
+                # How many times have we already visited this goal cell?
+                visits = self.frontier_visit_counts.get((tx, ty), 0)
+
+                # Selection rule:
+                #  1. Prefer smaller visit count
+                #  2. Break ties by distance
+                if best_goal is None:
                     best_goal = (tx, ty)
+                    best_dist2 = dist2
+                    best_visits = visits
+                else:
+                    if visits < best_visits:
+                        best_goal = (tx, ty)
+                        best_dist2 = dist2
+                        best_visits = visits
+                    elif visits == best_visits and dist2 < best_dist2:
+                        best_goal = (tx, ty)
+                        best_dist2 = dist2
+                        best_visits = visits
 
         return best_goal
 
@@ -1266,6 +1283,90 @@ class Task1(Node):
 
         return True
 
+    def _extend_collinear_segment(self, start_idx, curr_path_wrld, tol=1e-6):
+        """
+        From start_idx, look forward and find the longest contiguous run of points
+        that lie on the same infinite line defined by waypoints[start_idx] and
+        waypoints[start_idx+1]. Returns the last index of that collinear run.
+        """
+        N = len(curr_path_wrld)
+        i = start_idx
+        if i >= N-1:
+            return i  # nothing to extend
+
+        p0 = curr_path_wrld[i]
+        d = curr_path_wrld[i+1] - p0
+        # If the direction is (near) zero (duplicate points), just stop here.
+        if np.allclose(d, 0, atol=tol):
+            return i+1
+
+        # Cross-product test for collinearity with all subsequent points
+        rel = curr_path_wrld[i+1:] - p0                    # shape (N-i-1, 2)
+        cross = rel[:, 0] * d[1] - rel[:, 1] * d[0]   # scalar 2D cross
+        mask = np.isclose(cross, 0.0, atol=tol)
+
+        # We only want the longest *contiguous* True prefix
+        if mask.all():
+            prefix_len = len(mask)
+        else:
+            # index of first False in mask (prefix length of True)
+            prefix_len = np.argmax(~mask)
+
+        # Last collinear index = i + prefix_len (since mask starts at i+1)
+        return i + prefix_len
+    
+    def choose_next(self, rx, ry):
+        curr_path_wrld = np.array(self.current_path_world)
+        N = len(curr_path_wrld)
+
+        if self.path_idx is None:
+            self.path_idx = 0
+
+        # If we are already at (or beyond) the final index, just stick to it
+        if self.path_idx >= N - 1:
+            return N - 1
+
+        # Consider only strictly future indices
+        idxs = np.arange(self.path_idx + 1, N)
+
+        dx = curr_path_wrld[idxs, 0] - rx
+        dy = curr_path_wrld[idxs, 1] - ry
+        distances = np.sqrt(dx**2 + dy**2)
+
+        # Closest future index
+        rel = np.argmin(distances)
+        next_idx_o = idxs[rel]
+
+        # Extend collinear segment forward from that index
+        next_idx = self._extend_collinear_segment(next_idx_o, curr_path_wrld)
+
+        self.get_logger().info(f'[**DEBUG**] Robot: {rx}, {ry}; Curr Path World: {curr_path_wrld}; Indexes: {idxs}; Distances: {distances}; Next Index Before Extend: {next_idx_o}; Next Index After Extend: {next_idx}')
+
+        self.last_idx = next_idx
+        if self.last_idx == N - 1:
+            self.final_idx = True
+
+        return next_idx
+    
+    def advance_waypoint_if_reached(self, rx: float, ry: float, waypoint_tol: float):
+        """
+        Strictly follow the path in order:
+        - Only move to the next waypoint when the current one is within waypoint_tol.
+        - Never jump ahead to the 'closest' waypoint.
+        """
+        if self.current_path_world is None or self.path_idx is None:
+            return
+
+        N = len(self.current_path_world)
+        # Progress through waypoints in order, but don't skip any
+        while self.path_idx < N - 1:
+            wx, wy = self.current_path_world[self.path_idx]
+            dist = math.hypot(wx - rx, wy - ry)
+            if dist < waypoint_tol:
+                self.path_idx += 1
+            else:
+                break
+
     def follow_current_path(self):
         """
         Follow the current path using PID on speed and heading.
@@ -1299,19 +1400,23 @@ class Task1(Node):
             self.front_range_filt < self.obstacle_stop_dist
         ):
             if self.frontier_goal is not None:
-                self.blocked_goals.append(self.frontier_goal)
+                # block the entire cluster
+                cl = self.which_cluster_contains(self.frontier_clusters, self.frontier_goal)
+                if cl:
+                    for cell in cl:
+                        self.blocked_goals.append(cell)
+
                 self.get_logger().warn(
-                    f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
-                    f'Marking frontier {self.frontier_goal} as blocked and replanning.',
-                    throttle_duration_sec=1.0
+                    f"Frontier {self.frontier_goal} too risky (front={self.front_range_filt:.2f} m). "
+                    f"Blocking its entire cluster and replanning."
                 )
             else:
                 self.get_logger().warn(
-                    f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
-                    f'Stopping and clearing path for replanning.',
-                    throttle_duration_sec=1.0
+                    f"Obstacle too close (front={self.front_range_filt:.2f} m). "
+                    f"Stopping and replanning."
                 )
 
+            # Stop following this path now
             self.clear_current_path()
             return
 
@@ -1366,16 +1471,20 @@ class Task1(Node):
         # Check final goal
         gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
-
+        
         if (self.path_idx == len(self.current_path_world) - 1 and
             dist_to_goal < goal_tol and
             speed_curr < min_goal_speed):
 
             if self.frontier_goal is not None:
-                self.blocked_goals.append(self.frontier_goal)
+                # Increment visit count for this frontier goal
+                old_count = self.frontier_visit_counts.get(self.frontier_goal, 0)
+                new_count = old_count + 1
+                self.frontier_visit_counts[self.frontier_goal] = new_count
+
                 self.get_logger().info(
-                    f'Reached current path goal {self.frontier_goal}. '
-                    f'Marking it as blocked and clearing path.',
+                    f'Reached frontier goal {self.frontier_goal}. '
+                    f'Visit count now = {new_count}. Clearing path.',
                     throttle_duration_sec=2.0
                 )
             else:
@@ -1418,7 +1527,7 @@ class Task1(Node):
         speed_cmd = self.pid_speed.step(speed_err, dt)
 
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 1.0:   # allow bigger error before freezing linear speed
+        if abs(heading_err) > 0.9:  # allow bigger error before freezing linear speed
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
@@ -1458,6 +1567,95 @@ class Task1(Node):
             return best_cluster
 
         return None
+
+    def find_alternative_goal_for_cluster(
+        self,
+        desired_goal: Tuple[int, int],
+        cluster: List[Tuple[int, int]],
+        neighborhood_radius: int = 4,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Given a desired frontier-related goal (mx,my) and its cluster,
+        search for the nearest cell that:
+          - is traversable (is_traversable = free + PATH_CLEARANCE_CELLS)
+          - is not in a blocked region
+          - is at least MIN_GOAL_DIST_CELLS away from the robot
+
+        This is the "project the goal to a valid nearby cell" logic.
+        """
+        if self.robot_mx is None or self.robot_my is None:
+            return None
+
+        gx, gy = desired_goal
+        candidates: Set[Tuple[int, int]] = set()
+
+        # 1) Start with the desired goal itself
+        candidates.add((gx, gy))
+
+        # 2) Try backoff_to_known_safe_cell from the desired goal
+        backed = self.backoff_to_known_safe_cell(
+            gx, gy,
+            max_back_cells=6,
+            clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
+        )
+        if backed is not None:
+            candidates.add(backed)
+
+        # 3) Add all cells in the cluster and their backed versions
+        for (mx, my) in cluster:
+            candidates.add((mx, my))
+
+            backed2 = self.backoff_to_known_safe_cell(
+                mx, my,
+                max_back_cells=6,
+                clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
+            )
+            if backed2 is not None:
+                candidates.add(backed2)
+
+        # 4) Add a neighborhood around the cluster
+        for (cx, cy) in cluster:
+            for dx in range(-neighborhood_radius, neighborhood_radius + 1):
+                for dy in range(-neighborhood_radius, neighborhood_radius + 1):
+                    nx = cx + dx
+                    ny = cy + dy
+                    if self.map_index(nx, ny) is None:
+                        continue
+                    candidates.add((nx, ny))
+
+        valid_scored: List[Tuple[float, Tuple[int, int]]] = []
+
+        for (mx, my) in candidates:
+            # Must be inside map
+            if self.map_index(mx, my) is None:
+                continue
+
+            # Respect traversability gate
+            if not self.is_traversable(mx, my):
+                continue
+
+            # Skip blocked regions
+            if self.is_blocked_goal_cell(mx, my):
+                continue
+
+            # Respect minimum distance from robot
+            dx = mx - self.robot_mx
+            dy = my - self.robot_my
+            if dx * dx + dy * dy < self.MIN_GOAL_DIST_CELLS ** 2:
+                continue
+
+            # Score: prefer staying close to the originally desired goal
+            ddx = mx - gx
+            ddy = my - gy
+            dist2_to_desired = ddx * ddx + ddy * ddy
+            valid_scored.append((dist2_to_desired, (mx, my)))
+
+        if not valid_scored:
+            return None
+
+        # Pick the valid candidate closest to the original goal
+        valid_scored.sort(key=lambda x: x[0])
+        return valid_scored[0][1]
 
     def timer_cb(self):
         """
@@ -1541,40 +1739,53 @@ class Task1(Node):
                     self.state = "DONE"
                     self.publish_cmd_vel(0.0, 0.0)
                     return
-
-                # If no current path, choose new goal and plan
+            
                 if self.current_path is None:
                     # iterate through clusters in order of distance
                     remaining_clusters = list(clusters)
 
                     found_valid_goal = False
                     while remaining_clusters and not found_valid_goal:
-                        goal_cell = self.choose_frontier_goal(remaining_clusters)
-                        if goal_cell is None:
+                        raw_goal = self.choose_frontier_goal(remaining_clusters)
+                        if raw_goal is None:
                             # no more acceptable cells under current filters
                             break
 
-                        gx, gy = goal_cell
+                        # Get the cluster corresponding to this goal
+                        cluster_for_goal = self.which_cluster_contains(remaining_clusters, raw_goal)
+                        if cluster_for_goal is None:
+                            cluster_for_goal = [raw_goal]
 
-                        # If the chosen goal is not traversable, REMOVE THAT CLUSTER
-                        if not self.is_traversable(gx, gy):
+                        # --- NEW: project goal to nearest valid cell in that area ---
+                        alt_goal = self.find_alternative_goal_for_cluster(
+                            desired_goal=raw_goal,
+                            cluster=cluster_for_goal,
+                            neighborhood_radius=4,
+                        )
+
+                        if alt_goal is None:
+                            # This cluster really has no valid traversable cell near the desired goal
                             self.get_logger().warn(
-                                f'Frontier goal {goal_cell} not traversable — skipping this cluster.'
+                                f'No valid alternative goal near frontier {raw_goal}; '
+                                f'skipping this cluster.'
                             )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
+                            if cluster_for_goal in remaining_clusters:
+                                remaining_clusters.remove(cluster_for_goal)
                             continue
 
-                        # Try A*
+                        gx, gy = alt_goal
+
+                        # Try A* to the adjusted goal
                         path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
                         if path is None:
+                            # We tried a projected goal and still cannot reach it;
+                            # treat this whole cluster as unreachable for now.
                             self.get_logger().warn(
-                                f'A*: no path to frontier {goal_cell} — skipping this cluster.'
+                                f'A*: no path to adjusted frontier goal {alt_goal} '
+                                f'for original {raw_goal} — skipping this cluster.'
                             )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
+                            if cluster_for_goal in remaining_clusters:
+                                remaining_clusters.remove(cluster_for_goal)
                             continue
 
                         # Smooth the path
@@ -1582,19 +1793,20 @@ class Task1(Node):
 
                         self.get_logger().info(
                             f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
-                            f'start={smoothed[0]}, end={smoothed[-1]}'
+                            f'start={smoothed[0]}, end={smoothed[-1]}, '
+                            f'raw_goal={raw_goal}, used_goal={alt_goal}'
                         )
-                        self.frontier_goal = goal_cell
-                        self.last_frontier_goal = goal_cell
+                        # We store the *actual* goal we are driving to
+                        self.frontier_goal = alt_goal
+                        self.last_frontier_goal = raw_goal
                         self.set_current_path(smoothed)
                         found_valid_goal = True
 
                     if not found_valid_goal:
-                        # No goal could satisfy traversability / blocked-goal / distance constraints.
-                        # Clear any stale goal marker so RViz matches planner state.
+                        # No goal in any cluster could satisfy all constraints *even after* projection.
                         self.frontier_goal = None
                         self.clear_current_path()
-                        self.get_logger().warn('No valid frontier goal in ANY cluster.')
+                        self.get_logger().warn('No valid (even adjusted) frontier goal in ANY cluster.')
 
             # 4) Visualization
             self.publish_frontier_markers()
