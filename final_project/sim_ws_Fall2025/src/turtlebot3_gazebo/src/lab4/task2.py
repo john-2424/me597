@@ -29,6 +29,7 @@ class Task2(Node):
     Step 4: Dynamic obstacle layer from LaserScan (trash cans)
     Step 5: Blocked-path detection & trigger for local replanning
     Step 6: Local RRT* planner for detours around static obstacles
+    Step 7: Path-following controller (pure-pursuit-ish) to generate cmd_vel
     """
 
     def __init__(self):
@@ -49,6 +50,14 @@ class Task2(Node):
         self.declare_parameter('rrt_goal_sample_rate', 0.2)   # probability [0,1]
         self.declare_parameter('rrt_neighbor_radius', 0.75)   # meters
         self.declare_parameter('rrt_local_range', 2.5)        # meters (sampling window radius)
+
+        # Path-following controller parameters
+        self.declare_parameter('max_linear_vel', 0.20)        # m/s
+        self.declare_parameter('max_angular_vel', 0.80)       # rad/s
+        self.declare_parameter('lookahead_distance', 0.40)    # m
+        self.declare_parameter('waypoint_tolerance', 0.05)    # m
+        self.declare_parameter('goal_tolerance', 0.15)        # m
+        self.declare_parameter('angular_gain', 1.5)           # P-gain on heading error
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -77,6 +86,25 @@ class Task2(Node):
         )
         self.rrt_local_range = (
             self.get_parameter('rrt_local_range').get_parameter_value().double_value
+        )
+
+        self.max_linear_vel = (
+            self.get_parameter('max_linear_vel').get_parameter_value().double_value
+        )
+        self.max_angular_vel = (
+            self.get_parameter('max_angular_vel').get_parameter_value().double_value
+        )
+        self.lookahead_distance = (
+            self.get_parameter('lookahead_distance').get_parameter_value().double_value
+        )
+        self.waypoint_tolerance = (
+            self.get_parameter('waypoint_tolerance').get_parameter_value().double_value
+        )
+        self.goal_tolerance = (
+            self.get_parameter('goal_tolerance').get_parameter_value().double_value
+        )
+        self.angular_gain = (
+            self.get_parameter('angular_gain').get_parameter_value().double_value
         )
 
         # -------------------------
@@ -112,10 +140,11 @@ class Task2(Node):
         self.current_path_index = 0        # index into active_path_points
 
         # For local replanning (RRT*)
+        self.blockage_radius = 2   # cells to check around each waypoint
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
 
-        # Timing (will be used later for scoring)
+        # Timing (used later in Step 8)
         self.navigation_start_time = None
         self.navigation_time_pub_msg = Float32()
 
@@ -175,7 +204,9 @@ class Task2(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task2 node initialized: IO + map + A* + dynamic obstacles + blockage + RRT* ready.')
+        self.get_logger().info(
+            'Task2 node initialized: IO + map + A* + dynamic obstacles + blockage + RRT* + controller ready.'
+        )
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -318,6 +349,17 @@ class Task2(Node):
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def _normalize_angle(angle):
+        """
+        Normalize angle to [-pi, pi].
+        """
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
     # ----------------------------------------------------------------------
     # Dynamic obstacle layer from LaserScan
@@ -521,11 +563,29 @@ class Task2(Node):
         return best_idx, best_dist2
 
     def _is_waypoint_blocked(self, x, y) -> bool:
+        """
+        Determine if a waypoint is blocked by *dynamic* obstacles (trash cans),
+        ignoring static map walls (A* already accounts for those).
+        """
+        if self.dynamic_occupancy is None:
+            return False
+
         idx = self.world_to_grid(x, y)
         if idx is None:
-            return True
+            # If waypoint is off-map, let A* handle it, don't treat as dynamically blocked
+            return False
+
         row, col = idx
-        return not self.is_cell_free(row, col)
+
+        R = self.blockage_radius  # e.g., 2 or 3 cells
+        for rr in range(row - R, row + R + 1):
+            for cc in range(col - R, col + R + 1):
+                if rr < 0 or cc < 0 or rr >= self.map_height or cc >= self.map_width:
+                    continue
+                if self.dynamic_occupancy[rr, cc] != 0:
+                    return True
+
+        return False
 
     def _check_path_blocked_ahead(self):
         if not self.active_path_points or self.current_pose is None:
@@ -578,10 +638,6 @@ class Task2(Node):
             self.cost = cost
 
     def _segment_collision_free(self, x1, y1, x2, y2) -> bool:
-        """
-        Check if the line segment between (x1,y1) and (x2,y2) is collision-free
-        using the static+dynamic occupancy grids.
-        """
         dx = x2 - x1
         dy = y2 - y1
         dist = math.hypot(dx, dy)
@@ -592,7 +648,6 @@ class Task2(Node):
             r, c = idx
             return self.is_cell_free(r, c)
 
-        # Sample along the segment at about half a grid resolution
         step = max(self.map_resolution * 0.5, 0.01)
         n_steps = max(int(dist / step), 1)
 
@@ -610,15 +665,10 @@ class Task2(Node):
         return True
 
     def _rrt_sample(self, center_x, center_y, goal_x, goal_y):
-        """
-        Sample a random free point in a local square window around center,
-        occasionally sampling the goal directly (goal bias).
-        """
         if random.random() < self.rrt_goal_sample_rate:
             return goal_x, goal_y
 
         for _ in range(100):
-            # Uniform sample in local square around robot
             dx = (random.random() * 2.0 - 1.0) * self.rrt_local_range
             dy = (random.random() * 2.0 - 1.0) * self.rrt_local_range
             x = center_x + dx
@@ -631,7 +681,6 @@ class Task2(Node):
             if self.is_cell_free(r, c):
                 return x, y
 
-        # Fallback
         return goal_x, goal_y
 
     def _rrt_nearest(self, nodes, x, y):
@@ -657,9 +706,6 @@ class Task2(Node):
         return from_node.x + dx * scale, from_node.y + dy * scale
 
     def _rrt_neighbors(self, nodes, new_node):
-        """
-        Return nodes within neighbor_radius of new_node.
-        """
         neighbors = []
         radius2 = self.rrt_neighbor_radius * self.rrt_neighbor_radius
         for node in nodes:
@@ -670,13 +716,6 @@ class Task2(Node):
         return neighbors
 
     def plan_rrt_star(self, start_xy, goal_xy, center_xy):
-        """
-        Plan a local path from start_xy to goal_xy using RRT* within a local window.
-        :param start_xy: (x, y) start in world frame (robot or path start)
-        :param goal_xy: (x, y) goal in world frame (reconnect point on global path)
-        :param center_xy: (x, y) center of local window (robot pose)
-        :return: list[(x, y)] from start to goal, or None if failed
-        """
         sx, sy = start_xy
         gx, gy = goal_xy
         cx, cy = center_xy
@@ -686,24 +725,19 @@ class Task2(Node):
         goal_node = None
 
         for it in range(self.rrt_max_iterations):
-            # 1) Sample
             sample_x, sample_y = self._rrt_sample(cx, cy, gx, gy)
 
-            # 2) Nearest
             nearest = self._rrt_nearest(nodes, sample_x, sample_y)
             if nearest is None:
                 continue
 
-            # 3) Steer
             new_x, new_y = self._rrt_steer(nearest, sample_x, sample_y)
 
-            # 4) Collision check
             if not self._segment_collision_free(nearest.x, nearest.y, new_x, new_y):
                 continue
 
             new_node = self._RRTNode(new_x, new_y, parent=None, cost=float('inf'))
 
-            # 5) Choose best parent among neighbors
             neighbors = self._rrt_neighbors(nodes, new_node)
             best_parent = nearest
             best_cost = nearest.cost + math.hypot(nearest.x - new_x, nearest.y - new_y)
@@ -718,14 +752,12 @@ class Task2(Node):
             new_node.cost = best_cost
             nodes.append(new_node)
 
-            # 6) Rewire neighbors
             for nb in neighbors:
                 d = math.hypot(nb.x - new_node.x, nb.y - new_node.y)
                 if new_node.cost + d < nb.cost and self._segment_collision_free(new_node.x, new_node.y, nb.x, nb.y):
                     nb.parent = new_node
                     nb.cost = new_node.cost + d
 
-            # 7) Check if we can connect to goal
             dist_to_goal = math.hypot(new_node.x - gx, new_node.y - gy)
             if dist_to_goal <= self.rrt_step_size * 2.0:
                 if self._segment_collision_free(new_node.x, new_node.y, gx, gy):
@@ -738,7 +770,6 @@ class Task2(Node):
             self.get_logger().warn('RRT*: failed to find a local path.')
             return None
 
-        # Reconstruct path from goal_node back to start
         path = []
         node = goal_node
         while node is not None:
@@ -793,6 +824,8 @@ class Task2(Node):
             return
 
         if self.state == 'WAIT_FOR_GOAL':
+            # Make sure robot stays still
+            self._publish_stop()
             return
 
         if self.state == 'PLAN_GLOBAL':
@@ -800,7 +833,7 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # Check if path ahead is blocked
+            # 1) Check if path ahead is blocked
             blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
             if blocked:
                 self.local_replan_start_index = start_idx
@@ -810,11 +843,11 @@ class Task2(Node):
                     f'from index {start_idx} to {goal_idx}.'
                 )
                 self.state = 'REPLAN_LOCAL'
+                self._publish_stop()
                 return
 
-            # Controller will be added later; keep robot stopped for now.
-            twist = Twist()
-            self.cmd_vel_pub.publish(twist)
+            # 2) Follow active path using controller
+            self._follow_active_path()
             return
 
         if self.state == 'REPLAN_LOCAL':
@@ -822,7 +855,8 @@ class Task2(Node):
             return
 
         if self.state == 'GOAL_REACHED':
-            # Goal handling, timing, and reset will be implemented later.
+            # Step 8 will add timing/report; for now just hold still.
+            self._publish_stop()
             return
 
     def _handle_plan_global(self):
@@ -863,11 +897,6 @@ class Task2(Node):
         self.state = 'FOLLOW_PATH'
 
     def _handle_replan_local(self):
-        """
-        Called in REPLAN_LOCAL state: run RRT* between two points on the active path
-        using the robot pose as the sampling center, then splice the result into
-        active_path_points and publish local_plan.
-        """
         if (
             self.current_pose is None or
             not self.active_path_points or
@@ -878,7 +907,6 @@ class Task2(Node):
             self.state = 'FOLLOW_PATH'
             return
 
-        # Clamp indices
         start_idx = max(0, min(self.local_replan_start_index, len(self.active_path_points) - 1))
         goal_idx = max(0, min(self.local_replan_goal_index, len(self.active_path_points) - 1))
 
@@ -890,14 +918,11 @@ class Task2(Node):
             self.state = 'FOLLOW_PATH'
             return
 
-        # Start: use current robot pose (for realism)
         rx = self.current_pose.pose.pose.position.x
         ry = self.current_pose.pose.pose.position.y
         start_xy = (rx, ry)
 
-        # Goal: reconnect point on the original active path
         goal_xy = self.active_path_points[goal_idx]
-
         center_xy = (rx, ry)
 
         self.get_logger().info(
@@ -916,15 +941,12 @@ class Task2(Node):
             self.state = 'FOLLOW_PATH'
             return
 
-        # Build Path message for visualization
         local_path_msg = self.build_path_msg(local_path)
         self.local_path_pub.publish(local_path_msg)
 
-        # Splice local RRT* path into active_path_points
         prefix = self.active_path_points[:start_idx]
         suffix = self.active_path_points[goal_idx + 1:]
 
-        # Avoid duplicating the reconnect goal if the last local point is very close
         if math.hypot(local_path[-1][0] - goal_xy[0], local_path[-1][1] - goal_xy[1]) < 0.1:
             local_splice = local_path
         else:
@@ -933,7 +955,6 @@ class Task2(Node):
         new_active = prefix + local_splice + suffix
         self.active_path_points = new_active
 
-        # Reset indices & go back to FOLLOW_PATH
         self.current_path_index = 0
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
@@ -945,6 +966,101 @@ class Task2(Node):
         )
 
         self.state = 'FOLLOW_PATH'
+
+    # ----------------------------------------------------------------------
+    # Path-following controller
+    # ----------------------------------------------------------------------
+    def _publish_stop(self):
+        twist = Twist()
+        self.cmd_vel_pub.publish(twist)
+
+    def _follow_active_path(self):
+        """
+        Simple pure-pursuit-style controller:
+        - Find nearest path point.
+        - Choose a lookahead target ahead of that point.
+        - Compute heading error and drive towards it.
+        - Detect when final goal is reached and switch to GOAL_REACHED.
+        """
+        if self.current_pose is None or not self.active_path_points:
+            self._publish_stop()
+            return
+
+        pose = self.current_pose.pose.pose
+        rx = pose.position.x
+        ry = pose.position.y
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        # Final goal point
+        gx, gy = self.active_path_points[-1]
+        dist_to_goal = math.hypot(gx - rx, gy - ry)
+
+        # Goal reached?
+        if dist_to_goal < self.goal_tolerance:
+            self.get_logger().info(
+                f'FOLLOW_PATH: goal reached (distance={dist_to_goal:.3f} < {self.goal_tolerance:.3f}).'
+            )
+            self.state = 'GOAL_REACHED'
+            self._publish_stop()
+            return
+
+        # Find nearest path index and keep it as current_path_index
+        nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
+        if nearest_idx is None:
+            self._publish_stop()
+            return
+
+        self.current_path_index = nearest_idx
+
+        # Select lookahead target index
+        target_idx = nearest_idx
+        while target_idx < len(self.active_path_points) - 1:
+            tx, ty = self.active_path_points[target_idx]
+            d = math.hypot(tx - rx, ty - ry)
+            if d >= self.lookahead_distance:
+                break
+            target_idx += 1
+
+        if target_idx >= len(self.active_path_points):
+            target_idx = len(self.active_path_points) - 1
+
+        tx, ty = self.active_path_points[target_idx]
+        dx = tx - rx
+        dy = ty - ry
+        dist_to_target = math.hypot(dx, dy)
+
+        if dist_to_target < 1e-6:
+            self._publish_stop()
+            return
+
+        desired_yaw = math.atan2(dy, dx)
+        heading_error = self._normalize_angle(desired_yaw - yaw)
+
+        # Simple speed policy: go slower for large heading errors
+        heading_factor = max(0.0, 1.0 - abs(heading_error) / math.pi)
+        linear_speed = self.max_linear_vel * heading_factor
+
+        # A bit of extra damping near the goal so we don't overshoot
+        if dist_to_goal < 0.5:
+            linear_speed *= dist_to_goal / 0.5
+
+        angular_speed = self.angular_gain * heading_error
+        if angular_speed > self.max_angular_vel:
+            angular_speed = self.max_angular_vel
+        elif angular_speed < -self.max_angular_vel:
+            angular_speed = -self.max_angular_vel
+
+        twist = Twist()
+        twist.linear.x = linear_speed
+        twist.angular.z = angular_speed
+        self.cmd_vel_pub.publish(twist)
+
+        self.get_logger().info(
+            f'FOLLOW_PATH: target_idx={target_idx}, '
+            f'd_target={dist_to_target:.2f}, d_goal={dist_to_goal:.2f}, '
+            f'v={linear_speed:.2f}, w={angular_speed:.2f}',
+            throttle_duration_sec=0.5
+        )
 
 
 def main(args=None):
