@@ -26,6 +26,7 @@ class Task2(Node):
     Step 2: Map loading (Task 1 map) + world <-> grid conversions
     Step 3: Global path planner (A*) using inflated occupancy grid
     Step 4: Dynamic obstacle layer from LaserScan (trash cans)
+    Step 5: Blocked-path detection & trigger for local replanning
     """
 
     def __init__(self):
@@ -37,6 +38,8 @@ class Task2(Node):
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')
         self.declare_parameter('inflation_kernel', 5)
+        # How many future waypoints to check for blockage
+        self.declare_parameter('block_check_lookahead_points', 30)
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -45,6 +48,10 @@ class Task2(Node):
         self.map_name = self.get_parameter('map').get_parameter_value().string_value
         self.inflation_kernel = (
             self.get_parameter('inflation_kernel').get_parameter_value().integer_value
+        )
+        self.block_check_lookahead_points = (
+            self.get_parameter('block_check_lookahead_points')
+            .get_parameter_value().integer_value
         )
 
         # -------------------------
@@ -73,9 +80,15 @@ class Task2(Node):
         self.state = 'WAIT_FOR_POSE'
         self.goal_active = False
 
-        # Global path storage (list of (x, y))
-        self.global_path_points = []
-        self.current_path_index = 0
+        # Global path (pure A*)
+        self.global_path_points = []       # list[(x, y)]
+        # Active path (global + local detours)
+        self.active_path_points = []       # list[(x, y)]
+        self.current_path_index = 0        # index into active_path_points
+
+        # For local replanning (RRT*) we will need these indices
+        self.local_replan_start_index = None
+        self.local_replan_goal_index = None
 
         # Timing (will be used later for scoring)
         self.navigation_start_time = None
@@ -137,7 +150,7 @@ class Task2(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task2 node initialized: ROS I/O + map + A* + dynamic obstacles ready.')
+        self.get_logger().info('Task2 node initialized: IO + map + A* + dynamic obstacles + blockage detection ready.')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -272,15 +285,11 @@ class Task2(Node):
     # ----------------------------------------------------------------------
     @staticmethod
     def _quat_to_yaw(q):
-        """
-        Convert geometry_msgs Quaternion to yaw angle (rad) in 2D.
-        """
         x = q.x
         y = q.y
         z = q.z
         w = q.w
 
-        # Yaw from quaternion (assuming roll, pitch ~ 0)
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
@@ -289,21 +298,12 @@ class Task2(Node):
     # Dynamic obstacle layer from LaserScan
     # ----------------------------------------------------------------------
     def update_dynamic_occupancy_from_scan(self):
-        """
-        Use the latest LaserScan and current_pose (AMCL) to update dynamic_occupancy.
-        Assumptions:
-        - Laser frame is coincident with base_link, oriented with the robot's yaw.
-        - Static obstacles are already in the map; new obstacles (trash cans)
-          will appear in scan but not in static_occupancy.
-        """
         if not self.map_loaded or self.latest_scan is None or self.current_pose is None:
             return
 
-        # Clear previous dynamic obstacles (static trash cans -> always seen)
-        # We recompute from scratch on each scan.
+        # Reset dynamic obstacles each scan; we treat trash cans as "always seen"
         self.dynamic_occupancy.fill(0)
 
-        # Robot pose in map frame
         pose = self.current_pose.pose.pose
         rx = pose.position.x
         ry = pose.position.y
@@ -312,9 +312,7 @@ class Task2(Node):
         scan = self.latest_scan
         angle = scan.angle_min
 
-        # Iterate over beams
         for r in scan.ranges:
-            # Skip invalid ranges
             if math.isinf(r) or math.isnan(r):
                 angle += scan.angle_increment
                 continue
@@ -322,24 +320,21 @@ class Task2(Node):
                 angle += scan.angle_increment
                 continue
 
-            # Point in robot (base_scan) frame
+            # Beam in robot frame
             lx = r * math.cos(angle)
             ly = r * math.sin(angle)
 
-            # Transform to world/map frame (2D rotation + translation)
+            # Transform to world
             wx = rx + math.cos(yaw) * lx - math.sin(yaw) * ly
             wy = ry + math.sin(yaw) * lx + math.cos(yaw) * ly
 
-            # Convert to grid cell
             idx = self.world_to_grid(wx, wy)
             if idx is not None:
                 row, col = idx
-                # Mark as dynamically occupied
                 self.dynamic_occupancy[row, col] = 1
 
             angle += scan.angle_increment
 
-        # Optional debug (throttled)
         num_dyn = int(self.dynamic_occupancy.sum())
         self.get_logger().info(
             f'Updated dynamic occupancy. Occupied cells (approx): {num_dyn}',
@@ -359,24 +354,15 @@ class Task2(Node):
         ):
             return False
 
-        # Static: inflated occupancy
         if self.inflated_occupancy[row, col] != 0:
             return False
 
-        # Dynamic: trash cans / unseen stuff
         if self.dynamic_occupancy is not None and self.dynamic_occupancy[row, col] != 0:
             return False
 
         return True
 
     def astar_plan(self, start_world, goal_world):
-        """
-        Run A* on the inflated occupancy grid (and dynamic layer if present).
-
-        :param start_world: (x, y) in world frame
-        :param goal_world:  (x, y) in world frame
-        :return: list of (x, y) world coordinates representing the path, or None
-        """
         if not self.map_loaded:
             self.get_logger().error('Cannot run A*: map not loaded.')
             return None
@@ -399,7 +385,6 @@ class Task2(Node):
             self.get_logger().warn('Goal cell is occupied (static or dynamic).')
             return None
 
-        # 8-connected neighbors: (dr, dc, cost)
         neighbors = [
             (-1,  0, 1.0),
             ( 1,  0, 1.0),
@@ -417,13 +402,12 @@ class Task2(Node):
         open_set = []
         heapq.heappush(open_set, (0.0, (s_row, s_col)))
 
-        came_from = {}          # (row, col) -> (parent_row, parent_col)
-        g_score = { (s_row, s_col): 0.0 }
-
+        came_from = {}
+        g_score = {(s_row, s_col): 0.0}
         closed_set = set()
 
         iterations = 0
-        max_iterations = self.map_width * self.map_height  # loose cap
+        max_iterations = self.map_width * self.map_height
 
         while open_set and iterations < max_iterations:
             iterations += 1
@@ -492,6 +476,92 @@ class Task2(Node):
         return msg
 
     # ----------------------------------------------------------------------
+    # Path blockage detection helpers
+    # ----------------------------------------------------------------------
+    def _nearest_path_index(self, x, y, path_points):
+        """
+        Find index of the path point closest to (x, y).
+        Returns (idx, squared_distance) or (None, inf) if path empty.
+        """
+        if not path_points:
+            return None, float('inf')
+
+        best_idx = 0
+        best_dist2 = float('inf')
+
+        for i, (px, py) in enumerate(path_points):
+            dx = px - x
+            dy = py - y
+            d2 = dx * dx + dy * dy
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_idx = i
+
+        return best_idx, best_dist2
+
+    def _is_waypoint_blocked(self, x, y) -> bool:
+        """
+        Check whether the waypoint at (x, y) lies in a dynamically or statically occupied cell.
+        """
+        idx = self.world_to_grid(x, y)
+        if idx is None:
+            # Outside map => treat as blocked for safety
+            return True
+        row, col = idx
+        return not self.is_cell_free(row, col)
+
+    def _check_path_blocked_ahead(self):
+        """
+        Check whether the active path ahead of the robot is blocked by dynamic obstacles.
+
+        Returns:
+            (blocked: bool, start_idx: int, goal_idx: int)
+            - blocked: whether any waypoint in the lookahead window is blocked
+            - start_idx: nearest path index to robot (for RRT* start)
+            - goal_idx: a future index to reconnect to (for RRT* goal)
+        """
+        if not self.active_path_points or self.current_pose is None:
+            return False, None, None
+
+        # Find nearest path index to current pose
+        rx = self.current_pose.pose.pose.position.x
+        ry = self.current_pose.pose.pose.position.y
+
+        nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
+        if nearest_idx is None:
+            return False, None, None
+
+        # Look ahead some number of points
+        max_idx = min(
+            nearest_idx + self.block_check_lookahead_points,
+            len(self.active_path_points) - 1
+        )
+
+        blocked = False
+        first_blocked_idx = None
+
+        for i in range(nearest_idx, max_idx + 1):
+            x, y = self.active_path_points[i]
+            if self._is_waypoint_blocked(x, y):
+                blocked = True
+                first_blocked_idx = i
+                break
+
+        if not blocked:
+            return False, nearest_idx, max_idx
+
+        # Choose a reconnect goal index slightly beyond the first blocked point,
+        # if possible, to encourage RRT* to bypass and rejoin later.
+        reconnect_idx = min(first_blocked_idx + 5, len(self.active_path_points) - 1)
+
+        self.get_logger().info(
+            f'Path blocked detected: nearest_idx={nearest_idx}, '
+            f'first_blocked_idx={first_blocked_idx}, reconnect_idx={reconnect_idx}'
+        )
+
+        return True, nearest_idx, reconnect_idx
+
+    # ----------------------------------------------------------------------
     # Subscriber callbacks
     # ----------------------------------------------------------------------
     def amcl_pose_callback(self, msg: PoseWithCovarianceStamped):
@@ -513,7 +583,6 @@ class Task2(Node):
 
     def scan_callback(self, msg: LaserScan):
         self.latest_scan = msg
-        # Update dynamic occupancy as soon as we get new scan
         self.update_dynamic_occupancy_from_scan()
 
     # ----------------------------------------------------------------------
@@ -543,14 +612,30 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # For now, we only publish zero cmd_vel to keep robot stationary
-            # while we focus on planning and perception.
+            # Step 5: check if current active path is blocked ahead
+            blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
+            if blocked:
+                self.local_replan_start_index = start_idx
+                self.local_replan_goal_index = goal_idx
+                self.get_logger().info(
+                    f'FOLLOW_PATH: path blocked. Triggering local replanning '
+                    f'from index {start_idx} to {goal_idx}.'
+                )
+                self.state = 'REPLAN_LOCAL'
+                return
+
+            # For now, we still keep robot stationary. Controller will come later.
             twist = Twist()
             self.cmd_vel_pub.publish(twist)
             return
 
         if self.state == 'REPLAN_LOCAL':
-            # RRT* local replanning will go here in a later step.
+            # Placeholder: RRT* local replanning will be implemented in Step 6.
+            self.get_logger().info(
+                'REPLAN_LOCAL: local replanning (RRT*) not implemented yet. '
+                'Switching back to FOLLOW_PATH.'
+            )
+            self.state = 'FOLLOW_PATH'
             return
 
         if self.state == 'GOAL_REACHED':
@@ -579,8 +664,14 @@ class Task2(Node):
             self.get_logger().warn('PLAN_GLOBAL: A* failed or path too short. Staying in PLAN_GLOBAL.')
             return
 
+        # Store pure global path
         self.global_path_points = path_world
+
+        # Active path initially matches global path (until RRT* detours modify it)
+        self.active_path_points = list(path_world)
         self.current_path_index = 0
+        self.local_replan_start_index = None
+        self.local_replan_goal_index = None
 
         path_msg = self.build_path_msg(path_world)
         self.global_path_pub.publish(path_msg)
