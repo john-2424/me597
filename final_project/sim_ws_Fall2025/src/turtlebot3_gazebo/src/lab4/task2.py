@@ -41,26 +41,34 @@ class Task2(Node):
         # -------------------------
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')
-        self.declare_parameter('inflation_kernel', 5)
+        self.declare_parameter('inflation_kernel', 6)
         # How many future waypoints to check for blockage
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 1)
+        self.declare_parameter('dynamic_inflation_kernel', 6)
 
         # RRT* parameters (slightly more generous defaults)
         self.declare_parameter('rrt_max_iterations', 1200)
         self.declare_parameter('rrt_step_size', 0.25)         # meters
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
         self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
-        self.declare_parameter('rrt_local_range', 3.5)        # meters (sampling window radius)
+        self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
 
         # Path-following controller parameters
-        self.declare_parameter('max_linear_vel', 0.20)        # m/s
-        self.declare_parameter('max_angular_vel', 0.80)       # rad/s
-        self.declare_parameter('lookahead_distance', 0.40)    # m
+        self.declare_parameter('max_linear_vel', 0.40)        # m/s
+        self.declare_parameter('max_angular_vel', 1.0)       # rad/s
+        self.declare_parameter('lookahead_distance', 0.50)    # m
         self.declare_parameter('waypoint_tolerance', 0.05)    # m
         self.declare_parameter('goal_tolerance', 0.15)        # m
-        self.declare_parameter('angular_gain', 1.5)           # P-gain on heading error
+        self.declare_parameter('angular_gain', 1.8)           # P-gain on heading error
+
+        # Obstacle avoidance (reactive) parameters
+        self.declare_parameter('obstacle_avoid_distance', 0.35)      # m, too-close threshold
+        self.declare_parameter('obstacle_avoid_back_time', 1.0)      # s
+        self.declare_parameter('obstacle_avoid_turn_time', 1.0)      # s
+        self.declare_parameter('obstacle_avoid_forward_time', 1.0)   # s
+        self.declare_parameter('obstacle_avoid_linear_vel', 0.10)    # m/s
+        self.declare_parameter('obstacle_avoid_angular_vel', 0.80)   # rad/s
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -117,6 +125,25 @@ class Task2(Node):
             self.get_parameter('angular_gain').get_parameter_value().double_value
         )
 
+        self.obstacle_avoid_distance = (
+            self.get_parameter('obstacle_avoid_distance').get_parameter_value().double_value
+        )
+        self.obstacle_avoid_back_time = (
+            self.get_parameter('obstacle_avoid_back_time').get_parameter_value().double_value
+        )
+        self.obstacle_avoid_turn_time = (
+            self.get_parameter('obstacle_avoid_turn_time').get_parameter_value().double_value
+        )
+        self.obstacle_avoid_forward_time = (
+            self.get_parameter('obstacle_avoid_forward_time').get_parameter_value().double_value
+        )
+        self.obstacle_avoid_linear_vel = (
+            self.get_parameter('obstacle_avoid_linear_vel').get_parameter_value().double_value
+        )
+        self.obstacle_avoid_angular_vel = (
+            self.get_parameter('obstacle_avoid_angular_vel').get_parameter_value().double_value
+        )
+
         # -------------------------
         # Map-related members
         # -------------------------
@@ -139,6 +166,11 @@ class Task2(Node):
         self.current_pose = None           # PoseWithCovarianceStamped
         self.current_goal = None           # PoseStamped
         self.latest_scan = None            # LaserScan
+        
+        # Reactive obstacle avoidance state
+        self.avoidance_phase = None               # 'BACK', 'TURN', 'FORWARD'
+        self.avoidance_direction = None           # 'LEFT' or 'RIGHT'
+        self.avoidance_phase_start_time = None    # rclpy.time.Time
 
         self.state = 'WAIT_FOR_POSE'
         self.goal_active = False
@@ -716,6 +748,130 @@ class Task2(Node):
             self.y = y
             self.parent = parent
             self.cost = cost
+    
+    def _scan_min_in_sector(self, center_deg: float, width_deg: float) -> float:
+        """
+        Return the minimum valid range in a sector around center_deg (in degrees)
+        with total width width_deg (degrees). If no valid returns, +inf.
+        """
+        if self.latest_scan is None:
+            return float('inf')
+
+        scan = self.latest_scan
+        center = math.radians(center_deg)
+        half = math.radians(width_deg) / 2.0
+
+        angle = scan.angle_min
+        min_r = float('inf')
+
+        for r in scan.ranges:
+            if math.isinf(r) or math.isnan(r):
+                angle += scan.angle_increment
+                continue
+
+            if scan.range_min <= r <= scan.range_max:
+                if (center - half) <= angle <= (center + half):
+                    if r < min_r:
+                        min_r = r
+
+            angle += scan.angle_increment
+
+        return min_r
+
+    def _choose_avoidance_direction(self) -> str:
+        """
+        Choose LEFT or RIGHT based on which side has more clearance.
+        """
+        left_min = self._scan_min_in_sector(90.0, 80.0)    # sector on the left
+        right_min = self._scan_min_in_sector(-90.0, 80.0)  # sector on the right
+
+        self.get_logger().info(
+            f'AVOID_OBSTACLE: sector min ranges -> left={left_min:.2f}, right={right_min:.2f}'
+        )
+
+        if left_min >= right_min:
+            return 'LEFT'
+        else:
+            return 'RIGHT'
+
+    def _start_avoidance(self):
+        """
+        Initialize the reactive avoidance maneuver:
+        - Decide turn direction (left/right) based on lidar.
+        - Start in BACK phase.
+        """
+        self.avoidance_direction = self._choose_avoidance_direction()
+        self.avoidance_phase = 'BACK'
+        self.avoidance_phase_start_time = self.get_clock().now()
+
+        self.get_logger().info(
+            f'AVOID_OBSTACLE: starting maneuver, direction={self.avoidance_direction}.'
+        )
+
+    def _handle_avoid_obstacle(self):
+        """
+        State machine for AVOID_OBSTACLE:
+        BACK -> TURN -> FORWARD -> PLAN_GLOBAL
+        """
+        if self.avoidance_phase is None:
+            # Shouldn't happen, but be robust
+            self._start_avoidance()
+
+        now = self.get_clock().now()
+        dt = (now - self.avoidance_phase_start_time).nanoseconds / 1e9
+
+        twist = Twist()
+
+        if self.avoidance_phase == 'BACK':
+            if dt < self.obstacle_avoid_back_time:
+                # Move backwards
+                twist.linear.x = -self.obstacle_avoid_linear_vel
+                self.cmd_vel_pub.publish(twist)
+                return
+            else:
+                # Move to TURN phase
+                self.avoidance_phase = 'TURN'
+                self.avoidance_phase_start_time = now
+                self.get_logger().info('AVOID_OBSTACLE: BACK phase done, switching to TURN.')
+                return
+
+        if self.avoidance_phase == 'TURN':
+            if dt < self.obstacle_avoid_turn_time:
+                # Turn left or right on the spot
+                if self.avoidance_direction == 'LEFT':
+                    twist.angular.z = self.obstacle_avoid_angular_vel
+                else:
+                    twist.angular.z = -self.obstacle_avoid_angular_vel
+                self.cmd_vel_pub.publish(twist)
+                return
+            else:
+                # Move to FORWARD phase
+                self.avoidance_phase = 'FORWARD'
+                self.avoidance_phase_start_time = now
+                self.get_logger().info('AVOID_OBSTACLE: TURN phase done, switching to FORWARD.')
+                return
+
+        if self.avoidance_phase == 'FORWARD':
+            if dt < self.obstacle_avoid_forward_time:
+                # Move forward into the newly open space
+                twist.linear.x = self.obstacle_avoid_linear_vel
+                self.cmd_vel_pub.publish(twist)
+                return
+            else:
+                # Maneuver complete: stop and replan globally
+                self._publish_stop()
+
+                self.avoidance_phase = None
+                self.avoidance_direction = None
+                self.avoidance_phase_start_time = None
+
+                self.get_logger().info(
+                    'AVOID_OBSTACLE: maneuver complete. Switching to PLAN_GLOBAL for replanning.'
+                )
+
+                # Trigger a fresh A* from the new pose to the current goal
+                self.state = 'PLAN_GLOBAL'
+                return
 
     def _obstacle_too_close_ahead(self, max_distance=0.5, fov_deg=40.0):
         """
@@ -938,6 +1094,15 @@ class Task2(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
+            # 0) Immediate reactive avoidance if something is too close in front
+            if self._obstacle_too_close_ahead(max_distance=self.obstacle_avoid_distance):
+                self.get_logger().info(
+                    'FOLLOW_PATH: obstacle too close ahead. Entering AVOID_OBSTACLE.'
+                )
+                self._start_avoidance()
+                self.state = 'AVOID_OBSTACLE'
+                return
+
             # 1) Check if the path ahead is actually blocked in the map
             blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
             if blocked:
@@ -959,6 +1124,10 @@ class Task2(Node):
             self._handle_replan_local()
             return
 
+        if self.state == 'AVOID_OBSTACLE':
+            self._handle_avoid_obstacle()
+            return
+        
         if self.state == 'GOAL_REACHED':
             # Step 8: publish navigation time once, keep robot stopped
             self._handle_goal_reached()
