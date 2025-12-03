@@ -27,8 +27,7 @@ class Task3(Node):
     - Layer 0: Boilerplate & ROS wiring
     - Layer 1: Map loading & occupancy utilities
     - Layer 2: Automatic waypoint generation & route optimization
-      (indoor-only, using inflated occupancy and separate visualization
-       for patrol waypoints vs future global A* paths)
+      using distance-transform maxima (geometry-based coverage).
     """
 
     def __init__(self):
@@ -42,11 +41,9 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 6) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_min_component_area', 100)  # cells
-        self.declare_parameter('l2_corner_margin_cells', 3)   # cells from bounding box edges
         self.declare_parameter('l2_prune_dist', 0.5)          # m, min dist between waypoints
-        self.declare_parameter('l2_search_radius_cells', 10)  # cells for snapping to free
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
+        self.declare_parameter('l2_min_dt_cells', 2)          # min distance-to-obstacle in cells
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -57,24 +54,16 @@ class Task3(Node):
             self.get_parameter('inflation_kernel').get_parameter_value().integer_value
         )
 
-        self.l2_min_component_area = (
-            self.get_parameter('l2_min_component_area')
-            .get_parameter_value().integer_value
-        )
-        self.l2_corner_margin_cells = (
-            self.get_parameter('l2_corner_margin_cells')
-            .get_parameter_value().integer_value
-        )
         self.l2_prune_dist = (
             self.get_parameter('l2_prune_dist')
             .get_parameter_value().double_value
         )
-        self.l2_search_radius_cells = (
-            self.get_parameter('l2_search_radius_cells')
-            .get_parameter_value().integer_value
-        )
         self.l2_two_opt_max_iters = (
             self.get_parameter('l2_two_opt_max_iters')
+            .get_parameter_value().integer_value
+        )
+        self.l2_min_dt_cells = (
+            self.get_parameter('l2_min_dt_cells')
             .get_parameter_value().integer_value
         )
 
@@ -89,7 +78,7 @@ class Task3(Node):
 
         self.static_occupancy = None   # 0 free, 1 occupied
         self.inflated_occupancy = None # 0 free, 1 occupied (inflated)
-        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; Layer 3 will use this)
+        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; later)
 
         # -------------------------
         # Robot state
@@ -130,14 +119,14 @@ class Task3(Node):
             10
         )
 
-        # Future A* global path (we keep the topic reserved)
+        # Future A* global path (keep reserved)
         self.global_path_pub = self.create_publisher(
             Path,
             self._ns_topic('global_plan'),
             10
         )
 
-        # Local path (later RRT*/detours)
+        # Local path (later)
         self.local_path_pub = self.create_publisher(
             Path,
             self._ns_topic('local_plan'),
@@ -154,7 +143,6 @@ class Task3(Node):
         # -------------------------
         # Subscriptions
         # -------------------------
-        # AMCL pose (map frame)
         self.amcl_sub = self.create_subscription(
             PoseWithCovarianceStamped,
             self._ns_topic('amcl_pose'),
@@ -162,7 +150,6 @@ class Task3(Node):
             10
         )
 
-        # LaserScan for obstacles and later for ball range estimation
         self.scan_sub = self.create_subscription(
             LaserScan,
             self._ns_topic('scan'),
@@ -170,7 +157,6 @@ class Task3(Node):
             10
         )
 
-        # Camera image for color detection
         self.image_sub = self.create_subscription(
             Image,
             self._ns_topic('camera/image_raw'),
@@ -188,7 +174,7 @@ class Task3(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task3 node initialized (Layers 0 + 1 + 2, fixed).')
+        self.get_logger().info('Task3 node initialized (Layers 0 + 1 + 2).')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -279,6 +265,13 @@ class Task3(Node):
 
         self.dynamic_occupancy = np.zeros_like(self.static_occupancy, dtype=np.uint8)
 
+        free_static_count = int((self.static_occupancy == 0).sum())
+        free_inflated_count = int((self.inflated_occupancy == 0).sum())
+        self.get_logger().info(
+            f'[Layer 1] Free cells (static)   = {free_static_count}\n'
+            f'[Layer 1] Free cells (inflated) = {free_inflated_count}'
+        )
+
         self.map_loaded = True
         self.get_logger().info(
             f'[Layer 1] Obstacle inflation done with kernel size {kernel_size}. '
@@ -318,7 +311,7 @@ class Task3(Node):
         return x, y
 
     # ----------------------------------------------------------------------
-    # Layer 2: waypoint generation & route optimization (indoor-only)
+    # Layer 2: waypoint generation & route optimization (DT-based)
     # ----------------------------------------------------------------------
     def _generate_patrol_waypoints_if_needed(self):
         if self.waypoints_generated:
@@ -346,7 +339,7 @@ class Task3(Node):
         - AND inflated_occupancy == 0 (safely away from walls)
         """
         if self.static_occupancy is None or self.inflated_occupancy is None:
-            self.get_logger().warn('[Layer 2 DEBUG] Occupancy grids not ready.')
+            self.get_logger().warn('[Layer 2] Occupancy grids not ready.')
             return None
 
         free_static = (self.static_occupancy == 0)
@@ -354,113 +347,147 @@ class Task3(Node):
 
         waypoint_free = np.logical_and(free_static, free_inflated).astype(np.uint8)
 
-        total_free = int(waypoint_free.sum())
-        h, w = waypoint_free.shape
-
-        # --- DEBUG: global stats ---
-        self.get_logger().info(
-            f'[Layer 2 DEBUG] waypoint_free_mask: free_cells={total_free}, '
-            f'shape=({h},{w})'
-        )
-
-        # --- DEBUG: bottom-right ROI (20% × 20%) ---
-        r0 = int(h * 0.6)
-        c0 = int(w * 0.6)
-        roi = waypoint_free[r0:, c0:]
-        roi_free = int(roi.sum())
+        count_free_static = int(free_static.sum())
+        count_free_inflated = int(free_inflated.sum())
+        count_waypoint_free = int(waypoint_free.sum())
 
         self.get_logger().info(
-            f'[Layer 2 DEBUG] bottom-right ROI: r=[{r0}:{h}], c=[{c0}:{w}], '
-            f'free_cells_in_roi={roi_free}'
+            f'[Layer 2] waypoint_free_mask stats:\n'
+            f'  free_static      cells = {count_free_static}\n'
+            f'  free_inflated    cells = {count_free_inflated}\n'
+            f'  waypoint_free    cells = {count_waypoint_free}'
         )
 
         return waypoint_free
 
     def _generate_patrol_waypoints_from_map(self):
+        """
+        Use distance-transform maxima over waypoint_free_mask to generate
+        room-covering waypoints:
+
+        1) waypoint_free_mask = free & inflated-free
+        2) distanceTransform
+        3) pick local maxima above a distance threshold
+        4) convert to world, prune by distance
+        5) route via NN + 2-opt
+        """
         waypoint_free_mask = self._compute_waypoint_free_mask()
         if waypoint_free_mask is None or waypoint_free_mask.sum() == 0:
             self.get_logger().warn(
-                '[Layer 2 DEBUG] No free cells; skipping waypoint generation.'
+                '[Layer 2] waypoint_free_mask has no free cells. '
+                'No patrol waypoints will be generated.'
             )
             self.patrol_waypoints = []
             return
 
-        # --- Distance Transform ---
+        # --- Distance transform (in cells) ---
         dist = cv2.distanceTransform(waypoint_free_mask, cv2.DIST_L2, 3)
+        min_dt = float(dist[waypoint_free_mask == 1].min()) if waypoint_free_mask.sum() > 0 else 0.0
+        max_dt = float(dist.max())
+        self.get_logger().info(
+            f'[Layer 2] DistanceTransform stats (cells): '
+            f'min={min_dt:.2f}, max={max_dt:.2f}'
+        )
 
-        min_dist_cells = 2
-        candidate_mask = (dist >= float(min_dist_cells))
+        # Ignore tiny pockets very close to walls (in cells)
+        min_dist_cells = max(1, int(self.l2_min_dt_cells))
+        candidate_mask = np.logical_and(
+            waypoint_free_mask == 1,
+            dist >= float(min_dist_cells)
+        )
 
+        self.get_logger().info(
+            f'[Layer 2] Candidate cells after DT threshold >= {min_dist_cells}: '
+            f'{int(candidate_mask.sum())}'
+        )
+
+        # --- Local maxima detection ---
         kernel = np.ones((3, 3), np.uint8)
         dist_dilated = cv2.dilate(dist, kernel)
 
         local_max_mask = np.logical_and(
             candidate_mask,
-            dist >= dist_dilated - 1e-6
+            dist >= dist_dilated - 1e-6  # float tolerance
         )
-        local_max_mask = np.logical_and(local_max_mask, waypoint_free_mask == 1)
 
         ys, xs = np.where(local_max_mask)
         self.get_logger().info(
-            f'[Layer 2 DEBUG] DT local maxima count (grid): {len(xs)}'
+            f'[Layer 2] Distance-transform local maxima count (grid): {len(xs)}'
         )
 
-        # --- Convert maxima to world coords ---
+        if len(xs) == 0:
+            self.get_logger().warn(
+                '[Layer 2] No local maxima found. Consider lowering l2_min_dt_cells.'
+            )
+
+        # Convert to world coordinates
         raw_world_points = []
         for r, c in zip(ys, xs):
             world_xy = self.grid_to_world(int(r), int(c))
             if world_xy is not None:
-                xw, yw = world_xy
                 raw_world_points.append(world_xy)
-                self.get_logger().info(
-                    f'[Layer 2 DEBUG] DT max grid=({r},{c}) -> world=({xw:.2f}, {yw:.2f})'
-                )
 
         self.get_logger().info(
-            f'[Layer 2 DEBUG] Raw DT maxima (world): {len(raw_world_points)}'
+            f'[Layer 2] Raw world waypoints from DT maxima: {len(raw_world_points)}'
         )
 
-        # --- DEBUG probe for bottom-right room ---
-        probe_world = (3.5, -3.0)  # adjust coordinate to your map visually
-        probe_idx = self.world_to_grid(*probe_world)
-        if probe_idx is not None:
-            pr, pc = probe_idx
-            in_bounds = (0 <= pr < waypoint_free_mask.shape[0]) and (0 <= pc < waypoint_free_mask.shape[1])
-            val_static = int(self.static_occupancy[pr, pc]) if in_bounds else -1
-            val_inflated = int(self.inflated_occupancy[pr, pc]) if in_bounds else -1
-            val_free = int(waypoint_free_mask[pr, pc]) if in_bounds else -1
-
+        # Debug: log bounding box and extreme points of raw_world_points
+        if raw_world_points:
+            xs_w = [p[0] for p in raw_world_points]
+            ys_w = [p[1] for p in raw_world_points]
             self.get_logger().info(
-                f'[Layer 2 DEBUG] Probe bottom-right world={probe_world} -> '
-                f'grid=({pr},{pc}), static={val_static}, inflated={val_inflated}, '
-                f'waypoint_free={val_free}'
-            )
-        else:
-            self.get_logger().info(
-                f'[Layer 2 DEBUG] Probe world={probe_world}: outside map!'
+                f'[Layer 2] Raw waypoint world bounds: '
+                f'x in [{min(xs_w):.2f}, {max(xs_w):.2f}], '
+                f'y in [{min(ys_w):.2f}, {max(ys_w):.2f}]'
             )
 
-        # --- Prune duplicates ---
+            # log the "most bottom-right" candidate (max x, min y)
+            idx_br = max(
+                range(len(raw_world_points)),
+                key=lambda i: (raw_world_points[i][0], -raw_world_points[i][1])
+            )
+            br_x, br_y = raw_world_points[idx_br]
+            self.get_logger().info(
+                f'[Layer 2] Bottom-right-ish DT candidate: ({br_x:.2f}, {br_y:.2f})'
+            )
+
+            # Log up to first 5 points for sanity
+            sample_n = min(5, len(raw_world_points))
+            msg_pts = ', '.join(
+                f'({raw_world_points[i][0]:.2f},{raw_world_points[i][1]:.2f})'
+                for i in range(sample_n)
+            )
+            self.get_logger().info(
+                f'[Layer 2] Sample raw DT waypoints (first {sample_n}): {msg_pts}'
+            )
+
+        # Prune near-duplicates in world space
         pruned_world_points = self._prune_waypoints_by_distance(
             raw_world_points, self.l2_prune_dist
         )
 
         self.get_logger().info(
-            f'[Layer 2 DEBUG] Pruned waypoints: {len(pruned_world_points)} '
+            f'[Layer 2] Pruned world waypoints: {len(pruned_world_points)} '
             f'(prune_dist={self.l2_prune_dist:.2f} m)'
         )
 
         if not pruned_world_points:
             self.get_logger().warn(
-                '[Layer 2 DEBUG] No valid waypoints after pruning.'
+                '[Layer 2] No valid waypoints after pruning. '
+                'Patrol waypoints will be empty.'
             )
             self.patrol_waypoints = []
             return
 
-        # --- Routing ---
+        # Route ordering: nearest neighbor + 2-opt
         start_x = self.current_pose.pose.pose.position.x
         start_y = self.current_pose.pose.pose.position.y
         start_xy = (start_x, start_y)
+
+        self.get_logger().info(
+            f'[Layer 2] Building route from robot start at ({start_x:.2f}, {start_y:.2f}) '
+            f'over {len(pruned_world_points)} waypoints.'
+        )
 
         route_indices = self._nearest_neighbor_route(pruned_world_points, start_xy)
         if len(route_indices) > 2 and self.l2_two_opt_max_iters > 0:
@@ -470,31 +497,26 @@ class Task3(Node):
 
         self.patrol_waypoints = [pruned_world_points[i] for i in route_indices]
 
+        # Route length just for logging
+        total_route_len = 0.0
+        cur = start_xy
+        for idx in route_indices:
+            nx, ny = pruned_world_points[idx]
+            total_route_len += math.hypot(nx - cur[0], ny - cur[1])
+            cur = (nx, ny)
+
         self.get_logger().info(
-            f'[Layer 2 DEBUG] Final patrol waypoint count={len(self.patrol_waypoints)}'
+            f'[Layer 2] Final patrol route length ≈ {total_route_len:.2f} m, '
+            f'waypoints count={len(self.patrol_waypoints)}.'
         )
 
-    def _snap_to_free_in_component(
-        self, r, c, free_mask, labels, label_id, max_radius
-    ):
-        r = max(0, min(self.map_height - 1, r))
-        c = max(0, min(self.map_width - 1, c))
-
-        if free_mask[r, c] == 1 and labels[r, c] == label_id:
-            return (r, c)
-
-        for radius in range(1, max_radius + 1):
-            r_min = max(0, r - radius)
-            r_max = min(self.map_height - 1, r + radius)
-            c_min = max(0, c - radius)
-            c_max = min(self.map_width - 1, c + radius)
-
-            for rr in range(r_min, r_max + 1):
-                for cc in range(c_min, c_max + 1):
-                    if free_mask[rr, cc] == 1 and labels[rr, cc] == label_id:
-                        return (rr, cc)
-
-        return None
+        # Extra debug: print ordered waypoints
+        lines = []
+        for i, (wx, wy) in enumerate(self.patrol_waypoints):
+            lines.append(f'  #{i:02d}: ({wx:.2f}, {wy:.2f})')
+        self.get_logger().info(
+            '[Layer 2] Final ordered patrol waypoints:\n' + '\n'.join(lines)
+        )
 
     def _prune_waypoints_by_distance(self, points, d_min):
         pruned = []
@@ -613,7 +635,6 @@ class Task3(Node):
             m.scale.x = 0.1
             m.scale.y = 0.1
             m.scale.z = 0.1
-            # RViz default color is white if all zeros → set alpha=1
             m.color.a = 1.0
             m.color.r = 0.0
             m.color.g = 1.0
@@ -629,8 +650,11 @@ class Task3(Node):
     def amcl_pose_callback(self, msg: PoseWithCovarianceStamped):
         self.current_pose = msg
         if self.state == 'WAIT_FOR_POSE' and self.map_loaded:
+            px = msg.pose.pose.position.x
+            py = msg.pose.pose.position.y
             self.get_logger().info(
-                '[Task3] AMCL pose received. Ready to generate waypoints.'
+                f'[Task3] AMCL pose received. '
+                f'Current robot pose ≈ ({px:.2f}, {py:.2f}) in map frame.'
             )
 
     def scan_callback(self, msg: LaserScan):
