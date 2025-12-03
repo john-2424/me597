@@ -2,6 +2,7 @@
 
 import os
 import math
+import random  # For RRT* sampling
 
 import rclpy
 from rclpy.node import Node
@@ -43,6 +44,7 @@ class Task3(Node):
                * Pure-pursuit-style path follower
                * Patrol state machine visiting DT waypoints in an efficient order
                * Simple reactive obstacle avoidance (LaserScan-based)
+               * Local RRT* detours for path blockage avoidance (dynamic obstacles)
     - Layer 4: Vision + ball detection + visualization
                * Subscribe to camera
                * Multi-color (red/green/blue) HSV-based blob detection
@@ -54,8 +56,14 @@ class Task3(Node):
                * Track task start/end time and publish completion time
     """
 
+    # Future improvements (not yet implemented):
+    # - Better multi-frame filtering / averaging of ball positions.
+    # - More precise camera calibration / TF alignment between camera and base_scan.
+    # - Dynamic adjustment of HSV ranges / area thresholds for robustness.
+
     def __init__(self):
         super().__init__('task3_node')
+        self.get_logger().info('[Layer 0] Initializing Task3 node...')
 
         # -------------------------
         # Parameters
@@ -83,6 +91,18 @@ class Task3(Node):
         self.declare_parameter('obstacle_avoid_forward_time', 1.0)   # s
         self.declare_parameter('obstacle_avoid_linear_vel', 0.10)    # m/s
         self.declare_parameter('obstacle_avoid_angular_vel', 0.80)   # rad/s
+
+        # Dynamic obstacle + RRT* related
+        self.declare_parameter('block_check_lookahead_points', 30)
+        self.declare_parameter('dynamic_inflation_kernel', 6)
+
+        # RRT* parameters (borrowed from Task2)
+        self.declare_parameter('rrt_max_iterations', 1200)
+        self.declare_parameter('rrt_step_size', 0.25)         # meters
+        self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
+        self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
+        self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
+        self.declare_parameter('rrt_clearance_cells', 1)
 
         # Camera model (approximate)
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
@@ -145,11 +165,46 @@ class Task3(Node):
             self.get_parameter('obstacle_avoid_angular_vel').get_parameter_value().double_value
         )
 
+        self.block_check_lookahead_points = (
+            self.get_parameter('block_check_lookahead_points')
+            .get_parameter_value().integer_value
+        )
+        self.dynamic_inflation_kernel = (
+            self.get_parameter('dynamic_inflation_kernel')
+            .get_parameter_value().integer_value
+        )
+
+        self.rrt_max_iterations = (
+            self.get_parameter('rrt_max_iterations').get_parameter_value().integer_value
+        )
+        self.rrt_step_size = (
+            self.get_parameter('rrt_step_size').get_parameter_value().double_value
+        )
+        self.rrt_goal_sample_rate = (
+            self.get_parameter('rrt_goal_sample_rate').get_parameter_value().double_value
+        )
+        self.rrt_neighbor_radius = (
+            self.get_parameter('rrt_neighbor_radius').get_parameter_value().double_value
+        )
+        self.rrt_local_range = (
+            self.get_parameter('rrt_local_range').get_parameter_value().double_value
+        )
+        self.rrt_clearance_cells = (
+            self.get_parameter('rrt_clearance_cells').get_parameter_value().integer_value
+        )
+
         self.camera_h_fov_deg = (
             self.get_parameter('camera_h_fov_deg').get_parameter_value().double_value
         )
         self.ball_min_contour_area = (
             self.get_parameter('ball_min_contour_area').get_parameter_value().integer_value
+        )
+
+        self.get_logger().info(
+            f'[Layer 0] Parameters: map={self.map_name}, inflation_kernel={self.inflation_kernel}, '
+            f'l2_prune_dist={self.l2_prune_dist}, l2_min_dt_cells={self.l2_min_dt_cells}, '
+            f'max_linear_vel={self.max_linear_vel}, max_angular_vel={self.max_angular_vel}, '
+            f'rrt_max_iters={self.rrt_max_iterations}, rrt_range={self.rrt_local_range}'
         )
 
         # -------------------------
@@ -163,7 +218,7 @@ class Task3(Node):
 
         self.static_occupancy = None   # 0 free, 1 occupied
         self.inflated_occupancy = None # 0 free, 1 occupied (inflated)
-        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; reserved)
+        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; dynamic)
 
         # -------------------------
         # Robot state
@@ -186,15 +241,18 @@ class Task3(Node):
 
         # Global path currently being followed
         self.global_path_points = []      # list of (x, y)
-        self.active_path_points = []      # alias to global path for now
+        # Active path (global + local detours from RRT*)
+        self.active_path_points = []      # list of (x, y)
         self.current_path_index = 0
+
+        # For local replanning (RRT*)
+        self.local_replan_start_index = None
+        self.local_replan_goal_index = None
+        self.rrt_fail_count = 0
 
         # -------------------------
         # High-level task state machine
         # -------------------------
-        # WAIT_FOR_POSE -> SELECT_NEXT_WAYPOINT -> PLAN_TO_WAYPOINT
-        # -> FOLLOW_PATH / AVOID_OBSTACLE -> SELECT_NEXT_WAYPOINT ...
-        # -> PATROL_DONE or TASK_DONE
         self.state = 'WAIT_FOR_POSE'
 
         # Simple reactive avoidance state
@@ -235,7 +293,7 @@ class Task3(Node):
             10
         )
 
-        # Local path (not used yet, reserved)
+        # Local path (RRT* detours)
         self.local_path_pub = self.create_publisher(
             Path,
             self._ns_topic('local_plan'),
@@ -304,7 +362,7 @@ class Task3(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task3 node initialized (Layers 0–5).')
+        self.get_logger().info('Task3 node initialized (Layers 0–5 + RRT* local detours).')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -320,6 +378,7 @@ class Task3(Node):
     # Map loading utilities (Layer 1)
     # ----------------------------------------------------------------------
     def _load_map_from_yaml(self):
+        self.get_logger().info('[Layer 1] Attempting to load map from YAML...')
         try:
             pkg_share = get_package_share_directory('turtlebot3_gazebo')
         except Exception as e:
@@ -393,6 +452,7 @@ class Task3(Node):
         inflated = cv2.dilate(self.static_occupancy, kernel, iterations=1)
         self.inflated_occupancy = inflated
 
+        # Dynamic occupancy: all free initially
         self.dynamic_occupancy = np.zeros_like(self.static_occupancy, dtype=np.uint8)
 
         free_static_count = int((self.static_occupancy == 0).sum())
@@ -408,8 +468,66 @@ class Task3(Node):
             'Dynamic obstacle layer initialized.'
         )
 
+    # Dynamic obstacle layer update (from LaserScan, like Task2)
+    def update_dynamic_occupancy_from_scan(self):
+        if not self.map_loaded or self.latest_scan is None or self.current_pose is None:
+            return
+
+        self.get_logger().info(
+            '[Layer 3] Updating dynamic occupancy from LaserScan...',
+            throttle_duration_sec=2.0
+        )
+
+        self.dynamic_occupancy.fill(0)
+
+        pose = self.current_pose.pose.pose
+        rx = pose.position.x
+        ry = pose.position.y
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        scan = self.latest_scan
+        angle = scan.angle_min
+
+        for r in scan.ranges:
+            if math.isinf(r) or math.isnan(r):
+                angle += scan.angle_increment
+                continue
+            if r < scan.range_min or r > scan.range_max:
+                angle += scan.angle_increment
+                continue
+
+            lx = r * math.cos(angle)
+            ly = r * math.sin(angle)
+
+            wx = rx + math.cos(yaw) * lx - math.sin(yaw) * ly
+            wy = ry + math.sin(yaw) * lx + math.cos(yaw) * ly
+
+            idx = self.world_to_grid(wx, wy)
+            if idx is not None:
+                row, col = idx
+                self.dynamic_occupancy[row, col] = 1
+
+            angle += scan.angle_increment
+
+        if self.dynamic_inflation_kernel > 1:
+            k = max(1, int(self.dynamic_inflation_kernel))
+            kernel = np.ones((k, k), np.uint8)
+            cv2.dilate(
+                self.dynamic_occupancy,
+                kernel,
+                dst=self.dynamic_occupancy,
+                iterations=1
+            )
+
+        num_dyn = int(self.dynamic_occupancy.sum())
+        self.get_logger().info(
+            f'[Layer 3] Dynamic occupancy updated. Occupied cells ≈ {num_dyn}',
+            throttle_duration_sec=2.0
+        )
+
     def world_to_grid(self, x: float, y: float):
         if not self.map_loaded:
+            self.get_logger().warn('[Layer 1] world_to_grid called but map not loaded.')
             return None
 
         origin_x, origin_y, _ = self.map_origin
@@ -423,12 +541,17 @@ class Task3(Node):
         row = (self.map_height - 1) - index_from_bottom
 
         if row < 0 or row >= self.map_height or col < 0 or col >= self.map_width:
+            self.get_logger().debug(
+                f'[Layer 1] world_to_grid: ({x:.2f},{y:.2f}) -> out of bounds '
+                f'(row={row}, col={col}).'
+            )
             return None
 
         return row, col
 
     def grid_to_world(self, row: int, col: int):
         if not self.map_loaded:
+            self.get_logger().warn('[Layer 1] grid_to_world called but map not loaded.')
             return None
 
         origin_x, origin_y, _ = self.map_origin
@@ -472,6 +595,7 @@ class Task3(Node):
             self.get_logger().warn('[Layer 2] Occupancy grids not ready.')
             return None
 
+        self.get_logger().info('[Layer 2] Computing waypoint_free_mask...')
         free_static = (self.static_occupancy == 0)
         free_inflated = (self.inflated_occupancy == 0)
 
@@ -491,10 +615,6 @@ class Task3(Node):
         return waypoint_free
 
     def _generate_patrol_waypoints_from_map(self):
-        """
-        Use distance-transform maxima over waypoint_free_mask to generate
-        room-covering waypoints, then order them with NN + 2-opt.
-        """
         waypoint_free_mask = self._compute_waypoint_free_mask()
         if waypoint_free_mask is None or waypoint_free_mask.sum() == 0:
             self.get_logger().warn(
@@ -504,7 +624,6 @@ class Task3(Node):
             self.patrol_waypoints = []
             return
 
-        # --- Distance transform (in cells) ---
         dist = cv2.distanceTransform(waypoint_free_mask, cv2.DIST_L2, 3)
         min_dt = float(dist[waypoint_free_mask == 1].min()) if waypoint_free_mask.sum() > 0 else 0.0
         max_dt = float(dist.max())
@@ -513,7 +632,6 @@ class Task3(Node):
             f'min={min_dt:.2f}, max={max_dt:.2f}'
         )
 
-        # Ignore tiny pockets very close to walls (in cells)
         min_dist_cells = max(1, int(self.l2_min_dt_cells))
         candidate_mask = np.logical_and(
             waypoint_free_mask == 1,
@@ -525,13 +643,12 @@ class Task3(Node):
             f'{int(candidate_mask.sum())}'
         )
 
-        # --- Local maxima detection ---
         kernel = np.ones((3, 3), np.uint8)
         dist_dilated = cv2.dilate(dist, kernel)
 
         local_max_mask = np.logical_and(
             candidate_mask,
-            dist >= dist_dilated - 1e-6  # float tolerance
+            dist >= dist_dilated - 1e-6
         )
 
         ys, xs = np.where(local_max_mask)
@@ -544,7 +661,6 @@ class Task3(Node):
                 '[Layer 2] No local maxima found. Consider lowering l2_min_dt_cells.'
             )
 
-        # Convert to world coordinates
         raw_world_points = []
         for r, c in zip(ys, xs):
             world_xy = self.grid_to_world(int(r), int(c))
@@ -555,7 +671,6 @@ class Task3(Node):
             f'[Layer 2] Raw world waypoints from DT maxima: {len(raw_world_points)}'
         )
 
-        # Debug: log bounding box and extreme points of raw_world_points
         if raw_world_points:
             xs_w = [p[0] for p in raw_world_points]
             ys_w = [p[1] for p in raw_world_points]
@@ -583,7 +698,6 @@ class Task3(Node):
                 f'[Layer 2] Sample raw DT waypoints (first {sample_n}): {msg_pts}'
             )
 
-        # Prune near-duplicates in world space
         pruned_world_points = self._prune_waypoints_by_distance(
             raw_world_points, self.l2_prune_dist
         )
@@ -601,7 +715,6 @@ class Task3(Node):
             self.patrol_waypoints = []
             return
 
-        # Route ordering: nearest neighbor + 2-opt
         start_x = self.current_pose.pose.pose.position.x
         start_y = self.current_pose.pose.pose.position.y
         start_xy = (start_x, start_y)
@@ -619,7 +732,6 @@ class Task3(Node):
 
         self.patrol_waypoints = [pruned_world_points[i] for i in route_indices]
 
-        # Route length just for logging
         total_route_len = 0.0
         cur = start_xy
         for idx in route_indices:
@@ -640,6 +752,9 @@ class Task3(Node):
         )
 
     def _prune_waypoints_by_distance(self, points, d_min):
+        self.get_logger().info(
+            f'[Layer 2] Pruning waypoints by distance: d_min={d_min:.2f}, raw={len(points)}'
+        )
         pruned = []
         for (x, y) in points:
             keep = True
@@ -649,13 +764,19 @@ class Task3(Node):
                     break
             if keep:
                 pruned.append((x, y))
+
+        self.get_logger().info(
+            f'[Layer 2] Prune complete. Kept {len(pruned)} waypoints.'
+        )
         return pruned
 
     def _nearest_neighbor_route(self, points, start_xy):
         n = len(points)
         if n == 0:
+            self.get_logger().warn('[Layer 2] _nearest_neighbor_route: no points.')
             return []
 
+        self.get_logger().info(f'[Layer 2] Running nearest neighbor route for {n} points...')
         unvisited = set(range(n))
         route = []
         cur_xy = start_xy
@@ -673,9 +794,16 @@ class Task3(Node):
             unvisited.remove(best_idx)
             cur_xy = points[best_idx]
 
+        self.get_logger().info(
+            f'[Layer 2] Nearest neighbor route built. Route length={len(route)}.'
+        )
         return route
 
     def _two_opt_improvement(self, points, route, max_iters):
+        self.get_logger().info(
+            f'[Layer 2] Starting 2-opt improvement with max_iters={max_iters}...'
+        )
+
         def route_length(rt):
             length = 0.0
             for i in range(len(rt) - 1):
@@ -710,14 +838,19 @@ class Task3(Node):
 
         self.get_logger().info(
             f'[Layer 2] 2-opt finished after {it} iterations. '
-            f'Route length over points ≈ {best_length:.2f}'
+            f'Improved route length ≈ {best_length:.2f}'
         )
 
         return best_route
 
     def _publish_waypoints_path(self, waypoints):
         if not waypoints:
+            self.get_logger().info('[Layer 2] No waypoints to publish as Path.')
             return
+
+        self.get_logger().info(
+            f'[Layer 2] Publishing patrol_path Path with {len(waypoints)} poses.'
+        )
 
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
@@ -736,7 +869,12 @@ class Task3(Node):
 
     def _publish_waypoints_markers(self, waypoints):
         if not waypoints:
+            self.get_logger().info('[Layer 2] No waypoints to publish as markers.')
             return
+
+        self.get_logger().info(
+            f'[Layer 2] Publishing {len(waypoints)} patrol_waypoints markers.'
+        )
 
         ma = MarkerArray()
         now = self.get_clock().now().to_msg()
@@ -766,7 +904,7 @@ class Task3(Node):
         self.patrol_markers_pub.publish(ma)
 
     # ----------------------------------------------------------------------
-    # Layer 3: Navigation core (A* + path follower + avoidance)
+    # Layer 3: Navigation core (A* + RRT* + path follower + avoidance)
     # ----------------------------------------------------------------------
     @staticmethod
     def _quat_to_yaw(q):
@@ -787,6 +925,10 @@ class Task3(Node):
         return angle
 
     def _is_cell_free(self, row: int, col: int) -> bool:
+        """
+        Check if a cell is free considering both inflated static map
+        and dynamic obstacles (like Task2.is_cell_free).
+        """
         if (
             row < 0 or row >= self.map_height or
             col < 0 or col >= self.map_width
@@ -796,12 +938,27 @@ class Task3(Node):
         if self.inflated_occupancy[row, col] != 0:
             return False
 
+        if self.dynamic_occupancy is not None and self.dynamic_occupancy[row, col] != 0:
+            return False
+
+        return True
+
+    def is_cell_free_rrt(self, row: int, col: int) -> bool:
+        k = max(0, int(self.rrt_clearance_cells))
+        for r in range(row - k, row + k + 1):
+            for c in range(col - k, col + k + 1):
+                if not self._is_cell_free(r, c):
+                    return False
         return True
 
     def astar_plan(self, start_world, goal_world):
         if not self.map_loaded:
             self.get_logger().error('[Layer 3] Cannot run A*: map not loaded.')
             return None
+
+        self.get_logger().info(
+            f'[Layer 3] A*: planning from {start_world} to {goal_world}...'
+        )
 
         start_idx = self.world_to_grid(start_world[0], start_world[1])
         goal_idx = self.world_to_grid(goal_world[0], goal_world[1])
@@ -813,8 +970,14 @@ class Task3(Node):
         s_row, s_col = start_idx
         g_row, g_col = goal_idx
 
+        if not self._is_cell_free(s_row, s_col):
+            self.get_logger().warn(
+                '[Layer 3] Start cell is occupied (static/dynamic); '
+                'continuing A* planning anyway.'
+            )
+
         if not self._is_cell_free(g_row, g_col):
-            self.get_logger().warn('[Layer 3] Goal cell is not free in inflated map.')
+            self.get_logger().warn('[Layer 3] Goal cell is not free in inflated/dynamic map.')
             return None
 
         neighbors = [
@@ -850,7 +1013,12 @@ class Task3(Node):
                 continue
 
             if (cur_row, cur_col) == (g_row, g_col):
-                return self._reconstruct_path(came_from, (cur_row, cur_col))
+                path = self._reconstruct_path(came_from, (cur_row, cur_col))
+                self.get_logger().info(
+                    f'[Layer 3] A*: SUCCESS in {iterations} iterations. '
+                    f'Path len={len(path)}.'
+                )
+                return path
 
             closed_set.add((cur_row, cur_col))
 
@@ -925,11 +1093,247 @@ class Task3(Node):
 
         return best_idx, best_dist2
 
+    def _is_waypoint_blocked(self, x, y) -> bool:
+        idx = self.world_to_grid(x, y)
+        if idx is None:
+            self.get_logger().debug(
+                f'[Layer 3] _is_waypoint_blocked: ({x:.2f},{y:.2f}) outside map -> blocked.'
+            )
+            return True
+        row, col = idx
+        blocked = not self._is_cell_free(row, col)
+        if blocked:
+            self.get_logger().debug(
+                f'[Layer 3] _is_waypoint_blocked: cell ({row},{col}) is not free.'
+            )
+        return blocked
+
+    def _check_path_blocked_ahead(self):
+        """
+        Check if the active path is blocked within a lookahead window.
+        """
+        if not self.active_path_points or self.current_pose is None:
+            return False, None, None
+
+        rx = self.current_pose.pose.pose.position.x
+        ry = self.current_pose.pose.pose.position.y
+
+        nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
+        if nearest_idx is None:
+            return False, None, None
+
+        max_idx = min(
+            nearest_idx + self.block_check_lookahead_points,
+            len(self.active_path_points) - 1
+        )
+
+        blocked_run = False
+        first_blocked_idx = None
+        last_blocked_idx = None
+
+        for i in range(nearest_idx, max_idx + 1):
+            x, y = self.active_path_points[i]
+            if self._is_waypoint_blocked(x, y):
+                if not blocked_run:
+                    blocked_run = True
+                    first_blocked_idx = i
+                last_blocked_idx = i
+            else:
+                if blocked_run:
+                    break
+
+        if not blocked_run:
+            return False, nearest_idx, max_idx
+
+        reconnect_idx = last_blocked_idx + 1
+
+        while reconnect_idx < len(self.active_path_points):
+            x, y = self.active_path_points[reconnect_idx]
+            if not self._is_waypoint_blocked(x, y):
+                break
+            reconnect_idx += 1
+
+        reconnect_idx = min(reconnect_idx, len(self.active_path_points) - 1)
+
+        self.get_logger().info(
+            f'[Layer 3] Path blocked detected: nearest_idx={nearest_idx}, '
+            f'first_blocked_idx={first_blocked_idx}, last_blocked_idx={last_blocked_idx}, '
+            f'reconnect_idx={reconnect_idx}'
+        )
+
+        return True, nearest_idx, reconnect_idx
+
+    # ----------------------------------------------------------------------
+    # RRT* helpers
+    # ----------------------------------------------------------------------
+    class _RRTNode:
+        __slots__ = ('x', 'y', 'parent', 'cost')
+
+        def __init__(self, x, y, parent=None, cost=0.0):
+            self.x = x
+            self.y = y
+            self.parent = parent
+            self.cost = cost
+
+    def _segment_collision_free(self, x1, y1, x2, y2) -> bool:
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.hypot(dx, dy)
+        if dist == 0.0:
+            idx = self.world_to_grid(x1, y1)
+            if idx is None:
+                return False
+            r, c = idx
+            return self.is_cell_free_rrt(r, c)
+
+        step = max(self.map_resolution * 0.5, 0.01)
+        n_steps = max(int(dist / step), 1)
+
+        for i in range(n_steps + 1):
+            t = i / float(n_steps)
+            x = x1 + t * dx
+            y = y1 + t * dy
+            idx = self.world_to_grid(x, y)
+            if idx is None:
+                return False
+            r, c = idx
+            if not self.is_cell_free_rrt(r, c):
+                return False
+
+        return True
+
+    def _rrt_sample(self, center_x, center_y, goal_x, goal_y):
+        if random.random() < self.rrt_goal_sample_rate:
+            return goal_x, goal_y
+
+        for _ in range(100):
+            dx = (random.random() * 2.0 - 1.0) * self.rrt_local_range
+            dy = (random.random() * 2.0 - 1.0) * self.rrt_local_range
+            x = center_x + dx
+            y = center_y + dy
+
+            idx = self.world_to_grid(x, y)
+            if idx is None:
+                continue
+            r, c = idx
+            if self._is_cell_free(r, c):
+                return x, y
+
+        return goal_x, goal_y
+
+    def _rrt_nearest(self, nodes, x, y):
+        best_node = None
+        best_dist2 = float('inf')
+        for node in nodes:
+            dx = node.x - x
+            dy = node.y - y
+            d2 = dx * dx + dy * dy
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_node = node
+        return best_node
+
+    def _rrt_steer(self, from_node, x, y):
+        dx = x - from_node.x
+        dy = y - from_node.y
+        dist = math.hypot(dx, dy)
+        if dist <= self.rrt_step_size:
+            return x, y
+
+        scale = self.rrt_step_size / dist
+        return from_node.x + dx * scale, from_node.y + dy * scale
+
+    def _rrt_neighbors(self, nodes, new_node):
+        neighbors = []
+        radius2 = self.rrt_neighbor_radius * self.rrt_neighbor_radius
+        for node in nodes:
+            dx = node.x - new_node.x
+            dy = node.y - new_node.y
+            if dx * dx + dy * dy <= radius2:
+                neighbors.append(node)
+        return neighbors
+
+    def plan_rrt_star(self, start_xy, goal_xy, center_xy):
+        sx, sy = start_xy
+        gx, gy = goal_xy
+        cx, cy = center_xy
+
+        self.get_logger().info(
+            f'[Layer 3] RRT*: start={start_xy}, goal={goal_xy}, center={center_xy}, '
+            f'max_iter={self.rrt_max_iterations}'
+        )
+
+        start_node = self._RRTNode(sx, sy, parent=None, cost=0.0)
+        nodes = [start_node]
+        goal_node = None
+
+        for it in range(self.rrt_max_iterations):
+            if it % 200 == 0 and it > 0:
+                self.get_logger().info(
+                    f'[Layer 3] RRT*: iteration {it}, nodes={len(nodes)}'
+                )
+
+            sample_x, sample_y = self._rrt_sample(cx, cy, gx, gy)
+
+            nearest = self._rrt_nearest(nodes, sample_x, sample_y)
+            if nearest is None:
+                continue
+
+            new_x, new_y = self._rrt_steer(nearest, sample_x, sample_y)
+
+            if not self._segment_collision_free(nearest.x, nearest.y, new_x, new_y):
+                continue
+
+            new_node = self._RRTNode(new_x, new_y, parent=None, cost=float('inf'))
+
+            neighbors = self._rrt_neighbors(nodes, new_node)
+            best_parent = nearest
+            best_cost = nearest.cost + math.hypot(nearest.x - new_x, nearest.y - new_y)
+
+            for nb in neighbors:
+                d = math.hypot(nb.x - new_x, nb.y - new_y)
+                if nb.cost + d < best_cost and self._segment_collision_free(nb.x, nb.y, new_x, new_y):
+                    best_parent = nb
+                    best_cost = nb.cost + d
+
+            new_node.parent = best_parent
+            new_node.cost = best_cost
+            nodes.append(new_node)
+
+            for nb in neighbors:
+                d = math.hypot(nb.x - new_node.x, nb.y - new_node.y)
+                if new_node.cost + d < nb.cost and self._segment_collision_free(new_node.x, new_node.y, nb.x, nb.y):
+                    nb.parent = new_node
+                    nb.cost = new_node.cost + d
+
+            dist_to_goal = math.hypot(new_node.x - gx, new_node.y - gy)
+            if dist_to_goal <= self.rrt_step_size * 2.0:
+                if self._segment_collision_free(new_node.x, new_node.y, gx, gy):
+                    goal_node = self._RRTNode(
+                        gx, gy,
+                        parent=new_node,
+                        cost=new_node.cost + dist_to_goal
+                    )
+                    self.get_logger().info(
+                        f'[Layer 3] RRT*: reached goal at iteration {it}, nodes={len(nodes)}.'
+                    )
+                    break
+
+        if goal_node is None:
+            self.get_logger().warn('[Layer 3] RRT*: failed to find a local path.')
+            return None
+
+        path = []
+        node = goal_node
+        while node is not None:
+            path.append((node.x, node.y))
+            node = node.parent
+        path.reverse()
+
+        self.get_logger().info(f'[Layer 3] RRT*: local path length = {len(path)} waypoints.')
+        return path
+
     def _obstacle_too_close_ahead(self, max_distance=0.5, fov_deg=40.0):
-        """
-        Simple safety check: returns True if there is an obstacle closer than
-        max_distance within +/- fov_deg around the robot's heading.
-        """
         if self.latest_scan is None:
             return False
 
@@ -942,16 +1346,16 @@ class Task3(Node):
                 angle += scan.angle_increment
                 continue
             if abs(angle) <= half_fov and scan.range_min < r < max_distance:
+                self.get_logger().info(
+                    f'[Layer 3] Obstacle too close ahead: range={r:.2f} m, '
+                    f'threshold={max_distance:.2f} m.'
+                )
                 return True
             angle += scan.angle_increment
 
         return False
 
-    # Sector scan helper for arbitrary center (radians)
     def _scan_min_in_sector_rad(self, center_rad: float, width_rad: float) -> float:
-        """
-        Return minimum valid LaserScan range in sector [center - width/2, center + width/2].
-        """
         if self.latest_scan is None:
             return float('inf')
 
@@ -976,35 +1380,25 @@ class Task3(Node):
         return min_r
 
     def _scan_min_in_sector(self, center_deg: float, width_deg: float) -> float:
-        """
-        Deg version (used by avoidance logic).
-        """
         center = math.radians(center_deg)
         width = math.radians(width_deg)
         return self._scan_min_in_sector_rad(center, width)
 
     def _choose_avoidance_direction(self) -> str:
-        """
-        Choose LEFT or RIGHT based on which side has more clearance.
-        """
-        left_min = self._scan_min_in_sector(90.0, 80.0)     # sector on the left
-        right_min = self._scan_min_in_sector(-90.0, 80.0)   # sector on the right
+        left_min = self._scan_min_in_sector(90.0, 80.0)
+        right_min = self._scan_min_in_sector(-90.0, 80.0)
 
         self.get_logger().info(
             f'[Layer 3] AVOID_OBSTACLE: sector min ranges -> '
             f'left={left_min:.2f}, right={right_min:.2f}'
         )
 
-        # Bigger min range = more open
         if left_min >= right_min:
             return 'LEFT'
         else:
             return 'RIGHT'
 
     def _start_avoidance(self):
-        """
-        Initialize the reactive avoidance maneuver.
-        """
         self.avoidance_direction = self._choose_avoidance_direction()
         self.avoidance_phase = 'BACK'
         self.avoidance_phase_start_time = self.get_clock().now()
@@ -1015,12 +1409,7 @@ class Task3(Node):
         )
 
     def _handle_avoid_obstacle(self):
-        """
-        State machine for AVOID_OBSTACLE:
-        BACK -> TURN -> FORWARD -> PLAN_TO_WAYPOINT
-        """
         if self.avoidance_phase is None:
-            # Should not happen, but be robust
             self._start_avoidance()
 
         now = self.get_clock().now()
@@ -1063,7 +1452,6 @@ class Task3(Node):
                 self.cmd_vel_pub.publish(twist)
                 return
             else:
-                # Maneuver complete: stop and replan globally
                 self._publish_stop()
 
                 self.avoidance_phase = None
@@ -1075,15 +1463,10 @@ class Task3(Node):
                     'Switching to PLAN_TO_WAYPOINT for replanning.'
                 )
 
-                # Replan from current pose to the SAME waypoint
                 self.state = 'PLAN_TO_WAYPOINT'
                 return
 
     def _follow_active_path(self):
-        """
-        Pure-pursuit-style controller.
-        Returns True when final goal is reached.
-        """
         if self.current_pose is None or not self.active_path_points:
             self._publish_stop()
             return False
@@ -1111,7 +1494,6 @@ class Task3(Node):
 
         self.current_path_index = nearest_idx
 
-        # lookahead target
         target_idx = nearest_idx
         while target_idx < len(self.active_path_points) - 1:
             tx, ty = self.active_path_points[target_idx]
@@ -1138,7 +1520,6 @@ class Task3(Node):
         heading_factor = max(0.0, 1.0 - abs(heading_error) / math.pi)
         linear_speed = self.max_linear_vel * heading_factor
 
-        # extra damping near goal
         if dist_to_goal < 0.5:
             linear_speed *= dist_to_goal / 0.5
 
@@ -1154,7 +1535,7 @@ class Task3(Node):
         self.cmd_vel_pub.publish(twist)
 
         self.get_logger().info(
-            f'[Layer 3] FOLLOW_PATH: target_idx={target_idx}, '
+            f'[Layer 3] FOLLOW_PATH: idx={self.current_path_index}->{target_idx}, '
             f'd_target={dist_to_target:.2f}, d_goal={dist_to_goal:.2f}, '
             f'v={linear_speed:.2f}, w={angular_speed:.2f}',
             throttle_duration_sec=0.5
@@ -1163,9 +1544,6 @@ class Task3(Node):
         return False
 
     def _choose_next_waypoint_index(self):
-        """
-        Choose next waypoint as nearest unvisited to current pose.
-        """
         if not self.patrol_waypoints or self.current_pose is None:
             return None
 
@@ -1183,6 +1561,14 @@ class Task3(Node):
                 best_dist = d
                 best_idx = i
 
+        if best_idx is not None:
+            self.get_logger().info(
+                f'[Layer 3] _choose_next_waypoint_index: chose #{best_idx} '
+                f'at dist={best_dist:.2f} m.'
+            )
+        else:
+            self.get_logger().info('[Layer 3] _choose_next_waypoint_index: no unvisited waypoints.')
+
         return best_idx
 
     # ----------------------------------------------------------------------
@@ -1197,20 +1583,17 @@ class Task3(Node):
             return None
 
     def _detect_balls_in_image(self, frame):
-        """
-        Detect red, green, blue balls using HSV thresholds.
-        Updates:
-            - self.ball_pixel_obs[color] = (cx, cy)
-            - self.ball_world_est[color] if localization succeeds
-        """
         if frame is None:
             return
+
+        self.get_logger().info(
+            '[Layer 4] Running ball detection on new camera frame...',
+            throttle_duration_sec=0.5
+        )
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w, _ = frame.shape
 
-        # HSV ranges (tuned for bright colored balls; may need adjustment)
-        # Red is split into two ranges around hue wrap-around
         color_ranges = {
             'red': [
                 ((0, 100, 80), (10, 255, 255)),
@@ -1230,7 +1613,6 @@ class Task3(Node):
             if color not in color_ranges:
                 continue
 
-            # Build mask for this color
             masks = []
             for (lower, upper) in color_ranges[color]:
                 lower_np = np.array(lower, dtype=np.uint8)
@@ -1241,27 +1623,31 @@ class Task3(Node):
             for extra in masks[1:]:
                 mask = cv2.bitwise_or(mask, extra)
 
-            # Morphological cleanup
             kernel = np.ones((5, 5), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-            # Contours
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
+                self.get_logger().debug(f'[Layer 4] No contours found for color {color}.')
                 continue
 
-            # Largest blob
             largest = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest)
+            self.get_logger().debug(
+                f'[Layer 4] Color {color}: largest contour area={area:.1f} px.'
+            )
             if area < self.ball_min_contour_area:
+                self.get_logger().debug(
+                    f'[Layer 4] Color {color}: contour area {area:.1f} < '
+                    f'min_area={self.ball_min_contour_area}. Ignoring.'
+                )
                 continue
 
             (x, y, rw, rh) = cv2.boundingRect(largest)
             cx = int(x + rw / 2)
             cy = int(y + rh / 2)
 
-            # Visual overlay
             color_bgr = {
                 'red': (0, 0, 255),
                 'green': (0, 255, 0),
@@ -1281,9 +1667,13 @@ class Task3(Node):
                 cv2.LINE_AA,
             )
 
+            self.get_logger().info(
+                f'[Layer 4] Detected {color} blob: bbox=({x},{y},{rw},{rh}), '
+                f'centroid=({cx},{cy}).'
+            )
+
             self.ball_pixel_obs[color] = (cx, cy)
 
-            # Try to localize this ball in world coordinates
             world_xy = self._localize_ball_from_pixel(color, cx, cy, w, h)
             if world_xy is not None:
                 wx, wy = world_xy
@@ -1292,46 +1682,45 @@ class Task3(Node):
                 self.get_logger().info(
                     f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).'
                 )
+            else:
+                self.get_logger().info(
+                    f'[Layer 5] Failed to localize {color} ball from pixel observation.'
+                )
 
-        # Show debug frame if enabled
         if self.show_debug_image:
             cv2.imshow('task3_camera_debug', debug_frame)
             key = cv2.waitKey(1) & 0xFF
-            # Press 'q' in the window to turn off debug display
             if key == ord('q'):
                 self.show_debug_image = False
                 cv2.destroyWindow('task3_camera_debug')
+                self.get_logger().info('[Layer 4] Disabled OpenCV debug window via keyboard.')
 
     def _localize_ball_from_pixel(self, color, cx, cy, img_width, img_height):
-        """
-        Combine:
-        - camera pixel (cx) -> bearing angle (camera frame)
-        - LaserScan -> range at that bearing
-        - AMCL pose -> map/world coordinates
-
-        Returns (wx, wy) or None if localization failed.
-        """
         if self.latest_scan is None or self.current_pose is None:
-            return None
-
-        # Bearing from pixel
-        img_cx = img_width / 2.0
-        fov_rad = math.radians(self.camera_h_fov_deg)
-
-        # Normalized offset in [-1, 1]
-        pixel_offset = (cx - img_cx) / img_cx
-        bearing_cam = pixel_offset * (fov_rad / 2.0)
-
-        # Query LaserScan near that bearing
-        range_window_rad = math.radians(10.0)  # +/- 5 deg sector
-        r = self._scan_min_in_sector_rad(bearing_cam, range_window_rad)
-        if math.isinf(r) or r <= 0.0:
-            self.get_logger().info(
-                f'[Layer 5] No valid scan range for {color} ball (bearing_cam={bearing_cam:.2f} rad).'
+            self.get_logger().debug(
+                f'[Layer 5] _localize_ball_from_pixel: no scan/pose yet for color={color}.'
             )
             return None
 
-        # Ball position in robot frame (assuming camera aligned with scan frame)
+        img_cx = img_width / 2.0
+        fov_rad = math.radians(self.camera_h_fov_deg)
+
+        pixel_offset = (cx - img_cx) / img_cx
+        bearing_cam = pixel_offset * (fov_rad / 2.0)
+
+        self.get_logger().debug(
+            f'[Layer 5] Color={color}, pixel_x={cx}, img_cx={img_cx:.1f}, '
+            f'bearing_cam={bearing_cam:.3f} rad.'
+        )
+
+        range_window_rad = math.radians(10.0)
+        r = self._scan_min_in_sector_rad(bearing_cam, range_window_rad)
+        if math.isinf(r) or r <= 0.0:
+            self.get_logger().info(
+                f'[Layer 5] No valid scan range for {color} ball (bearing={bearing_cam:.2f} rad).'
+            )
+            return None
+
         lx = r * math.cos(bearing_cam)
         ly = r * math.sin(bearing_cam)
 
@@ -1340,11 +1729,14 @@ class Task3(Node):
         ry = pose.position.y
         yaw = self._quat_to_yaw(pose.orientation)
 
-        # Transform to world (map) frame
         wx = rx + math.cos(yaw) * lx - math.sin(yaw) * ly
         wy = ry + math.sin(yaw) * lx + math.cos(yaw) * ly
 
-        # Optional: sanity-check against map bounds
+        self.get_logger().debug(
+            f'[Layer 5] Color={color}: range={r:.2f} m, robot=({rx:.2f},{ry:.2f}), '
+            f'yaw={yaw:.2f} rad -> world=({wx:.2f},{wy:.2f}).'
+        )
+
         idx = self.world_to_grid(wx, wy)
         if idx is None:
             self.get_logger().info(
@@ -1357,7 +1749,7 @@ class Task3(Node):
         if not self._is_cell_free(row, col):
             self.get_logger().info(
                 f'[Layer 5] Localized {color} ball in occupied cell ({row},{col}), '
-                f'candidate=({wx:.2f}, {wy:.2f}). Keeping anyway but note it may be near wall.'
+                f'candidate=({wx:.2f}, {wy:.2f}). Using but note proximity to obstacle.'
             )
 
         return wx, wy
@@ -1366,9 +1758,6 @@ class Task3(Node):
     # Layer 5: Ball markers & completion
     # ----------------------------------------------------------------------
     def _publish_ball_markers(self):
-        """
-        Publish MarkerArray for localized balls (red, green, blue).
-        """
         ma = MarkerArray()
         now = self.get_clock().now().to_msg()
 
@@ -1410,25 +1799,27 @@ class Task3(Node):
             ma.markers.append(m)
 
         if ma.markers:
+            self.get_logger().info(
+                f'[Layer 5] Publishing {len(ma.markers)} ball markers.'
+            )
             self.ball_markers_pub.publish(ma)
+        else:
+            self.get_logger().debug('[Layer 5] No ball markers to publish.')
 
     def _publish_balls_posearray_and_time(self):
-        """
-        Publish PoseArray for all detected balls and a Float32 completion time.
-        Called once when all three balls are localized.
-        """
         if not all(self.detected_balls.values()):
             return
 
-        # PoseArray
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
         pa.header.frame_id = 'map'
 
-        # Order: red, green, blue
         for color in self.ball_colors:
             wx, wy = self.ball_world_est.get(color, (None, None))
             if wx is None or wy is None:
+                self.get_logger().warn(
+                    f'[Layer 5] Ball {color} marked detected but no world_est. Skipping in PoseArray.'
+                )
                 continue
             p = Pose()
             p.position.x = wx
@@ -1437,9 +1828,11 @@ class Task3(Node):
             p.orientation.w = 1.0
             pa.poses.append(p)
 
+        self.get_logger().info(
+            f'[Layer 5] Publishing PoseArray with {len(pa.poses)} ball poses.'
+        )
         self.balls_posearray_pub.publish(pa)
 
-        # Completion time
         if self.task_start_time is not None:
             now = self.get_clock().now()
             dt = now - self.task_start_time
@@ -1449,17 +1842,15 @@ class Task3(Node):
             self.task_time_pub.publish(msg)
             self.get_logger().info(
                 f'[Layer 5] TASK COMPLETE: all balls localized. '
-                f'Elapsed time ≈ {elapsed_seconds:.2f} s (published on task3_completion_time).'
+                f'Elapsed time ≈ {elapsed_seconds:.2f} s '
+                f'(published on task3_completion_time).'
             )
         else:
-            self.get_logger().info(
+            self.get_logger().warn(
                 '[Layer 5] TASK COMPLETE: all balls localized, but task_start_time was None.'
             )
 
     def _maybe_finish_task_if_balls_found(self):
-        """
-        If all balls are found, publish markers & PoseArray and switch to TASK_DONE.
-        """
         if not all(self.detected_balls.values()):
             return
 
@@ -1486,25 +1877,135 @@ class Task3(Node):
 
     def scan_callback(self, msg: LaserScan):
         self.latest_scan = msg
+        self.get_logger().debug(
+            '[Layer 3] New LaserScan received.',
+        )
+        self.update_dynamic_occupancy_from_scan()
 
     def image_callback(self, msg: Image):
         self.latest_image = msg
+        self.get_logger().debug(
+            '[Layer 4] New camera image received.',
+        )
         frame = self._image_to_cv2(msg)
         if frame is not None:
             self._detect_balls_in_image(frame)
-            # Update ball markers continuously (useful before full completion)
             self._publish_ball_markers()
+
+    # ----------------------------------------------------------------------
+    # Local replanning handler (RRT* detour)
+    # ----------------------------------------------------------------------
+    def _handle_replan_local(self):
+        self.get_logger().info('[Layer 3] Handling REPLAN_LOCAL (RRT* detour)...')
+
+        if (
+            self.current_pose is None or
+            not self.active_path_points or
+            self.local_replan_start_index is None or
+            self.local_replan_goal_index is None
+        ):
+            self.get_logger().warn(
+                '[Layer 3] REPLAN_LOCAL: missing data for replanning. '
+                'Returning to FOLLOW_PATH.'
+            )
+            self.state = 'FOLLOW_PATH'
+            return
+
+        start_idx = max(0, min(self.local_replan_start_index, len(self.active_path_points) - 1))
+        goal_idx = max(0, min(self.local_replan_goal_index, len(self.active_path_points) - 1))
+
+        if start_idx >= goal_idx:
+            self.get_logger().warn(
+                f'[Layer 3] REPLAN_LOCAL: invalid indices start={start_idx}, goal={goal_idx}. '
+                'Returning to FOLLOW_PATH.'
+            )
+            self.state = 'FOLLOW_PATH'
+            return
+
+        rx = self.current_pose.pose.pose.position.x
+        ry = self.current_pose.pose.pose.position.y
+        start_xy = (rx, ry)
+
+        goal_xy = self.active_path_points[goal_idx]
+        center_xy = (rx, ry)
+
+        start_idx_cell = self.world_to_grid(start_xy[0], start_xy[1])
+        goal_idx_cell = self.world_to_grid(goal_xy[0], goal_xy[1])
+        if start_idx_cell is not None:
+            sr, sc = start_idx_cell
+            self.get_logger().info(
+                f'[Layer 3] REPLAN_LOCAL: start cell ({sr},{sc}) free={self._is_cell_free(sr, sc)}'
+            )
+        else:
+            self.get_logger().info('[Layer 3] REPLAN_LOCAL: start cell is outside map.')
+
+        if goal_idx_cell is not None:
+            gr, gc = goal_idx_cell
+            self.get_logger().info(
+                f'[Layer 3] REPLAN_LOCAL: goal cell ({gr},{gc}) free={self._is_cell_free(gr, gc)}'
+            )
+        else:
+            self.get_logger().info('[Layer 3] REPLAN_LOCAL: goal cell is outside map.')
+
+        self.get_logger().info(
+            f'[Layer 3] REPLAN_LOCAL: running RRT* from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) '
+            f'to ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
+            f'with local_range={self.rrt_local_range:.2f}.'
+        )
+
+        local_path = self.plan_rrt_star(start_xy, goal_xy, center_xy)
+
+        if local_path is None or len(local_path) < 2:
+            self.rrt_fail_count += 1
+            self.get_logger().warn(
+                f'[Layer 3] REPLAN_LOCAL: RRT* failed or local path too short '
+                f'(fail_count={self.rrt_fail_count}). '
+                'Falling back to PLAN_TO_WAYPOINT.'
+            )
+            self.state = 'PLAN_TO_WAYPOINT'
+            return
+
+        self.rrt_fail_count = 0
+
+        self.get_logger().info(
+            f'[Layer 3] REPLAN_LOCAL: RRT* produced path with {len(local_path)} points.'
+        )
+        local_path_msg = self.build_path_msg(local_path)
+        self.local_path_pub.publish(local_path_msg)
+
+        prefix = self.active_path_points[:start_idx]
+        suffix = self.active_path_points[goal_idx + 1:]
+
+        if math.hypot(local_path[-1][0] - goal_xy[0], local_path[-1][1] - goal_xy[1]) < 0.1:
+            local_splice = local_path
+        else:
+            local_splice = local_path + [goal_xy]
+
+        new_active = prefix + local_splice + suffix
+        self.active_path_points = new_active
+
+        self.current_path_index = 0
+        self.local_replan_start_index = None
+        self.local_replan_goal_index = None
+
+        self.get_logger().info(
+            f'[Layer 3] REPLAN_LOCAL: local detour spliced into active path. '
+            f'New active path length = {len(self.active_path_points)}. '
+            'Returning to FOLLOW_PATH.'
+        )
+
+        self.state = 'FOLLOW_PATH'
 
     # ----------------------------------------------------------------------
     # Timer callback / state machine
     # ----------------------------------------------------------------------
     def timer_cb(self):
         self.get_logger().info(
-            f'[Layer 0-5] State = {self.state}, '
+            f'[Layer 0-5] State={self.state}, '
             f'map_loaded={self.map_loaded}, '
-            f'pose_received={self.current_pose is not None}, '
-            f'scan_received={self.latest_scan is not None}, '
-            f'image_received={self.latest_image is not None}, '
+            f'pose={self.current_pose is not None}, '
+            f'scan={self.latest_scan is not None}, '
+            f'image={self.latest_image is not None}, '
             f'waypoints_generated={self.waypoints_generated}, '
             f'visited={len(self.visited_waypoints)}/{len(self.patrol_waypoints)}, '
             f'balls_detected={sum(self.detected_balls.values())}/3',
@@ -1515,23 +2016,19 @@ class Task3(Node):
             self._publish_stop()
             return
 
-        # Ensure Layer 2 waypoints exist
         self._generate_patrol_waypoints_if_needed()
 
         if not self.patrol_waypoints:
+            self.get_logger().warn('[Layer 3] No patrol_waypoints available. Stopping.')
             self._publish_stop()
             return
 
-        # Check for task completion (Layer 5)
         self._maybe_finish_task_if_balls_found()
         if self.state == 'TASK_DONE':
-            # Nothing else to do
             return
 
         if self.state == 'WAIT_FOR_POSE':
-            # We have pose and waypoints now
             self.state = 'SELECT_NEXT_WAYPOINT'
-            # Start timing when we actually start patrolling
             if self.task_start_time is None:
                 self.task_start_time = self.get_clock().now()
                 self.get_logger().info('[Layer 5] Task timer started.')
@@ -1544,7 +2041,6 @@ class Task3(Node):
                 self.state = 'PATROL_DONE'
                 self._publish_stop()
                 self.get_logger().info('[Layer 3] All waypoints visited. PATROL_DONE.')
-                # Even if patrol done, maybe balls are already found; check once more
                 self._maybe_finish_task_if_balls_found()
                 return
 
@@ -1562,8 +2058,8 @@ class Task3(Node):
             ry = self.current_pose.pose.pose.position.y
 
             self.get_logger().info(
-                f'[Layer 3] Planning A* from ({rx:.2f}, {ry:.2f}) to '
-                f'waypoint #{self.current_waypoint_idx} = ({wx:.2f}, {wy:.2f})'
+                f'[Layer 3] PLAN_TO_WAYPOINT: A* from ({rx:.2f}, {ry:.2f}) '
+                f'to waypoint #{self.current_waypoint_idx} = ({wx:.2f}, {wy:.2f})'
             )
 
             path_world = self.astar_plan((rx, ry), (wx, wy))
@@ -1592,13 +2088,24 @@ class Task3(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            # If something is too close, enter reactive avoidance rather than freezing
             if self._obstacle_too_close_ahead(max_distance=self.obstacle_avoid_distance):
                 self.get_logger().warn(
-                    '[Layer 3] Obstacle too close ahead. Entering AVOID_OBSTACLE.'
+                    '[Layer 3] FOLLOW_PATH: obstacle too close ahead. Entering AVOID_OBSTACLE.'
                 )
                 self._start_avoidance()
                 self.state = 'AVOID_OBSTACLE'
+                return
+
+            blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
+            if blocked:
+                self.local_replan_start_index = start_idx
+                self.local_replan_goal_index = goal_idx
+                self.get_logger().info(
+                    f'[Layer 3] FOLLOW_PATH: path blocked. Triggering REPLAN_LOCAL '
+                    f'from index {start_idx} to {goal_idx}.'
+                )
+                self._publish_stop()
+                self.state = 'REPLAN_LOCAL'
                 return
 
             reached = self._follow_active_path()
@@ -1611,15 +2118,16 @@ class Task3(Node):
                 self.state = 'SELECT_NEXT_WAYPOINT'
             return
 
+        if self.state == 'REPLAN_LOCAL':
+            self._handle_replan_local()
+            return
+
         if self.state == 'AVOID_OBSTACLE':
             self._handle_avoid_obstacle()
             return
 
         if self.state == 'PATROL_DONE':
-            # Patrol finished, but maybe still missing balls -> keep camera + localization running;
-            # you could optionally re-plan, but for now just stop and rely on previous detections.
             self._publish_stop()
-            # One more completion check
             self._maybe_finish_task_if_balls_found()
             return
 
@@ -1635,11 +2143,11 @@ class Task3(Node):
         self.cmd_vel_pub.publish(twist)
 
     def destroy_node(self):
-        # Ensure OpenCV windows are closed when node shuts down
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
+        self.get_logger().info('[Layer 0] Shutting down Task3 node and closing OpenCV windows.')
         super().destroy_node()
 
 
