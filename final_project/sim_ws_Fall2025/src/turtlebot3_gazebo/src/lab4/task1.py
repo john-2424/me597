@@ -203,19 +203,19 @@ class Task1(Node):
             OccupancyGrid,
             '/map',
             self.map_callback,
-            10
+            20
         )
         self.map_update_sub = self.create_subscription(
             OccupancyGridUpdate,
             '/map_updates',
             self.map_update_callback,
-            10
+            50
         )
         self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
-            10
+            50
         )
 
         # ---------------------------
@@ -224,7 +224,7 @@ class Task1(Node):
         self.cmd_vel_pub = self.create_publisher(
             Twist,
             '/cmd_vel',
-            10
+            20
         )
         self.frontier_markers_pub = self.create_publisher(
             MarkerArray,
