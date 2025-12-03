@@ -431,6 +431,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /patrol_plan
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        detected_balls: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /detected_balls_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
