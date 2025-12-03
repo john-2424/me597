@@ -107,6 +107,7 @@ class Task3(Node):
         # Camera model (approximate)
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
         self.declare_parameter('ball_min_contour_area', 100)  # px, to filter noise
+        self.declare_parameter('ball_min_circularity', 0.75)  # shape filter (0–1)
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -198,6 +199,9 @@ class Task3(Node):
         )
         self.ball_min_contour_area = (
             self.get_parameter('ball_min_contour_area').get_parameter_value().integer_value
+        )
+        self.ball_min_circularity = (
+            self.get_parameter('ball_min_circularity').get_parameter_value().double_value
         )
 
         self.get_logger().info(
@@ -1574,6 +1578,21 @@ class Task3(Node):
     # ----------------------------------------------------------------------
     # Layer 4: Vision / ball detection
     # ----------------------------------------------------------------------
+    @staticmethod
+    def _contour_circularity(contour):
+        """
+        Return (area, circularity) for a contour.
+        circularity = 4*pi*A / P^2 in [0,1], with 1 = perfect circle.
+        """
+        area = cv2.contourArea(contour)
+        if area <= 0.0:
+            return 0.0, 0.0
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 1e-6:
+            return area, 0.0
+        circ = 4.0 * math.pi * area / (perimeter * perimeter)
+        return area, circ
+
     def _image_to_cv2(self, msg: Image):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -1583,71 +1602,143 @@ class Task3(Node):
             return None
 
     def _detect_balls_in_image(self, frame):
+        """
+        Detect red, green, blue balls using calibrated HSV centers and
+        strong shape filtering to avoid brick / orange / text false positives.
+
+        Updates:
+            - self.ball_pixel_obs[color] = (cx, cy)
+            - self.ball_world_est[color] if localization succeeds
+            - self.detected_balls[color] flags
+
+        Additionally:
+            - Once a ball color has been successfully localized (world pose available),
+              we skip processing that color on subsequent frames, so we don't keep
+              chasing already-found balls.
+        """
         if frame is None:
             return
 
-        self.get_logger().info(
-            '[Layer 4] Running ball detection on new camera frame...',
-            throttle_duration_sec=0.5
-        )
-
+        # --- Convert to HSV once ---
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        h, w, _ = frame.shape
+        h, s, v = cv2.split(hsv)
 
-        color_ranges = {
-            'red': [
-                ((0, 100, 80), (10, 255, 255)),
-                ((160, 100, 80), (179, 255, 255)),
-            ],
-            'green': [
-                ((35, 80, 80), (85, 255, 255)),
-            ],
-            'blue': [
-                ((90, 80, 80), (135, 255, 255)),
-            ],
+        # Hue distance must be computed modulo 180, so use int16
+        h = h.astype(np.int16)
+
+        # Calibrated hue centers from your example images (center of balls)
+        color_centers = {
+            'red': 0,      # redball center ~0
+            'green': 60,   # greenball center ~60
+            'blue': 120,   # blueball center ~120
+        }
+
+        # Hue tolerances (in degrees)
+        hue_tolerances = {
+            'red': 10,
+            'green': 10,
+            'blue': 10,
+        }
+
+        # Strong saturation / brightness thresholds
+        s_thresh = 150
+        v_thresh = 80
+
+        # Per-color minimum area (pixels) to reject tiny blobs
+        base_min_area = float(self.ball_min_contour_area)
+        color_min_area = {
+            'red':  base_min_area * 5.0,   # stricter for red to ignore tiny wall specks
+            'green': base_min_area,
+            'blue':  base_min_area,
         }
 
         debug_frame = frame.copy()
 
         for color in self.ball_colors:
-            if color not in color_ranges:
+            # If this color's ball has already been localized, skip re-detection
+            if self.detected_balls[color] and self.ball_world_est[color] is not None:
                 continue
 
-            masks = []
-            for (lower, upper) in color_ranges[color]:
-                lower_np = np.array(lower, dtype=np.uint8)
-                upper_np = np.array(upper, dtype=np.uint8)
-                masks.append(cv2.inRange(hsv, lower_np, upper_np))
-
-            mask = masks[0]
-            for extra in masks[1:]:
-                mask = cv2.bitwise_or(mask, extra)
-
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                self.get_logger().debug(f'[Layer 4] No contours found for color {color}.')
+            if color not in color_centers:
                 continue
 
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            self.get_logger().debug(
-                f'[Layer 4] Color {color}: largest contour area={area:.1f} px.'
+            center_h = color_centers[color]
+            h_tol = hue_tolerances[color]
+            min_area = color_min_area.get(color, base_min_area)
+
+            # --- Build color mask using hue distance + S/V ---
+            diff = np.abs(h - center_h)
+            diff = np.minimum(diff, 180 - diff)  # wrap-around-safe distance
+
+            mask = (
+                (diff <= h_tol) &
+                (s >= s_thresh) &
+                (v >= v_thresh)
             )
-            if area < self.ball_min_contour_area:
-                self.get_logger().debug(
-                    f'[Layer 4] Color {color}: contour area {area:.1f} < '
-                    f'min_area={self.ball_min_contour_area}. Ignoring.'
+
+            mask_u8 = (mask.astype(np.uint8)) * 255
+
+            # Morphological cleanup to merge blobs and remove speckle
+            kernel = np.ones((5, 5), np.uint8)
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(
+                mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if not contours:
+                self.get_logger().info(
+                    f'[Layer 4] No {color} contours found (after HSV+shape filtering).',
+                    throttle_duration_sec=2.0
                 )
                 continue
 
-            (x, y, rw, rh) = cv2.boundingRect(largest)
+            best_contour = None
+            best_area = 0.0
+            best_circ = 0.0
+
+            for c in contours:
+                area, circ = self._contour_circularity(c)
+
+                # Area threshold to kill tiny blobs
+                if area < min_area:
+                    continue
+
+                # Circularity threshold to reject bricks / edges / text blobs
+                if circ < self.ball_min_circularity:
+                    continue
+
+                if area > best_area:
+                    best_area = area
+                    best_circ = circ
+                    best_contour = c
+
+            if best_contour is None:
+                # Everything was filtered out → likely only false positives
+                self.get_logger().info(
+                    f'[Layer 4] {color} candidates rejected by area/circularity '
+                    f'(min_area={min_area:.1f}, '
+                    f'min_circ={self.ball_min_circularity:.2f}).',
+                    throttle_duration_sec=2.0
+                )
+                continue
+
+            # --- We have a good ball contour for this color ---
+            x, y, rw, rh = cv2.boundingRect(best_contour)
             cx = int(x + rw / 2)
             cy = int(y + rh / 2)
 
+            self.ball_pixel_obs[color] = (cx, cy)
+
+            self.get_logger().info(
+                f'[Layer 4] {color} ball detection: '
+                f'area={best_area:.1f}, circ={best_circ:.3f}, '
+                f'bbox=({x},{y},{rw},{rh}), center=({cx},{cy}).',
+                throttle_duration_sec=1.0
+            )
+
+            # Draw overlay on debug frame
             color_bgr = {
                 'red': (0, 0, 255),
                 'green': (0, 255, 0),
@@ -1667,33 +1758,25 @@ class Task3(Node):
                 cv2.LINE_AA,
             )
 
-            self.get_logger().info(
-                f'[Layer 4] Detected {color} blob: bbox=({x},{y},{rw},{rh}), '
-                f'centroid=({cx},{cy}).'
-            )
-
-            self.ball_pixel_obs[color] = (cx, cy)
-
-            world_xy = self._localize_ball_from_pixel(color, cx, cy, w, h)
+            # Try to localize this ball in world coordinates
+            world_xy = self._localize_ball_from_pixel(color, cx, cy, frame.shape[1], frame.shape[0])
             if world_xy is not None:
                 wx, wy = world_xy
                 self.ball_world_est[color] = (wx, wy)
                 self.detected_balls[color] = True
                 self.get_logger().info(
-                    f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).'
-                )
-            else:
-                self.get_logger().info(
-                    f'[Layer 5] Failed to localize {color} ball from pixel observation.'
+                    f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).',
+                    throttle_duration_sec=1.0
                 )
 
+        # Show debug frame if enabled
         if self.show_debug_image:
             cv2.imshow('task3_camera_debug', debug_frame)
             key = cv2.waitKey(1) & 0xFF
+            # Press 'q' in the window to turn off debug display
             if key == ord('q'):
                 self.show_debug_image = False
                 cv2.destroyWindow('task3_camera_debug')
-                self.get_logger().info('[Layer 4] Disabled OpenCV debug window via keyboard.')
 
     def _localize_ball_from_pixel(self, color, cx, cy, img_width, img_height):
         if self.latest_scan is None or self.current_pose is None:
