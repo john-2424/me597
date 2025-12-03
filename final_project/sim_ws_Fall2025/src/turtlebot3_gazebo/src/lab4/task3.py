@@ -7,24 +7,33 @@ import rclpy
 from rclpy.node import Node
 
 # ROS message types
-from geometry_msgs.msg import Twist, PoseWithCovarianceStamped, PoseStamped
+from geometry_msgs.msg import (
+    Twist,
+    PoseWithCovarianceStamped,
+    PoseStamped,
+    Pose,
+    PoseArray,
+)
 from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Float32
 
 # Map / image handling
 import cv2
 import numpy as np
 import yaml
 from ament_index_python.packages import get_package_share_directory
-from cv_bridge import CvBridge   # Layer 4: for OpenCV view
+
+from cv_bridge import CvBridge, CvBridgeError
 
 
 class Task3(Node):
     """
     Task 3: Search and Localize colored balls.
 
-    Implemented layers so far:
+    Layers implemented:
+
     - Layer 0: Boilerplate & ROS wiring
     - Layer 1: Map loading & occupancy utilities
     - Layer 2: Automatic waypoint generation & route optimization
@@ -33,11 +42,16 @@ class Task3(Node):
                * A* global planner over inflated map
                * Pure-pursuit-style path follower
                * Patrol state machine visiting DT waypoints in an efficient order
-    - Layer 4: Perception
-               * HSV-based multi-color detection on camera frames
-               * OpenCV debug window (like red_ball_tracker.py)
-               * Ball localization using camera FOV + /scan + AMCL pose -> map frame
-               * MarkerArray for detected balls in map frame
+               * Simple reactive obstacle avoidance (LaserScan-based)
+    - Layer 4: Vision + ball detection + visualization
+               * Subscribe to camera
+               * Multi-color (red/green/blue) HSV-based blob detection
+               * Draw detections and show OpenCV debug window
+    - Layer 5: Ball localization & task bookkeeping
+               * Fuse image bearing + LaserScan range + AMCL pose -> world (x,y)
+               * Track first good localization per color
+               * Publish markers and PoseArray for detected balls
+               * Track task start/end time and publish completion time
     """
 
     def __init__(self):
@@ -70,9 +84,9 @@ class Task3(Node):
         self.declare_parameter('obstacle_avoid_linear_vel', 0.10)    # m/s
         self.declare_parameter('obstacle_avoid_angular_vel', 0.80)   # rad/s
 
-        # Layer 4 camera model params (approximate; can tweak)
-        self.declare_parameter('camera_horizontal_fov_deg', 60.0)   # degrees
-        self.declare_parameter('camera_scan_sector_width_deg', 10.0)  # +/- around bearing
+        # Camera model (approximate)
+        self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
+        self.declare_parameter('ball_min_contour_area', 100)  # px, to filter noise
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -131,13 +145,12 @@ class Task3(Node):
             self.get_parameter('obstacle_avoid_angular_vel').get_parameter_value().double_value
         )
 
-        self.camera_horizontal_fov_deg = (
-            self.get_parameter('camera_horizontal_fov_deg').get_parameter_value().double_value
+        self.camera_h_fov_deg = (
+            self.get_parameter('camera_h_fov_deg').get_parameter_value().double_value
         )
-        self.camera_scan_sector_width_deg = (
-            self.get_parameter('camera_scan_sector_width_deg').get_parameter_value().double_value
+        self.ball_min_contour_area = (
+            self.get_parameter('ball_min_contour_area').get_parameter_value().integer_value
         )
-        self.camera_horizontal_fov_rad = math.radians(self.camera_horizontal_fov_deg)
 
         # -------------------------
         # Map-related members (Layer 1)
@@ -150,32 +163,18 @@ class Task3(Node):
 
         self.static_occupancy = None   # 0 free, 1 occupied
         self.inflated_occupancy = None # 0 free, 1 occupied (inflated)
-        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; later)
+        self.dynamic_occupancy = None  # 0 free, 1 occupied (from LaserScan; reserved)
 
         # -------------------------
         # Robot state
         # -------------------------
         self.current_pose = None          # PoseWithCovarianceStamped
         self.latest_scan = None           # LaserScan
-        self.latest_image = None          # Image (ROS message)
+        self.latest_image = None          # Image
 
-        # -------------------------
-        # Perception (Layer 4)
-        # -------------------------
+        # For image handling
         self.bridge = CvBridge()
-        self.show_debug_image = True  # can be toggled off with 'q' in window
-        # Pixel-space detections: color -> (cx, cy) or None
-        self.ball_detections_px = {
-            'red': None,
-            'green': None,
-            'blue': None,
-        }
-        # Map-frame detections: color -> (x, y) or None
-        self.ball_detections_world = {
-            'red': None,
-            'green': None,
-            'blue': None,
-        }
+        self.show_debug_image = True     # OpenCV debug frames
 
         # -------------------------
         # Waypoints & navigation (Layer 2 & 3)
@@ -194,13 +193,24 @@ class Task3(Node):
         # High-level task state machine
         # -------------------------
         # WAIT_FOR_POSE -> SELECT_NEXT_WAYPOINT -> PLAN_TO_WAYPOINT
-        # -> FOLLOW_PATH -> back to SELECT_NEXT_WAYPOINT ... -> PATROL_DONE
+        # -> FOLLOW_PATH / AVOID_OBSTACLE -> SELECT_NEXT_WAYPOINT ...
+        # -> PATROL_DONE or TASK_DONE
         self.state = 'WAIT_FOR_POSE'
 
         # Simple reactive avoidance state
         self.avoidance_phase = None               # 'BACK', 'TURN', 'FORWARD'
         self.avoidance_direction = None           # 'LEFT' or 'RIGHT'
         self.avoidance_phase_start_time = None    # rclpy.time.Time
+
+        # -------------------------
+        # Layer 5: Ball bookkeeping & timing
+        # -------------------------
+        self.ball_colors = ['red', 'green', 'blue']
+        self.detected_balls = {c: False for c in self.ball_colors}
+        self.ball_pixel_obs = {c: None for c in self.ball_colors}   # (cx, cy)
+        self.ball_world_est = {c: None for c in self.ball_colors}   # (wx, wy)
+        self.task_start_time = None
+        self.task_done_time = None
 
         # -------------------------
         # Publishers
@@ -239,10 +249,24 @@ class Task3(Node):
             10
         )
 
-        # Markers for detected balls (map frame)
+        # Ball markers (Layer 5)
         self.ball_markers_pub = self.create_publisher(
             MarkerArray,
-            self._ns_topic('detected_balls_markers'),
+            self._ns_topic('ball_markers'),
+            10
+        )
+
+        # PoseArray for ball positions (Layer 5)
+        self.balls_posearray_pub = self.create_publisher(
+            PoseArray,
+            self._ns_topic('detected_balls'),
+            10
+        )
+
+        # Completion time publisher (Layer 5)
+        self.task_time_pub = self.create_publisher(
+            Float32,
+            self._ns_topic('task3_completion_time'),
             10
         )
 
@@ -280,7 +304,7 @@ class Task3(Node):
         # -------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)
 
-        self.get_logger().info('Task3 node initialized (Layers 0 + 1 + 2 + 3 + 4).')
+        self.get_logger().info('Task3 node initialized (Layers 0–5).')
 
     # ----------------------------------------------------------------------
     # Helper to handle namespace in topic names
@@ -742,7 +766,7 @@ class Task3(Node):
         self.patrol_markers_pub.publish(ma)
 
     # ----------------------------------------------------------------------
-    # Layer 3: Navigation core (A* + path follower)
+    # Layer 3: Navigation core (A* + path follower + avoidance)
     # ----------------------------------------------------------------------
     @staticmethod
     def _quat_to_yaw(q):
@@ -923,17 +947,15 @@ class Task3(Node):
 
         return False
 
-    # Sector scan helpers & avoidance state machine
-    def _scan_min_in_sector(self, center_rad: float, width_rad: float) -> float:
+    # Sector scan helper for arbitrary center (radians)
+    def _scan_min_in_sector_rad(self, center_rad: float, width_rad: float) -> float:
         """
-        Return the minimum valid range in a sector around center_rad (rad)
-        with total width width_rad (rad). If no valid returns, +inf.
+        Return minimum valid LaserScan range in sector [center - width/2, center + width/2].
         """
         if self.latest_scan is None:
             return float('inf')
 
         scan = self.latest_scan
-        center = center_rad
         half = width_rad / 2.0
 
         angle = scan.angle_min
@@ -945,7 +967,7 @@ class Task3(Node):
                 continue
 
             if scan.range_min <= r <= scan.range_max:
-                if (center - half) <= angle <= (center + half):
+                if (center_rad - half) <= angle <= (center_rad + half):
                     if r < min_r:
                         min_r = r
 
@@ -953,12 +975,20 @@ class Task3(Node):
 
         return min_r
 
+    def _scan_min_in_sector(self, center_deg: float, width_deg: float) -> float:
+        """
+        Deg version (used by avoidance logic).
+        """
+        center = math.radians(center_deg)
+        width = math.radians(width_deg)
+        return self._scan_min_in_sector_rad(center, width)
+
     def _choose_avoidance_direction(self) -> str:
         """
         Choose LEFT or RIGHT based on which side has more clearance.
         """
-        left_min = self._scan_min_in_sector(math.radians(90.0), math.radians(80.0))
-        right_min = self._scan_min_in_sector(math.radians(-90.0), math.radians(80.0))
+        left_min = self._scan_min_in_sector(90.0, 80.0)     # sector on the left
+        right_min = self._scan_min_in_sector(-90.0, 80.0)   # sector on the right
 
         self.get_logger().info(
             f'[Layer 3] AVOID_OBSTACLE: sector min ranges -> '
@@ -1156,6 +1186,292 @@ class Task3(Node):
         return best_idx
 
     # ----------------------------------------------------------------------
+    # Layer 4: Vision / ball detection
+    # ----------------------------------------------------------------------
+    def _image_to_cv2(self, msg: Image):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            return img
+        except CvBridgeError as e:
+            self.get_logger().warn(f'[Layer 4] CvBridge error: {e}')
+            return None
+
+    def _detect_balls_in_image(self, frame):
+        """
+        Detect red, green, blue balls using HSV thresholds.
+        Updates:
+            - self.ball_pixel_obs[color] = (cx, cy)
+            - self.ball_world_est[color] if localization succeeds
+        """
+        if frame is None:
+            return
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, w, _ = frame.shape
+
+        # HSV ranges (tuned for bright colored balls; may need adjustment)
+        # Red is split into two ranges around hue wrap-around
+        color_ranges = {
+            'red': [
+                ((0, 100, 80), (10, 255, 255)),
+                ((160, 100, 80), (179, 255, 255)),
+            ],
+            'green': [
+                ((35, 80, 80), (85, 255, 255)),
+            ],
+            'blue': [
+                ((90, 80, 80), (135, 255, 255)),
+            ],
+        }
+
+        debug_frame = frame.copy()
+
+        for color in self.ball_colors:
+            if color not in color_ranges:
+                continue
+
+            # Build mask for this color
+            masks = []
+            for (lower, upper) in color_ranges[color]:
+                lower_np = np.array(lower, dtype=np.uint8)
+                upper_np = np.array(upper, dtype=np.uint8)
+                masks.append(cv2.inRange(hsv, lower_np, upper_np))
+
+            mask = masks[0]
+            for extra in masks[1:]:
+                mask = cv2.bitwise_or(mask, extra)
+
+            # Morphological cleanup
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            # Contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+
+            # Largest blob
+            largest = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest)
+            if area < self.ball_min_contour_area:
+                continue
+
+            (x, y, rw, rh) = cv2.boundingRect(largest)
+            cx = int(x + rw / 2)
+            cy = int(y + rh / 2)
+
+            # Visual overlay
+            color_bgr = {
+                'red': (0, 0, 255),
+                'green': (0, 255, 0),
+                'blue': (255, 0, 0),
+            }[color]
+
+            cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
+            cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
+            cv2.putText(
+                debug_frame,
+                color,
+                (x, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color_bgr,
+                1,
+                cv2.LINE_AA,
+            )
+
+            self.ball_pixel_obs[color] = (cx, cy)
+
+            # Try to localize this ball in world coordinates
+            world_xy = self._localize_ball_from_pixel(color, cx, cy, w, h)
+            if world_xy is not None:
+                wx, wy = world_xy
+                self.ball_world_est[color] = (wx, wy)
+                self.detected_balls[color] = True
+                self.get_logger().info(
+                    f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).'
+                )
+
+        # Show debug frame if enabled
+        if self.show_debug_image:
+            cv2.imshow('task3_camera_debug', debug_frame)
+            key = cv2.waitKey(1) & 0xFF
+            # Press 'q' in the window to turn off debug display
+            if key == ord('q'):
+                self.show_debug_image = False
+                cv2.destroyWindow('task3_camera_debug')
+
+    def _localize_ball_from_pixel(self, color, cx, cy, img_width, img_height):
+        """
+        Combine:
+        - camera pixel (cx) -> bearing angle (camera frame)
+        - LaserScan -> range at that bearing
+        - AMCL pose -> map/world coordinates
+
+        Returns (wx, wy) or None if localization failed.
+        """
+        if self.latest_scan is None or self.current_pose is None:
+            return None
+
+        # Bearing from pixel
+        img_cx = img_width / 2.0
+        fov_rad = math.radians(self.camera_h_fov_deg)
+
+        # Normalized offset in [-1, 1]
+        pixel_offset = (cx - img_cx) / img_cx
+        bearing_cam = pixel_offset * (fov_rad / 2.0)
+
+        # Query LaserScan near that bearing
+        range_window_rad = math.radians(10.0)  # +/- 5 deg sector
+        r = self._scan_min_in_sector_rad(bearing_cam, range_window_rad)
+        if math.isinf(r) or r <= 0.0:
+            self.get_logger().info(
+                f'[Layer 5] No valid scan range for {color} ball (bearing_cam={bearing_cam:.2f} rad).'
+            )
+            return None
+
+        # Ball position in robot frame (assuming camera aligned with scan frame)
+        lx = r * math.cos(bearing_cam)
+        ly = r * math.sin(bearing_cam)
+
+        pose = self.current_pose.pose.pose
+        rx = pose.position.x
+        ry = pose.position.y
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        # Transform to world (map) frame
+        wx = rx + math.cos(yaw) * lx - math.sin(yaw) * ly
+        wy = ry + math.sin(yaw) * lx + math.cos(yaw) * ly
+
+        # Optional: sanity-check against map bounds
+        idx = self.world_to_grid(wx, wy)
+        if idx is None:
+            self.get_logger().info(
+                f'[Layer 5] Localized {color} ball outside map bounds, '
+                f'candidate=({wx:.2f}, {wy:.2f}). Ignoring.'
+            )
+            return None
+
+        row, col = idx
+        if not self._is_cell_free(row, col):
+            self.get_logger().info(
+                f'[Layer 5] Localized {color} ball in occupied cell ({row},{col}), '
+                f'candidate=({wx:.2f}, {wy:.2f}). Keeping anyway but note it may be near wall.'
+            )
+
+        return wx, wy
+
+    # ----------------------------------------------------------------------
+    # Layer 5: Ball markers & completion
+    # ----------------------------------------------------------------------
+    def _publish_ball_markers(self):
+        """
+        Publish MarkerArray for localized balls (red, green, blue).
+        """
+        ma = MarkerArray()
+        now = self.get_clock().now().to_msg()
+
+        color_map_rgb = {
+            'red':   (1.0, 0.0, 0.0),
+            'green': (0.0, 1.0, 0.0),
+            'blue':  (0.0, 0.0, 1.0),
+        }
+
+        mid = 0
+        for color in self.ball_colors:
+            if not self.detected_balls[color]:
+                continue
+            if self.ball_world_est[color] is None:
+                continue
+
+            wx, wy = self.ball_world_est[color]
+            m = Marker()
+            m.header.stamp = now
+            m.header.frame_id = 'map'
+            m.ns = 'balls'
+            m.id = mid
+            mid += 1
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = wx
+            m.pose.position.y = wy
+            m.pose.position.z = 0.10
+            m.pose.orientation.w = 1.0
+            m.scale.x = 0.2
+            m.scale.y = 0.2
+            m.scale.z = 0.2
+            m.color.a = 1.0
+            r, g, b = color_map_rgb[color]
+            m.color.r = r
+            m.color.g = g
+            m.color.b = b
+            m.lifetime.sec = 0
+            ma.markers.append(m)
+
+        if ma.markers:
+            self.ball_markers_pub.publish(ma)
+
+    def _publish_balls_posearray_and_time(self):
+        """
+        Publish PoseArray for all detected balls and a Float32 completion time.
+        Called once when all three balls are localized.
+        """
+        if not all(self.detected_balls.values()):
+            return
+
+        # PoseArray
+        pa = PoseArray()
+        pa.header.stamp = self.get_clock().now().to_msg()
+        pa.header.frame_id = 'map'
+
+        # Order: red, green, blue
+        for color in self.ball_colors:
+            wx, wy = self.ball_world_est.get(color, (None, None))
+            if wx is None or wy is None:
+                continue
+            p = Pose()
+            p.position.x = wx
+            p.position.y = wy
+            p.position.z = 0.0
+            p.orientation.w = 1.0
+            pa.poses.append(p)
+
+        self.balls_posearray_pub.publish(pa)
+
+        # Completion time
+        if self.task_start_time is not None:
+            now = self.get_clock().now()
+            dt = now - self.task_start_time
+            elapsed_seconds = dt.nanoseconds / 1e9
+            msg = Float32()
+            msg.data = float(elapsed_seconds)
+            self.task_time_pub.publish(msg)
+            self.get_logger().info(
+                f'[Layer 5] TASK COMPLETE: all balls localized. '
+                f'Elapsed time ≈ {elapsed_seconds:.2f} s (published on task3_completion_time).'
+            )
+        else:
+            self.get_logger().info(
+                '[Layer 5] TASK COMPLETE: all balls localized, but task_start_time was None.'
+            )
+
+    def _maybe_finish_task_if_balls_found(self):
+        """
+        If all balls are found, publish markers & PoseArray and switch to TASK_DONE.
+        """
+        if not all(self.detected_balls.values()):
+            return
+
+        if self.state != 'TASK_DONE':
+            self.get_logger().info('[Layer 5] All balls detected. Finalizing task.')
+            self._publish_ball_markers()
+            self._publish_balls_posearray_and_time()
+            self.task_done_time = self.get_clock().now()
+            self.state = 'TASK_DONE'
+            self._publish_stop()
+
+    # ----------------------------------------------------------------------
     # Subscriber callbacks
     # ----------------------------------------------------------------------
     def amcl_pose_callback(self, msg: PoseWithCovarianceStamped):
@@ -1172,265 +1488,26 @@ class Task3(Node):
         self.latest_scan = msg
 
     def image_callback(self, msg: Image):
-        """
-        Layer 4:
-        - Convert ROS Image -> BGR frame
-        - Run multi-color HSV detection
-        - Store pixel detections
-        - Estimate world positions using /scan + AMCL pose
-        - Draw debug markers and show with OpenCV (like red_ball_tracker)
-        - Publish MarkerArray of detected balls in map frame
-        """
         self.latest_image = msg
-
-        try:
-            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().warn(f'[Layer 4] CvBridge conversion failed: {e}')
-            return
-
-        detections_px = self._detect_balls_hsv(bgr)
-        self.ball_detections_px = detections_px
-
-        # Update world-frame detections using scan + pose
-        self._update_ball_world_detections(detections_px, bgr.shape)
-
-        # Publish markers for any balls we have in map frame
-        self._publish_ball_markers()
-
-        # Debug draw & show window
-        if self.show_debug_image:
-            vis = bgr.copy()
-            color_to_bgr = {
-                'red':   (0, 0, 255),
-                'green': (0, 255, 0),
-                'blue':  (255, 0, 0),
-            }
-
-            for color in ['red', 'green', 'blue']:
-                px = detections_px.get(color, None)
-                if px is None:
-                    continue
-                cx, cy = px
-                cv2.circle(vis, (cx, cy), 10, color_to_bgr[color], 2)
-                cv2.putText(
-                    vis,
-                    color,
-                    (cx + 5, cy - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color_to_bgr[color],
-                    1,
-                    cv2.LINE_AA,
-                )
-
-            cv2.imshow('task3_camera_debug', vis)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                self.show_debug_image = False
-                cv2.destroyWindow('task3_camera_debug')
-                self.get_logger().info('[Layer 4] Debug camera window closed by user (q).')
-
-    # ----------------------------------------------------------------------
-    # Layer 4: HSV-based multi-color detector (pixel space)
-    #          + scan-based range + map-frame projection
-    # ----------------------------------------------------------------------
-    def _detect_balls_hsv(self, bgr_image):
-        """
-        Return dict: color -> (cx, cy) in pixel coordinates or None.
-        Thresholds are tuned for bright simulated balls; adjust if needed.
-        """
-        detections = {'red': None, 'green': None, 'blue': None}
-
-        if bgr_image is None:
-            return detections
-
-        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-
-        # Crude HSV ranges; can be tuned from sim screenshots
-        # Red needs two ranges (wrap-around in hue)
-        mask_red1 = cv2.inRange(hsv, (0, 120, 70), (10, 255, 255))
-        mask_red2 = cv2.inRange(hsv, (170, 120, 70), (180, 255, 255))
-        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-
-        mask_green = cv2.inRange(hsv, (35, 80, 60), (85, 255, 255))
-        mask_blue  = cv2.inRange(hsv, (90, 80, 60), (130, 255, 255))
-
-        masks = {
-            'red': mask_red,
-            'green': mask_green,
-            'blue': mask_blue,
-        }
-
-        for color, mask in masks.items():
-            # Clean up mask
-            mask = cv2.medianBlur(mask, 5)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-
-            # Use largest contour
-            cnt = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(cnt)
-            if area < 50.0:
-                # Too small, likely noise
-                continue
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            cx = x + w // 2
-            cy = y + h // 2
-            detections[color] = (int(cx), int(cy))
-
-        return detections
-
-    def _pixel_x_to_bearing(self, cx_pixel: int, image_width: int) -> float:
-        """
-        Convert pixel x-coordinate (cx_pixel) to bearing (rad) in camera frame.
-        Assuming pinhole model with known horizontal FOV.
-        """
-        if image_width <= 0:
-            return 0.0
-
-        # pixel coordinate normalized to [-1, 1]
-        center = image_width / 2.0
-        norm = (cx_pixel - center) / center  # -1 left, +1 right
-
-        bearing = norm * (self.camera_horizontal_fov_rad / 2.0)
-        return bearing
-
-    def _range_from_scan_for_bearing(self, bearing_rad: float) -> float:
-        """
-        Use LaserScan to estimate distance at a given bearing (rad).
-        We search a small angular window around bearing.
-        """
-        if self.latest_scan is None:
-            return float('inf')
-
-        width_rad = math.radians(self.camera_scan_sector_width_deg)
-        r = self._scan_min_in_sector(bearing_rad, width_rad)
-        return r
-
-    def _update_ball_world_detections(self, detections_px, image_shape):
-        """
-        Combine pixel detections + LaserScan + AMCL pose to estimate
-        map-frame (x, y) positions of each colored ball.
-        """
-        if self.current_pose is None or self.latest_scan is None:
-            # Can't localize without pose and scan
-            return
-
-        if image_shape is None or len(image_shape) < 2:
-            return
-
-        height, width = image_shape[0], image_shape[1]
-
-        pose = self.current_pose.pose.pose
-        rx = pose.position.x
-        ry = pose.position.y
-        ryaw = self._quat_to_yaw(pose.orientation)
-
-        for color, px in detections_px.items():
-            if px is None:
-                self.ball_detections_world[color] = None
-                continue
-
-            cx, cy = px  # cy unused for now; we assume ball near ground
-
-            # pixel -> bearing in camera frame
-            bearing_cam = self._pixel_x_to_bearing(cx, width)
-
-            # Assuming camera optical axis aligned with base x-axis (no extrinsic yaw offset)
-            bearing_base = bearing_cam
-
-            # range from scan
-            r = self._range_from_scan_for_bearing(bearing_base)
-            if not (math.isfinite(r) and r > 0.0):
-                # no valid range; skip world localization
-                self.ball_detections_world[color] = None
-                continue
-
-            # Convert to base frame coordinates
-            bx = r * math.cos(bearing_base)
-            by = r * math.sin(bearing_base)
-
-            # Rotate + translate into map frame using robot pose
-            mx = rx + bx * math.cos(ryaw) - by * math.sin(ryaw)
-            my = ry + bx * math.sin(ryaw) + by * math.cos(ryaw)
-
-            self.ball_detections_world[color] = (mx, my)
-
-            self.get_logger().info(
-                f'[Layer 4] {color} ball localized at map ≈ ({mx:.2f}, {my:.2f}), '
-                f'r ≈ {r:.2f} m, bearing_cam ≈ {math.degrees(bearing_cam):.1f} deg',
-                throttle_duration_sec=1.0
-            )
-
-    def _publish_ball_markers(self):
-        """
-        Publish MarkerArray for all currently localized balls in map frame.
-        """
-        ma = MarkerArray()
-        now = self.get_clock().now().to_msg()
-
-        color_to_rgb = {
-            'red':   (1.0, 0.0, 0.0),
-            'green': (0.0, 1.0, 0.0),
-            'blue':  (0.0, 0.0, 1.0),
-        }
-
-        marker_id = 0
-        for color, pos in self.ball_detections_world.items():
-            if pos is None:
-                continue
-
-            x, y = pos
-            m = Marker()
-            m.header.stamp = now
-            m.header.frame_id = 'map'
-            m.ns = 'detected_balls'
-            m.id = marker_id
-            marker_id += 1
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.pose.position.x = x
-            m.pose.position.y = y
-            m.pose.position.z = 0.05
-            m.pose.orientation.w = 1.0
-            m.scale.x = 0.15
-            m.scale.y = 0.15
-            m.scale.z = 0.15
-            m.color.a = 1.0
-            m.color.r, m.color.g, m.color.b = color_to_rgb[color]
-            m.lifetime.sec = 0
-            ma.markers.append(m)
-
-        # Also send DELETEALL to clear old markers if no detections
-        if not ma.markers:
-            m = Marker()
-            m.header.stamp = now
-            m.header.frame_id = 'map'
-            m.ns = 'detected_balls'
-            m.id = 0
-            m.action = Marker.DELETEALL
-            ma.markers.append(m)
-
-        self.ball_markers_pub.publish(ma)
+        frame = self._image_to_cv2(msg)
+        if frame is not None:
+            self._detect_balls_in_image(frame)
+            # Update ball markers continuously (useful before full completion)
+            self._publish_ball_markers()
 
     # ----------------------------------------------------------------------
     # Timer callback / state machine
     # ----------------------------------------------------------------------
     def timer_cb(self):
         self.get_logger().info(
-            f'[Layer 0-4] State = {self.state}, '
+            f'[Layer 0-5] State = {self.state}, '
             f'map_loaded={self.map_loaded}, '
             f'pose_received={self.current_pose is not None}, '
             f'scan_received={self.latest_scan is not None}, '
             f'image_received={self.latest_image is not None}, '
             f'waypoints_generated={self.waypoints_generated}, '
-            f'visited={len(self.visited_waypoints)}/{len(self.patrol_waypoints)}',
+            f'visited={len(self.visited_waypoints)}/{len(self.patrol_waypoints)}, '
+            f'balls_detected={sum(self.detected_balls.values())}/3',
             throttle_duration_sec=1.0
         )
 
@@ -1445,9 +1522,19 @@ class Task3(Node):
             self._publish_stop()
             return
 
+        # Check for task completion (Layer 5)
+        self._maybe_finish_task_if_balls_found()
+        if self.state == 'TASK_DONE':
+            # Nothing else to do
+            return
+
         if self.state == 'WAIT_FOR_POSE':
-            # we have pose and waypoints now
+            # We have pose and waypoints now
             self.state = 'SELECT_NEXT_WAYPOINT'
+            # Start timing when we actually start patrolling
+            if self.task_start_time is None:
+                self.task_start_time = self.get_clock().now()
+                self.get_logger().info('[Layer 5] Task timer started.')
             self.get_logger().info('[Layer 3] Transition: WAIT_FOR_POSE -> SELECT_NEXT_WAYPOINT')
             return
 
@@ -1457,6 +1544,8 @@ class Task3(Node):
                 self.state = 'PATROL_DONE'
                 self._publish_stop()
                 self.get_logger().info('[Layer 3] All waypoints visited. PATROL_DONE.')
+                # Even if patrol done, maybe balls are already found; check once more
+                self._maybe_finish_task_if_balls_found()
                 return
 
             self.current_waypoint_idx = idx
@@ -1527,6 +1616,14 @@ class Task3(Node):
             return
 
         if self.state == 'PATROL_DONE':
+            # Patrol finished, but maybe still missing balls -> keep camera + localization running;
+            # you could optionally re-plan, but for now just stop and rely on previous detections.
+            self._publish_stop()
+            # One more completion check
+            self._maybe_finish_task_if_balls_found()
+            return
+
+        if self.state == 'TASK_DONE':
             self._publish_stop()
             return
 
@@ -1536,6 +1633,14 @@ class Task3(Node):
     def _publish_stop(self):
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
+
+    def destroy_node(self):
+        # Ensure OpenCV windows are closed when node shuts down
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        super().destroy_node()
 
 
 def main(args=None):
@@ -1549,11 +1654,6 @@ def main(args=None):
         pass
     finally:
         task3.destroy_node()
-        # Close any remaining OpenCV windows
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
         rclpy.shutdown()
 
 
