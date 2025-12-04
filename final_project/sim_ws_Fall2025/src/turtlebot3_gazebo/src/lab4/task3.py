@@ -1641,13 +1641,13 @@ class Task3(Node):
         }
 
         # Strong saturation / brightness thresholds
-        s_thresh = 150
-        v_thresh = 80
+        s_thresh = 100
+        v_thresh = 60
 
         # Per-color minimum area (pixels) to reject tiny blobs
         base_min_area = float(self.ball_min_contour_area)
         color_min_area = {
-            'red':  base_min_area,
+            'red':  1.5* base_min_area,
             'green': base_min_area,
             'blue':  base_min_area,
         }
@@ -1664,6 +1664,14 @@ class Task3(Node):
                 self.ball_world_est.get(color) is not None
             )
 
+            # If we have a good world estimate already, skip this color entirely.
+            # This enforces the “don’t keep looking for the same ball” behavior.
+            if already_localized:
+                self.get_logger().debug(
+                    f"[Layer 4] Skipping {color} – already localized in world frame."
+                )
+                continue
+            
             center_h = color_centers[color]
             h_tol = hue_tolerances[color]
             min_area = color_min_area.get(color, base_min_area)
@@ -1700,10 +1708,17 @@ class Task3(Node):
             best_circ = 0.0
 
             for c in contours:
+                # Reject elongated blobs (brick edges, streaks, etc.)
+                x_c, y_c, rw, rh = cv2.boundingRect(c)
+                aspect = max(rw, rh) / max(1, min(rw, rh))
+                # Tunable: 1.7 means anything more stretched than ~1.7:1 is not “ball-like”
+                if aspect > 1.7:
+                    continue
+
                 area, circ = self._contour_circularity(c)
 
                 self.get_logger().info(
-                    f'[Layer 4] {color} candidate: area={area:.1f}, circ={circ:.3f}',
+                    f'[Layer 4] {color} candidate: area={area:.1f}, circ={circ:.3f}, aspect={aspect:.2f}',
                     throttle_duration_sec=0.5
                 )
 
