@@ -106,8 +106,8 @@ class Task3(Node):
 
         # Camera model (approximate)
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
-        self.declare_parameter('ball_min_contour_area', 100)  # px, to filter noise
-        self.declare_parameter('ball_min_circularity', 0.75)  # shape filter (0–1)
+        self.declare_parameter('ball_min_contour_area', 150)  # px, to filter noise
+        self.declare_parameter('ball_min_circularity', 0.65)  # shape filter (0–1)
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -1647,7 +1647,7 @@ class Task3(Node):
         # Per-color minimum area (pixels) to reject tiny blobs
         base_min_area = float(self.ball_min_contour_area)
         color_min_area = {
-            'red':  base_min_area * 5.0,   # stricter for red to ignore tiny wall specks
+            'red':  base_min_area,
             'green': base_min_area,
             'blue':  base_min_area,
         }
@@ -1655,12 +1655,14 @@ class Task3(Node):
         debug_frame = frame.copy()
 
         for color in self.ball_colors:
-            # If this color's ball has already been localized, skip re-detection
-            if self.detected_balls[color] and self.ball_world_est[color] is not None:
-                continue
-
             if color not in color_centers:
                 continue
+
+            # Has this ball already been localized at least once?
+            already_localized = (
+                self.detected_balls[color] and
+                self.ball_world_est.get(color) is not None
+            )
 
             center_h = color_centers[color]
             h_tol = hue_tolerances[color]
@@ -1678,7 +1680,6 @@ class Task3(Node):
 
             mask_u8 = (mask.astype(np.uint8)) * 255
 
-            # Morphological cleanup to merge blobs and remove speckle
             kernel = np.ones((5, 5), np.uint8)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
@@ -1701,11 +1702,14 @@ class Task3(Node):
             for c in contours:
                 area, circ = self._contour_circularity(c)
 
-                # Area threshold to kill tiny blobs
+                self.get_logger().info(
+                    f'[Layer 4] {color} candidate: area={area:.1f}, circ={circ:.3f}',
+                    throttle_duration_sec=0.5
+                )
+
                 if area < min_area:
                     continue
 
-                # Circularity threshold to reject bricks / edges / text blobs
                 if circ < self.ball_min_circularity:
                     continue
 
@@ -1715,7 +1719,6 @@ class Task3(Node):
                     best_contour = c
 
             if best_contour is None:
-                # Everything was filtered out → likely only false positives
                 self.get_logger().info(
                     f'[Layer 4] {color} candidates rejected by area/circularity '
                     f'(min_area={min_area:.1f}, '
@@ -1738,11 +1741,10 @@ class Task3(Node):
                 throttle_duration_sec=1.0
             )
 
-            # Draw overlay on debug frame
             color_bgr = {
-                'red': (0, 0, 255),
+                'red':   (0, 0, 255),
                 'green': (0, 255, 0),
-                'blue': (255, 0, 0),
+                'blue':  (255, 0, 0),
             }[color]
 
             cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
@@ -1759,15 +1761,26 @@ class Task3(Node):
             )
 
             # Try to localize this ball in world coordinates
-            world_xy = self._localize_ball_from_pixel(color, cx, cy, frame.shape[1], frame.shape[0])
+            world_xy = self._localize_ball_from_pixel(
+                color, cx, cy, frame.shape[1], frame.shape[0]
+            )
             if world_xy is not None:
                 wx, wy = world_xy
                 self.ball_world_est[color] = (wx, wy)
-                self.detected_balls[color] = True
-                self.get_logger().info(
-                    f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).',
-                    throttle_duration_sec=1.0
-                )
+
+                # Only flip the flag the *first* time
+                if not already_localized:
+                    self.detected_balls[color] = True
+                    self.get_logger().info(
+                        f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).',
+                        throttle_duration_sec=1.0
+                    )
+                else:
+                    # Just refine world estimate silently / at debug level
+                    self.get_logger().debug(
+                        f'[Layer 5] Updated {color} ball world estimate to '
+                        f'({wx:.2f}, {wy:.2f}).'
+                    )
 
         # Show debug frame if enabled
         if self.show_debug_image:
@@ -1852,42 +1865,67 @@ class Task3(Node):
 
         mid = 0
         for color in self.ball_colors:
-            if not self.detected_balls[color]:
-                continue
-            if self.ball_world_est[color] is None:
+            if not self.detected_balls.get(color, False):
                 continue
 
-            wx, wy = self.ball_world_est[color]
+            world_xy = self.ball_world_est.get(color, None)
+            if (
+                world_xy is None or
+                not isinstance(world_xy, (tuple, list)) or
+                len(world_xy) != 2
+            ):
+                self.get_logger().warn(
+                    f"[Layer 5] Skipping marker for '{color}': "
+                    f"invalid world_est = {world_xy}"
+                )
+                continue
+
+            wx, wy = world_xy
+
+            # 🔍 NEW: log the exact marker pose we’re about to publish
+            self.get_logger().info(
+                f"[Layer 5] Marker for {color} at world=({wx:.2f}, {wy:.2f})",
+                throttle_duration_sec=1.0,
+            )
+
             m = Marker()
             m.header.stamp = now
             m.header.frame_id = 'map'
             m.ns = 'balls'
             m.id = mid
             mid += 1
+
             m.type = Marker.SPHERE
             m.action = Marker.ADD
-            m.pose.position.x = wx
-            m.pose.position.y = wy
+
+            m.pose.position.x = float(wx)
+            m.pose.position.y = float(wy)
             m.pose.position.z = 0.10
             m.pose.orientation.w = 1.0
+
             m.scale.x = 0.2
             m.scale.y = 0.2
             m.scale.z = 0.2
+
             m.color.a = 1.0
             r, g, b = color_map_rgb[color]
             m.color.r = r
             m.color.g = g
             m.color.b = b
+
             m.lifetime.sec = 0
+            m.lifetime.nanosec = 0
+
             ma.markers.append(m)
 
         if ma.markers:
             self.get_logger().info(
-                f'[Layer 5] Publishing {len(ma.markers)} ball markers.'
+                f"[Layer 5] Publishing {len(ma.markers)} ball markers.",
+                throttle_duration_sec=1.0,
             )
             self.ball_markers_pub.publish(ma)
         else:
-            self.get_logger().debug('[Layer 5] No ball markers to publish.')
+            self.get_logger().debug("[Layer 5] No ball markers to publish.")
 
     def _publish_balls_posearray_and_time(self):
         if not all(self.detected_balls.values()):
@@ -2105,6 +2143,10 @@ class Task3(Node):
             self.get_logger().warn('[Layer 3] No patrol_waypoints available. Stopping.')
             self._publish_stop()
             return
+
+        # Keep ball markers alive in RViz even if camera messages are sparse.
+        # This will republish markers at 10 Hz based on the latest world estimates.
+        self._publish_ball_markers()
 
         self._maybe_finish_task_if_balls_found()
         if self.state == 'TASK_DONE':

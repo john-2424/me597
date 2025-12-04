@@ -7,6 +7,10 @@ Panels:
         - /Global Options1
         - /TF1/Frames1
         - /Map1/Topic1
+        - /MarkerArray1
+        - /MarkerArray2
+        - /MarkerArray3
+        - /MarkerArray4
       Splitter Ratio: 0.5
     Tree Height: 585
   - Class: rviz_common/Selection
@@ -435,13 +439,46 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        detected_balls: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /detected_balls_markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        balls: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ball_markers
+      Value: true
+    - Alpha: 1
+      Arrow Length: 0.30000001192092896
+      Axes Length: 0.30000001192092896
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/PoseArray
+      Color: 255; 25; 0
+      Enabled: true
+      Head Length: 0.07000000029802322
+      Head Radius: 0.029999999329447746
+      Name: PoseArray
+      Shaft Length: 0.23000000417232513
+      Shaft Radius: 0.009999999776482582
+      Shape: Arrow (Flat)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /detected_balls
       Value: true
   Enabled: true
   Global Options:
@@ -487,7 +524,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 21.41470718383789
+      Distance: 16.275177001953125
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
