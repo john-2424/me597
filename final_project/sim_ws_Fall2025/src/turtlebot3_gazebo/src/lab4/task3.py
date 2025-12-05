@@ -108,6 +108,9 @@ class Task3(Node):
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
         self.declare_parameter('ball_min_contour_area', 150)  # px, to filter noise
         self.declare_parameter('ball_min_circularity', 0.65)  # shape filter (0–1)
+        # Yaw offset between camera optical axis and LaserScan 0-angle (in degrees).
+        # Positive = camera is rotated CCW relative to the scan.
+        self.declare_parameter('camera_laser_yaw_offset_deg', 0.0)
 
         self.ns = self.get_parameter('namespace').get_parameter_value().string_value
         if self.ns and not self.ns.startswith('/'):
@@ -203,6 +206,9 @@ class Task3(Node):
         self.ball_min_circularity = (
             self.get_parameter('ball_min_circularity').get_parameter_value().double_value
         )
+        self.camera_laser_yaw_offset_deg = (
+            self.get_parameter('camera_laser_yaw_offset_deg').get_parameter_value().double_value
+        )
 
         self.get_logger().info(
             f'[Layer 0] Parameters: map={self.map_name}, inflation_kernel={self.inflation_kernel}, '
@@ -273,6 +279,16 @@ class Task3(Node):
         self.ball_world_est = {c: None for c in self.ball_colors}   # (wx, wy)
         self.task_start_time = None
         self.task_done_time = None
+
+        # Quality tracking for "best" detection per color
+        # Higher score = better ball candidate for that color.
+        # Start at -inf so the first valid detection always wins.
+        self.ball_detection_score = {
+            c: float('-inf') for c in self.ball_colors
+        }
+        # Optional metadata for debugging / introspection
+        # e.g. {'area': ..., 'circ': ..., 'center_offset': ..., 'has_world': ...}
+        self.ball_detection_meta = {c: None for c in self.ball_colors}
 
         # -------------------------
         # Publishers
@@ -1374,13 +1390,21 @@ class Task3(Node):
                 angle += scan.angle_increment
                 continue
 
-            if scan.range_min <= r <= scan.range_max:
-                if (center_rad - half) <= angle <= (center_rad + half):
-                    if r < min_r:
-                        min_r = r
+            # Ignore ranges at/near max range – often the wall behind the ball
+            if r < scan.range_min or r > 0.95 * scan.range_max:
+                angle += scan.angle_increment
+                continue
+
+            if (center_rad - half) <= angle <= (center_rad + half):
+                if r < min_r:
+                    min_r = r
 
             angle += scan.angle_increment
 
+        self.get_logger().debug(
+            f"[Layer 5] _scan_min_in_sector_rad: center={center_rad:.3f} rad, "
+            f"width={width_rad:.3f} rad -> min_r={min_r:.2f}",
+        )
         return min_r
 
     def _scan_min_in_sector(self, center_deg: float, width_deg: float) -> float:
@@ -1658,19 +1682,12 @@ class Task3(Node):
             if color not in color_centers:
                 continue
 
-            # Has this ball already been localized at least once?
+            # Track if we have *some* world estimate already, but do not skip:
+            # new detections can still be *better* and replace the old one.
             already_localized = (
                 self.detected_balls[color] and
                 self.ball_world_est.get(color) is not None
             )
-
-            # If we have a good world estimate already, skip this color entirely.
-            # This enforces the “don’t keep looking for the same ball” behavior.
-            if already_localized:
-                self.get_logger().debug(
-                    f"[Layer 4] Skipping {color} – already localized in world frame."
-                )
-                continue
             
             center_h = color_centers[color]
             h_tol = hue_tolerances[color]
@@ -1747,15 +1764,82 @@ class Task3(Node):
             cx = int(x + rw / 2)
             cy = int(y + rh / 2)
 
+            img_width = frame.shape[1]
+            img_cx = img_width / 2.0
+            # How far from the horizontal center of the image? 0 = perfect center, 1 = edge.
+            center_offset = abs(cx - img_cx) / max(img_cx, 1.0)
+
+            # Try to localize this ball in world coordinates
+            world_xy = self._localize_ball_from_pixel(
+                color, cx, cy, frame.shape[1], frame.shape[0]
+            )
+            has_world = world_xy is not None
+
+            # -----------------------------
+            # Build a scalar quality score:
+            #   - larger area -> better
+            #   - more circular -> better
+            #   - closer to image center -> better
+            #   - having a valid world pose -> big bonus
+            # -----------------------------
+            # log(area) reduces crazy dominance of huge blobs
+            base_score = math.log(best_area + 1.0) + 0.8 * best_circ - 0.5 * center_offset
+
+            if has_world:
+                base_score += 2.0  # strong preference for localizable detections
+            elif self.ball_world_est.get(color) is not None:
+                # If we *already* have a world estimate, punish new detections that
+                # fail to produce one, so we don't overwrite good data with bad.
+                base_score -= 2.0
+
+            prev_score = self.ball_detection_score.get(color, float('-inf'))
+
+            # Compare against the current best detection for this color
+            if base_score <= prev_score:
+                self.get_logger().info(
+                    f"[Layer 5] New {color} detection (score={base_score:.2f}) "
+                    f"is worse than existing best (score={prev_score:.2f}); "
+                    f"keeping previous detection.",
+                    throttle_duration_sec=1.0,
+                )
+                # Skip updating state/markers for this color
+                continue
+
+            # This detection wins! Update the "best" record.
+            self.ball_detection_score[color] = base_score
+            self.ball_detection_meta[color] = {
+                "area": float(best_area),
+                "circ": float(best_circ),
+                "center_offset": float(center_offset),
+                "has_world": bool(has_world),
+            }
+
             self.ball_pixel_obs[color] = (cx, cy)
 
-            self.get_logger().info(
-                f'[Layer 4] {color} ball detection: '
-                f'area={best_area:.1f}, circ={best_circ:.3f}, '
-                f'bbox=({x},{y},{rw},{rh}), center=({cx},{cy}).',
-                throttle_duration_sec=1.0
-            )
+            if has_world:
+                wx, wy = world_xy
+                self.ball_world_est[color] = (wx, wy)
+                self.detected_balls[color] = True  # only mark detected if we have a world pose
 
+                self.get_logger().info(
+                    f'[Layer 5] UPDATED BEST {color} ball: '
+                    f'score={prev_score:.2f} -> {base_score:.2f}, '
+                    f'world ≈ ({wx:.2f}, {wy:.2f}), '
+                    f'area={best_area:.1f}, circ={best_circ:.3f}, '
+                    f'center_offset={center_offset:.2f}.',
+                    throttle_duration_sec=1.0,
+                )
+            else:
+                self.get_logger().info(
+                    f'[Layer 5] UPDATED BEST {color} pixel-only detection: '
+                    f'score={prev_score:.2f} -> {base_score:.2f}, '
+                    f'no reliable world range yet, '
+                    f'area={best_area:.1f}, circ={best_circ:.3f}, '
+                    f'center_offset={center_offset:.2f}.',
+                    throttle_duration_sec=1.0,
+                )
+
+            # Draw debug graphics for the *current* best detection
             color_bgr = {
                 'red':   (0, 0, 255),
                 'green': (0, 255, 0),
@@ -1766,7 +1850,7 @@ class Task3(Node):
             cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
             cv2.putText(
                 debug_frame,
-                color,
+                f"{color} s={base_score:.2f}",
                 (x, y - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -1774,28 +1858,6 @@ class Task3(Node):
                 1,
                 cv2.LINE_AA,
             )
-
-            # Try to localize this ball in world coordinates
-            world_xy = self._localize_ball_from_pixel(
-                color, cx, cy, frame.shape[1], frame.shape[0]
-            )
-            if world_xy is not None:
-                wx, wy = world_xy
-                self.ball_world_est[color] = (wx, wy)
-
-                # Only flip the flag the *first* time
-                if not already_localized:
-                    self.detected_balls[color] = True
-                    self.get_logger().info(
-                        f'[Layer 5] Localized {color} ball at world ≈ ({wx:.2f}, {wy:.2f}).',
-                        throttle_duration_sec=1.0
-                    )
-                else:
-                    # Just refine world estimate silently / at debug level
-                    self.get_logger().debug(
-                        f'[Layer 5] Updated {color} ball world estimate to '
-                        f'({wx:.2f}, {wy:.2f}).'
-                    )
 
         # Show debug frame if enabled
         if self.show_debug_image:
@@ -1816,24 +1878,34 @@ class Task3(Node):
         img_cx = img_width / 2.0
         fov_rad = math.radians(self.camera_h_fov_deg)
 
-        pixel_offset = (cx - img_cx) / img_cx
+        # Normalize pixel offset to [-1, 1] across the image width
+        pixel_offset = (cx - img_cx) / max(img_cx, 1.0)
+
+        # Bearing of the pixel in the CAMERA frame
         bearing_cam = pixel_offset * (fov_rad / 2.0)
 
-        self.get_logger().debug(
+        # Convert camera bearing to LASER bearing using the yaw offset parameter
+        yaw_offset_rad = math.radians(self.camera_laser_yaw_offset_deg)
+        bearing_laser = bearing_cam + yaw_offset_rad
+
+        self.get_logger().info(
             f'[Layer 5] Color={color}, pixel_x={cx}, img_cx={img_cx:.1f}, '
-            f'bearing_cam={bearing_cam:.3f} rad.'
+            f'bearing_cam={bearing_cam:.3f} rad, '
+            f'bearing_laser={bearing_laser:.3f} rad (offset={self.camera_laser_yaw_offset_deg:.1f} deg).',
+            throttle_duration_sec=0.5,
         )
 
+        # Look in a small window around the laser bearing
         range_window_rad = math.radians(10.0)
-        r = self._scan_min_in_sector_rad(bearing_cam, range_window_rad)
+        r = self._scan_min_in_sector_rad(bearing_laser, range_window_rad)
         if math.isinf(r) or r <= 0.0:
             self.get_logger().info(
                 f'[Layer 5] No valid scan range for {color} ball (bearing={bearing_cam:.2f} rad).'
             )
             return None
 
-        lx = r * math.cos(bearing_cam)
-        ly = r * math.sin(bearing_cam)
+        lx = r * math.cos(bearing_laser)
+        ly = r * math.sin(bearing_laser)
 
         pose = self.current_pose.pose.pose
         rx = pose.position.x
@@ -1902,7 +1974,15 @@ class Task3(Node):
                 f"[Layer 5] Marker for {color} at world=({wx:.2f}, {wy:.2f})",
                 throttle_duration_sec=1.0,
             )
-
+            idx = self.world_to_grid(wx, wy)
+            if idx is not None:
+                r, c = idx
+                occ = self.static_occupancy[r, c] if self.static_occupancy is not None else -1
+                self.get_logger().info(
+                    f"[Layer 5] {color} marker grid cell=({r},{c}), static_occ={occ}",
+                    throttle_duration_sec=1.0,
+                )
+            
             m = Marker()
             m.header.stamp = now
             m.header.frame_id = 'map'
