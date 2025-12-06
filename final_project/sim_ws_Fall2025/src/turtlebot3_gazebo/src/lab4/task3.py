@@ -14,6 +14,7 @@ from geometry_msgs.msg import (
     PoseStamped,
     Pose,
     PoseArray,
+    Point,
 )
 from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Path
@@ -73,17 +74,30 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 6) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 0.5)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 0.7)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
         self.declare_parameter('l2_min_dt_cells', 2)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
-        self.declare_parameter('max_linear_vel', 0.35)        # m/s
-        self.declare_parameter('max_angular_vel', 1.0)        # rad/s
-        self.declare_parameter('lookahead_distance', 0.6)     # m
-        self.declare_parameter('goal_tolerance', 0.20)        # m
+        self.declare_parameter('max_linear_vel', 0.30)        # m/s
+        self.declare_parameter('max_angular_vel', 0.9)        # rad/s
+        self.declare_parameter('lookahead_distance', 0.5)     # m
+        self.declare_parameter('goal_tolerance', 0.15)        # m
         self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
-        self.declare_parameter('obstacle_avoid_distance', 0.35)  # m, simple stop threshold
+        self.declare_parameter('obstacle_avoid_distance', 0.40)  # m, simple stop threshold
+
+        # NEW: when heading error is large, rotate-only instead of "plowing forward"
+        self.declare_parameter('heading_align_only_threshold', 0.5)  # rad (~30 deg)
+
+        # NEW: slow down when something is near but not yet at avoid distance
+        self.declare_parameter('obstacle_slowdown_distance', 0.80)   # m
+
+        # Align-to-ball (rotate-only) params
+        self.declare_parameter('align_center_tolerance', 0.15)  # normalized [0..1]
+        self.declare_parameter('align_angular_gain', 1.5)       # rad/s per unit error
+        # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
+        self.declare_parameter('align_max_angular_vel', 0.6)    # rad/s
+        self.declare_parameter('align_timeout_sec', 6.0)        # s
 
         # Reactive avoidance tuning (simple escape maneuver)
         self.declare_parameter('obstacle_avoid_back_time', 1.0)      # s
@@ -152,6 +166,33 @@ class Task3(Node):
         self.obstacle_avoid_distance = (
             self.get_parameter('obstacle_avoid_distance').get_parameter_value().double_value
         )
+
+        self.heading_align_only_threshold = (
+            self.get_parameter('heading_align_only_threshold')
+            .get_parameter_value().double_value
+        )
+        self.obstacle_slowdown_distance = (
+            self.get_parameter('obstacle_slowdown_distance')
+            .get_parameter_value().double_value
+        )
+
+        self.align_center_tolerance = (
+            self.get_parameter('align_center_tolerance')
+            .get_parameter_value().double_value
+        )
+        self.align_angular_gain = (
+            self.get_parameter('align_angular_gain')
+            .get_parameter_value().double_value
+        )
+        self.align_timeout_sec = (
+            self.get_parameter('align_timeout_sec')
+            .get_parameter_value().double_value
+        )
+        self.align_max_angular_vel = (
+            self.get_parameter('align_max_angular_vel')
+            .get_parameter_value().double_value
+        )
+
         # Avoidance params
         self.obstacle_avoid_back_time = (
             self.get_parameter('obstacle_avoid_back_time').get_parameter_value().double_value
@@ -280,6 +321,14 @@ class Task3(Node):
         self.task_start_time = None
         self.task_done_time = None
 
+        # Align-to-ball state (rotate-only)
+        self.align_ball_color = None         # which color we're currently aligning to
+        self.align_start_time = None         # rclpy.time.Time
+        self.prev_state_before_align = None  # to resume navigation after alignment
+
+        # For alignment math
+        self.last_image_width = None         # updated every frame in _detect_balls_in_image
+
         # Quality tracking for "best" detection per color
         # Higher score = better ball candidate for that color.
         # Start at -inf so the first valid detection always wins.
@@ -347,6 +396,15 @@ class Task3(Node):
             self._ns_topic('task3_completion_time'),
             10
         )
+
+        # --------------------------------------------------
+        # NEW: geometry_msgs/Point publishers for each color
+        # These are intentionally NOT namespace-prefixed,
+        # because the spec requires exact topic names.
+        # --------------------------------------------------
+        self.red_pos_pub = self.create_publisher(Point, '/red_pos', 10)
+        self.green_pos_pub = self.create_publisher(Point, '/green_pos', 10)
+        self.blue_pos_pub = self.create_publisher(Point, '/blue_pos', 10)
 
         # -------------------------
         # Subscriptions
@@ -789,6 +847,118 @@ class Task3(Node):
             f'[Layer 2] Prune complete. Kept {len(pruned)} waypoints.'
         )
         return pruned
+
+    def _astar_distance_between_points(self, p1, p2):
+        """
+        Estimate travel cost between two waypoints using A* path length
+        over the inflated map.
+
+        Returns a distance in meters. If no path is found, returns a very
+        large penalty so that route construction avoids this edge.
+        """
+        path = self.astar_plan(p1, p2)
+        if path is None or len(path) < 2:
+            # Unreachable or degenerate; treat as huge cost
+            return 1e6
+
+        total = 0.0
+        for (x1, y1), (x2, y2) in zip(path[:-1], path[1:]):
+            total += math.hypot(x2 - x1, y2 - y1)
+        return total
+
+    def _build_astar_distance_matrix(self, points):
+        """
+        Precompute pairwise A* distances between waypoints.
+
+        points: list of (x, y) in world coordinates.
+
+        Returns:
+            dist[i][j] = A* path length (meters) from points[i] to points[j],
+                         or a large value if no path exists.
+        """
+        n = len(points)
+        dist = [[0.0] * n for _ in range(n)]
+
+        self.get_logger().info(
+            f'[Layer 2] Building A* distance matrix for {n} waypoints. '
+            'This may take a few seconds...'
+        )
+
+        for i in range(n):
+            dist[i][i] = 0.0
+            for j in range(i + 1, n):
+                d = self._astar_distance_between_points(points[i], points[j])
+                dist[i][j] = d
+                dist[j][i] = d
+
+        self.get_logger().info('[Layer 2] A* distance matrix computation complete.')
+        return dist
+
+    def _nearest_neighbor_route_astar(self, points, start_xy):
+        """
+        Construct a route over `points` using a greedy nearest neighbor
+        heuristic, where "distance" is A* path length on the map.
+
+        This tends to respect doors / corridors and avoids suggesting
+        jumps through walls like straight-line distances do.
+        """
+        n = len(points)
+        if n == 0:
+            self.get_logger().warn('[Layer 2] _nearest_neighbor_route_astar: no points.')
+            return []
+
+        # Precompute A* distances between all waypoints
+        dist = self._build_astar_distance_matrix(points)
+
+        # Choose initial waypoint as the one closest (Euclidean) to start pose
+        best_first = None
+        best_d = float('inf')
+        for i, (x, y) in enumerate(points):
+            d = math.hypot(x - start_xy[0], y - start_xy[1])
+            if d < best_d:
+                best_d = d
+                best_first = i
+
+        if best_first is None:
+            self.get_logger().warn(
+                '[Layer 2] _nearest_neighbor_route_astar: could not pick first waypoint.'
+            )
+            return []
+
+        unvisited = set(range(n))
+        route = []
+        cur = best_first
+        route.append(cur)
+        unvisited.remove(cur)
+
+        self.get_logger().info(
+            f'[Layer 2] _nearest_neighbor_route_astar: starting from index {cur}.'
+        )
+
+        while unvisited:
+            next_idx = None
+            next_cost = float('inf')
+            for j in unvisited:
+                d = dist[cur][j]
+                if d < next_cost:
+                    next_cost = d
+                    next_idx = j
+
+            if next_idx is None:
+                # Something went very wrong; break out
+                self.get_logger().warn(
+                    '[Layer 2] _nearest_neighbor_route_astar: no next waypoint found.'
+                )
+                break
+
+            route.append(next_idx)
+            unvisited.remove(next_idx)
+            cur = next_idx
+
+        self.get_logger().info(
+            f'[Layer 2] _nearest_neighbor_route_astar built route of length {len(route)}.'
+        )
+        return route
 
     def _nearest_neighbor_route(self, points, start_xy):
         n = len(points)
@@ -1353,9 +1523,16 @@ class Task3(Node):
         self.get_logger().info(f'[Layer 3] RRT*: local path length = {len(path)} waypoints.')
         return path
 
-    def _obstacle_too_close_ahead(self, max_distance=0.5, fov_deg=40.0):
+    def _obstacle_too_close_ahead(self, max_distance=None, fov_deg=60.0):
+        """
+        Return True if any obstacle is closer than max_distance in a symmetric
+        FOV around the front. Defaults to self.obstacle_avoid_distance.
+        """
         if self.latest_scan is None:
             return False
+
+        if max_distance is None:
+            max_distance = self.obstacle_avoid_distance
 
         scan = self.latest_scan
         half_fov = math.radians(fov_deg / 2.0)
@@ -1365,10 +1542,14 @@ class Task3(Node):
             if math.isinf(r) or math.isnan(r):
                 angle += scan.angle_increment
                 continue
-            if abs(angle) <= half_fov and scan.range_min < r < max_distance:
+            if r < scan.range_min or r > scan.range_max:
+                angle += scan.angle_increment
+                continue
+
+            if abs(angle) <= half_fov and r < max_distance:
                 self.get_logger().info(
                     f'[Layer 3] Obstacle too close ahead: range={r:.2f} m, '
-                    f'threshold={max_distance:.2f} m.'
+                    f'threshold={max_distance:.2f} m, angle={angle:.2f} rad.'
                 )
                 return True
             angle += scan.angle_increment
@@ -1507,6 +1688,7 @@ class Task3(Node):
         gx, gy = self.active_path_points[-1]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
 
+        # Close enough to final goal
         if dist_to_goal < self.goal_tolerance:
             self.get_logger().info(
                 f'[Layer 3] Goal reached (distance={dist_to_goal:.3f} < '
@@ -1515,6 +1697,7 @@ class Task3(Node):
             self._publish_stop()
             return True
 
+        # Find nearest point on path
         nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
         if nearest_idx is None:
             self._publish_stop()
@@ -1522,6 +1705,7 @@ class Task3(Node):
 
         self.current_path_index = nearest_idx
 
+        # Pure pursuit: choose a lookahead target along the path
         target_idx = nearest_idx
         while target_idx < len(self.active_path_points) - 1:
             tx, ty = self.active_path_points[target_idx]
@@ -1545,18 +1729,43 @@ class Task3(Node):
         desired_yaw = math.atan2(dy, dx)
         heading_error = self._normalize_angle(desired_yaw - yaw)
 
-        heading_factor = max(0.0, 1.0 - abs(heading_error) / math.pi)
+        # --- Heading-only region: if we're turned far away, stop linear motion
+        if abs(heading_error) > self.heading_align_only_threshold:
+            heading_factor = 0.0
+        else:
+            heading_factor = max(0.0, 1.0 - abs(heading_error) / math.pi)
+
+        # Base linear speed from heading + distance
         linear_speed = self.max_linear_vel * heading_factor
 
-        if dist_to_goal < 0.5:
-            linear_speed *= dist_to_goal / 0.5
+        # Smooth braking as we approach final goal
+        if dist_to_goal < 0.6:
+            # Scale down linearly inside 0.6 m
+            linear_speed *= dist_to_goal / 0.6
 
+        # --- Obstacle-aware slowdown ahead (do NOT handle full avoidance here)
+        slowdown_factor = 1.0
+        if self.latest_scan is not None and self.obstacle_slowdown_distance > self.obstacle_avoid_distance:
+            slow_min = self._scan_min_in_sector(0.0, 60.0)  # front 60 deg
+            if not math.isinf(slow_min):
+                if slow_min <= self.obstacle_avoid_distance:
+                    slowdown_factor = 0.0
+                elif slow_min < self.obstacle_slowdown_distance:
+                    # Map [avoid_distance, slowdown_distance] -> [0, 1]
+                    num = slow_min - self.obstacle_avoid_distance
+                    den = (self.obstacle_slowdown_distance - self.obstacle_avoid_distance + 1e-3)
+                    slowdown_factor = max(0.0, min(1.0, num / den))
+
+        linear_speed *= slowdown_factor
+
+        # Angular control
         angular_speed = self.angular_gain * heading_error
         if angular_speed > self.max_angular_vel:
             angular_speed = self.max_angular_vel
         elif angular_speed < -self.max_angular_vel:
             angular_speed = -self.max_angular_vel
 
+        # If obstacle is close, linear_speed may be zero from slowdown_factor
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = angular_speed
@@ -1572,32 +1781,44 @@ class Task3(Node):
         return False
 
     def _choose_next_waypoint_index(self):
-        if not self.patrol_waypoints or self.current_pose is None:
+        """
+        Choose the next waypoint in the *precomputed patrol order*.
+
+        Instead of "nearest unvisited by Euclidean distance", we simply
+        walk forward along self.patrol_waypoints, skipping any that are
+        already in visited_waypoints.
+
+        This encourages a single sweep through the environment: once we
+        have moved past a region along the patrol route, we don't jump
+        back to waypoints behind us unless everything ahead is exhausted.
+        """
+        if not self.patrol_waypoints:
             return None
 
-        rx = self.current_pose.pose.pose.position.x
-        ry = self.current_pose.pose.pose.position.y
+        # If we have never chosen a waypoint yet, start from the beginning
+        start_idx = 0 if self.current_waypoint_idx is None else self.current_waypoint_idx + 1
 
-        best_idx = None
-        best_dist = float('inf')
+        # First, try to find the next unvisited waypoint *after* the current one
+        for i in range(start_idx, len(self.patrol_waypoints)):
+            if i not in self.visited_waypoints:
+                self.get_logger().info(
+                    f'[Layer 3] _choose_next_waypoint_index: chose #{i} '
+                    f'by route order (forward sweep).'
+                )
+                return i
 
-        for i, (wx, wy) in enumerate(self.patrol_waypoints):
-            if i in self.visited_waypoints:
-                continue
-            d = math.hypot(wx - rx, wy - ry)
-            if d < best_dist:
-                best_dist = d
-                best_idx = i
+        # If we didn't find anything forward (e.g. some early ones were skipped
+        # due to A* failure), fall back to any remaining unvisited earlier in the list.
+        for i in range(0, start_idx):
+            if i not in self.visited_waypoints:
+                self.get_logger().info(
+                    f'[Layer 3] _choose_next_waypoint_index: no forward candidates, '
+                    f'chose leftover #{i} behind current position.'
+                )
+                return i
 
-        if best_idx is not None:
-            self.get_logger().info(
-                f'[Layer 3] _choose_next_waypoint_index: chose #{best_idx} '
-                f'at dist={best_dist:.2f} m.'
-            )
-        else:
-            self.get_logger().info('[Layer 3] _choose_next_waypoint_index: no unvisited waypoints.')
-
-        return best_idx
+        self.get_logger().info('[Layer 3] _choose_next_waypoint_index: no unvisited waypoints.')
+        return None
 
     # ----------------------------------------------------------------------
     # Layer 4: Vision / ball detection
@@ -1642,6 +1863,9 @@ class Task3(Node):
         """
         if frame is None:
             return
+        
+        # Remember latest image width for alignment math
+        self.last_image_width = frame.shape[1]
 
         # --- Convert to HSV once ---
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -1769,11 +1993,20 @@ class Task3(Node):
             # How far from the horizontal center of the image? 0 = perfect center, 1 = edge.
             center_offset = abs(cx - img_cx) / max(img_cx, 1.0)
 
-            # Try to localize this ball in world coordinates
-            world_xy = self._localize_ball_from_pixel(
-                color, cx, cy, frame.shape[1], frame.shape[0]
-            )
-            has_world = world_xy is not None
+            # Only try LiDAR-based localization when the ball is roughly centered.
+            # This forces the "ALIGN_TO_BALL" state to run first.
+            world_xy = None
+            has_world = False
+            if center_offset <= self.align_center_tolerance:
+                world_xy = self._localize_ball_from_pixel(
+                    color, cx, cy, frame.shape[1], frame.shape[0]
+                )
+                has_world = world_xy is not None
+            else:
+                self.get_logger().debug(
+                    f"[Layer 5] {color} ball off-center (offset={center_offset:.2f}), "
+                    "skipping LiDAR-based localization until aligned."
+                )
 
             # -----------------------------
             # Build a scalar quality score:
@@ -1790,7 +2023,7 @@ class Task3(Node):
             elif self.ball_world_est.get(color) is not None:
                 # If we *already* have a world estimate, punish new detections that
                 # fail to produce one, so we don't overwrite good data with bad.
-                base_score -= 2.0
+                base_score -= 0.5
 
             prev_score = self.ball_detection_score.get(color, float('-inf'))
 
@@ -1838,6 +2071,22 @@ class Task3(Node):
                     f'center_offset={center_offset:.2f}.',
                     throttle_duration_sec=1.0,
                 )
+            
+            # If we don't yet have a world pose for this color,
+            # and the ball is not well-centered, trigger "rotate-only" alignment.
+            if (
+                not self.detected_balls[color] and  # we haven't locked in a world pose yet
+                self.state not in ['ALIGN_TO_BALL', 'TASK_DONE']
+            ):
+                if center_offset > self.align_center_tolerance:
+                    self.align_ball_color = color
+                    self.align_start_time = self.get_clock().now()
+                    self.prev_state_before_align = self.state
+                    self.state = 'ALIGN_TO_BALL'
+                    self.get_logger().info(
+                        f"[Layer 5] Starting ALIGN_TO_BALL for '{color}' "
+                        f"(center_offset={center_offset:.2f} > tol={self.align_center_tolerance:.2f})."
+                    )
 
             # Draw debug graphics for the *current* best detection
             color_bgr = {
@@ -1881,8 +2130,13 @@ class Task3(Node):
         # Normalize pixel offset to [-1, 1] across the image width
         pixel_offset = (cx - img_cx) / max(img_cx, 1.0)
 
-        # Bearing of the pixel in the CAMERA frame
-        bearing_cam = pixel_offset * (fov_rad / 2.0)
+        # If the ball is near the center of the image, treat it as "straight ahead"
+        # so we can use the front LiDAR beam for distance.
+        if abs(pixel_offset) < self.align_center_tolerance:
+            bearing_cam = 0.0
+        else:
+            # Bearing of the pixel in the CAMERA frame
+            bearing_cam = pixel_offset * (fov_rad / 2.0)
 
         # Convert camera bearing to LASER bearing using the yaw offset parameter
         yaw_offset_rad = math.radians(self.camera_laser_yaw_offset_deg)
@@ -1899,8 +2153,13 @@ class Task3(Node):
         range_window_rad = math.radians(10.0)
         r = self._scan_min_in_sector_rad(bearing_laser, range_window_rad)
         if math.isinf(r) or r <= 0.0:
-            self.get_logger().info(
-                f'[Layer 5] No valid scan range for {color} ball (bearing={bearing_cam:.2f} rad).'
+            # No good LiDAR distance yet – keep this as an image-only detection.
+            # The scoring logic will still keep the best image candidate, and
+            # once LiDAR sees the ball, a new detection will upgrade it to
+            # a full world localization.
+            self.get_logger().debug(
+                f'[Layer 5] No valid scan range for {color} ball at this bearing; '
+                'keeping detection as image-only for now.'
             )
             return None
 
@@ -1936,6 +2195,91 @@ class Task3(Node):
             )
 
         return wx, wy
+    
+    def _handle_align_to_ball(self):
+        """
+        Rotate-in-place behavior to center the currently tracked ball in the camera.
+        Uses ball_pixel_obs[align_ball_color] to compute horizontal offset and
+        commands only angular velocity (no forward motion).
+        """
+        if self.align_ball_color is None:
+            self.get_logger().warn(
+                '[Layer 5] ALIGN_TO_BALL: no align_ball_color set, returning to previous state.'
+            )
+            self.state = self.prev_state_before_align or 'FOLLOW_PATH'
+            self._publish_stop()
+            return
+
+        color = self.align_ball_color
+
+        # Timeout protection
+        if self.align_start_time is not None:
+            dt = (self.get_clock().now() - self.align_start_time).nanoseconds / 1e9
+            if dt > self.align_timeout_sec:
+                self.get_logger().warn(
+                    f'[Layer 5] ALIGN_TO_BALL: timeout after {dt:.1f}s for {color}, '
+                    f'returning to {self.prev_state_before_align}.'
+                )
+                self.align_ball_color = None
+                self.state = self.prev_state_before_align or 'FOLLOW_PATH'
+                self._publish_stop()
+                return
+
+        pix = self.ball_pixel_obs.get(color)
+        if pix is None or self.last_image_width is None:
+            # No current target pixel; just stop and wait a bit
+            self._publish_stop()
+            return
+
+        cx, cy = pix
+        img_cx = self.last_image_width / 2.0
+
+        # normalized horizontal error: -1 (far left) .. 0 (center) .. +1 (far right)
+        norm_err = (cx - img_cx) / max(img_cx, 1.0)
+
+        # Tiny deadband: ignore tiny jitter
+        if abs(norm_err) < 0.02:
+            norm_err = 0.0
+
+        # Check if we are already aligned
+        if abs(norm_err) <= self.align_center_tolerance:
+            self.get_logger().info(
+                f"[Layer 5] ALIGN_TO_BALL: '{color}' centered "
+                f"(err={norm_err:.2f} <= tol={self.align_center_tolerance:.2f})."
+            )
+            self._publish_stop()
+            self.align_ball_color = None
+            self.state = self.prev_state_before_align or 'FOLLOW_PATH'
+            return
+
+        # Non-linear (cubic) shaping: large errors turn fast, small errors turn gently
+        shaped_err = norm_err ** 3
+        ang = - self.align_angular_gain * shaped_err  # sign: positive err -> rotate towards center
+
+        # Clamp to a gentler max specifically for alignment
+        if ang > self.align_max_angular_vel:
+            ang = self.align_max_angular_vel
+        elif ang < -self.align_max_angular_vel:
+            ang = -self.align_max_angular_vel
+
+        # Ensure we don't command absurdly tiny speeds when far from center:
+        if norm_err != 0.0:
+            min_turn = 0.15  # rad/s
+            if ang > 0.0:
+                ang = max(min_turn, ang)
+            else:
+                ang = min(-min_turn, ang)
+
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = float(ang)
+        self.cmd_vel_pub.publish(twist)
+
+        self.get_logger().info(
+            f"[Layer 5] ALIGN_TO_BALL: color={color}, norm_err={norm_err:.2f}, "
+            f"cmd_w={ang:.2f} rad/s",
+            throttle_duration_sec=0.5,
+        )
 
     # ----------------------------------------------------------------------
     # Layer 5: Ball markers & completion
@@ -2022,6 +2366,41 @@ class Task3(Node):
         else:
             self.get_logger().debug("[Layer 5] No ball markers to publish.")
 
+    def _publish_ball_points(self):
+        """
+        Publish final geometry_msgs/Point for each ball color on:
+          /red_pos, /green_pos, /blue_pos
+
+        Only called once when all balls are localized, from
+        _maybe_finish_task_if_balls_found().
+        """
+        color_to_pub = {
+            'red': self.red_pos_pub,
+            'green': self.green_pos_pub,
+            'blue': self.blue_pos_pub,
+        }
+
+        for color in self.ball_colors:
+            wx, wy = self.ball_world_est.get(color, (None, None))
+            if wx is None or wy is None:
+                self.get_logger().warn(
+                    f"[Layer 5] Cannot publish /{color}_pos: missing world_est."
+                )
+                continue
+
+            pt = Point()
+            pt.x = float(wx)
+            pt.y = float(wy)
+            pt.z = 0.0
+
+            pub = color_to_pub.get(color, None)
+            if pub is not None:
+                pub.publish(pt)
+                self.get_logger().info(
+                    f"[Layer 5] Published {color} position on /{color}_pos: "
+                    f"({pt.x:.2f}, {pt.y:.2f}, {pt.z:.2f})"
+                )
+
     def _publish_balls_posearray_and_time(self):
         if not all(self.detected_balls.values()):
             return
@@ -2067,16 +2446,38 @@ class Task3(Node):
             )
 
     def _maybe_finish_task_if_balls_found(self):
+        """
+        Called periodically from timer_cb.
+
+        Semantics now:
+        - As soon as ALL balls are localized at least once in world coordinates,
+          we publish:
+            * RViz markers
+            * PoseArray
+            * completion time
+            * geometry_msgs/Point on /red_pos, /green_pos, /blue_pos
+        - BUT we do NOT change the navigation state anymore.
+          The robot keeps patrolling until all waypoints are visited.
+        """
         if not all(self.detected_balls.values()):
             return
 
-        if self.state != 'TASK_DONE':
-            self.get_logger().info('[Layer 5] All balls detected. Finalizing task.')
-            self._publish_ball_markers()
-            self._publish_balls_posearray_and_time()
-            self.task_done_time = self.get_clock().now()
-            self.state = 'TASK_DONE'
-            self._publish_stop()
+        # Already finalized once – don't spam topics.
+        if self.task_done_time is not None:
+            return
+
+        self.get_logger().info('[Layer 5] All balls localized at least once. Finalizing results.')
+
+        # Publish markers + PoseArray + completion time
+        self._publish_ball_markers()
+        self._publish_balls_posearray_and_time()
+
+        # NEW: publish geometry_msgs/Point to /red_pos, /green_pos, /blue_pos
+        self._publish_ball_points()
+
+        # Mark logical "task completion time" (for localization),
+        # but do NOT change self.state; patrol can still continue.
+        self.task_done_time = self.get_clock().now()
 
     # ----------------------------------------------------------------------
     # Subscriber callbacks
@@ -2305,6 +2706,10 @@ class Task3(Node):
                 f'(len={len(path_world)}). Switching to FOLLOW_PATH.'
             )
             self.state = 'FOLLOW_PATH'
+            return
+
+        if self.state == 'ALIGN_TO_BALL':
+            self._handle_align_to_ball()
             return
 
         if self.state == 'FOLLOW_PATH':
