@@ -71,12 +71,12 @@ class Task3(Node):
         # -------------------------
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')          # logical map name (map.yaml in maps/)
-        self.declare_parameter('inflation_kernel', 6) # for static obstacle inflation
+        self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 0.7)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 1.8)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 2)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 4)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
@@ -90,7 +90,7 @@ class Task3(Node):
         self.declare_parameter('heading_align_only_threshold', 0.5)  # rad (~30 deg)
 
         # NEW: slow down when something is near but not yet at avoid distance
-        self.declare_parameter('obstacle_slowdown_distance', 0.80)   # m
+        self.declare_parameter('obstacle_slowdown_distance', 0.60)   # m
 
         # Align-to-ball (rotate-only) params
         self.declare_parameter('align_center_tolerance', 0.15)  # normalized [0..1]
@@ -98,6 +98,11 @@ class Task3(Node):
         # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
         self.declare_parameter('align_max_angular_vel', 0.6)    # rad/s
         self.declare_parameter('align_timeout_sec', 6.0)        # s
+
+        # NEW: scan-at-waypoint params (full 360° spin)
+        self.declare_parameter('scan_angular_vel', 0.5)         # rad/s
+        self.declare_parameter('scan_turns', 1.0)               # number of full rotations
+        self.declare_parameter('scan_timeout_sec', 12.0)        # safety timeout
 
         # Reactive avoidance tuning (simple escape maneuver)
         self.declare_parameter('obstacle_avoid_back_time', 1.0)      # s
@@ -108,20 +113,20 @@ class Task3(Node):
 
         # Dynamic obstacle + RRT* related
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 6)
+        self.declare_parameter('dynamic_inflation_kernel', 7)
 
         # RRT* parameters (borrowed from Task2)
-        self.declare_parameter('rrt_max_iterations', 1200)
-        self.declare_parameter('rrt_step_size', 0.25)         # meters
+        self.declare_parameter('rrt_max_iterations', 1600)
+        self.declare_parameter('rrt_step_size', 0.20)         # meters
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
-        self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
-        self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
+        self.declare_parameter('rrt_neighbor_radius', 0.7)    # meters
+        self.declare_parameter('rrt_local_range', 3.5)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
 
         # Camera model (approximate)
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
-        self.declare_parameter('ball_min_contour_area', 150)  # px, to filter noise
-        self.declare_parameter('ball_min_circularity', 0.65)  # shape filter (0–1)
+        self.declare_parameter('ball_min_contour_area', 120)  # px, to filter noise
+        self.declare_parameter('ball_min_circularity', 0.50)  # shape filter (0–1)
         # Yaw offset between camera optical axis and LaserScan 0-angle (in degrees).
         # Positive = camera is rotated CCW relative to the scan.
         self.declare_parameter('camera_laser_yaw_offset_deg', 0.0)
@@ -190,6 +195,20 @@ class Task3(Node):
         )
         self.align_max_angular_vel = (
             self.get_parameter('align_max_angular_vel')
+            .get_parameter_value().double_value
+        )
+
+        # NEW: scan-at-waypoint
+        self.scan_angular_vel = (
+            self.get_parameter('scan_angular_vel')
+            .get_parameter_value().double_value
+        )
+        self.scan_turns = (
+            self.get_parameter('scan_turns')
+            .get_parameter_value().double_value
+        )
+        self.scan_timeout_sec = (
+            self.get_parameter('scan_timeout_sec')
             .get_parameter_value().double_value
         )
 
@@ -301,10 +320,19 @@ class Task3(Node):
         self.local_replan_goal_index = None
         self.rrt_fail_count = 0
 
+        # NEW: track whether a local (RRT*) path is currently being followed
+        self.local_plan_active = False
+
         # -------------------------
         # High-level task state machine
         # -------------------------
         self.state = 'WAIT_FOR_POSE'
+
+        # Scan-at-waypoint bookkeeping
+        self.scan_start_time = None
+        self.scan_start_yaw = None
+        self.scan_last_yaw = None
+        self.scan_accum_angle = 0.0
 
         # Simple reactive avoidance state
         self.avoidance_phase = None               # 'BACK', 'TURN', 'FORWARD'
@@ -1134,6 +1162,19 @@ class Task3(Node):
         return True
 
     def is_cell_free_rrt(self, row: int, col: int) -> bool:
+        """
+        RRT*-specific cell-free check.
+
+        Special case: allow the RRT* start cell even if inflated/dynamic occupancy
+        says it's blocked. This lets the tree grow *out* of a "stuck" start.
+        """
+        # If we know the RRT* start cell, treat it as free
+        if hasattr(self, 'rrt_start_idx') and self.rrt_start_idx is not None:
+            sr, sc = self.rrt_start_idx
+            if row == sr and col == sc:
+                return True
+
+        # Normal clearance check everywhere else
         k = max(0, int(self.rrt_clearance_cells))
         for r in range(row - k, row + k + 1):
             for c in range(col - k, col + k + 1):
@@ -1448,6 +1489,10 @@ class Task3(Node):
         gx, gy = goal_xy
         cx, cy = center_xy
 
+        # Remember the RRT* start cell so we can treat it as free
+        self.rrt_start_xy = (sx, sy)
+        self.rrt_start_idx = self.world_to_grid(sx, sy)
+
         self.get_logger().info(
             f'[Layer 3] RRT*: start={start_xy}, goal={goal_xy}, center={center_xy}, '
             f'max_iter={self.rrt_max_iterations}'
@@ -1511,6 +1556,7 @@ class Task3(Node):
 
         if goal_node is None:
             self.get_logger().warn('[Layer 3] RRT*: failed to find a local path.')
+            self.rrt_start_idx = None
             return None
 
         path = []
@@ -1521,6 +1567,7 @@ class Task3(Node):
         path.reverse()
 
         self.get_logger().info(f'[Layer 3] RRT*: local path length = {len(path)} waypoints.')
+        self.rrt_start_idx = None
         return path
 
     def _obstacle_too_close_ahead(self, max_distance=None, fov_deg=60.0):
@@ -1555,6 +1602,53 @@ class Task3(Node):
             angle += scan.angle_increment
 
         return False
+
+    def _scan_median_in_sector_rad(self, center_rad: float, width_rad: float) -> float:
+        """
+        Return the median range in a sector around center_rad.
+
+        Used for localization (balls), which is less sensitive to a single
+        spurious beam and more interested in a stable, typical distance.
+        """
+        if self.latest_scan is None:
+            return float('inf')
+
+        scan = self.latest_scan
+        half = width_rad / 2.0
+
+        angle = scan.angle_min
+        vals = []
+
+        for r in scan.ranges:
+            if math.isinf(r) or math.isnan(r):
+                angle += scan.angle_increment
+                continue
+
+            # Ignore extremes: walls far away or invalid close junk
+            if r < scan.range_min or r > 0.95 * scan.range_max:
+                angle += scan.angle_increment
+                continue
+
+            if (center_rad - half) <= angle <= (center_rad + half):
+                vals.append(r)
+
+            angle += scan.angle_increment
+
+        if not vals:
+            return float('inf')
+
+        vals.sort()
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            med = vals[mid]
+        else:
+            med = 0.5 * (vals[mid - 1] + vals[mid])
+
+        self.get_logger().debug(
+            f"[Layer 5] _scan_median_in_sector_rad: center={center_rad:.3f}, "
+            f"width={width_rad:.3f}, median={med:.2f}, n={len(vals)}"
+        )
+        return med
 
     def _scan_min_in_sector_rad(self, center_rad: float, width_rad: float) -> float:
         if self.latest_scan is None:
@@ -1617,6 +1711,86 @@ class Task3(Node):
             f'direction={self.avoidance_direction}.'
         )
 
+    def _start_scan_at_waypoint(self):
+        """
+        Initialize 360° scan at the current waypoint.
+        """
+        if self.current_pose is None:
+            return
+
+        pose = self.current_pose.pose.pose
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        self.scan_start_time = self.get_clock().now()
+        self.scan_start_yaw = yaw
+        self.scan_last_yaw = yaw
+        self.scan_accum_angle = 0.0
+
+        self.get_logger().info(
+            '[Layer 3] Starting SCAN_AT_WAYPOINT: rotating in place to search for balls.'
+        )
+
+    def _handle_scan_at_waypoint(self):
+        """
+        Rotate in place until we accumulate ~2π * scan_turns radians of rotation
+        (or hit a timeout). Vision is active only during this state.
+        """
+        if self.current_pose is None:
+            self._publish_stop()
+            return
+
+        if self.scan_start_time is None:
+            # Safety: if not properly initialized, initialize now.
+            self._start_scan_at_waypoint()
+
+        now = self.get_clock().now()
+        dt = (now - self.scan_start_time).nanoseconds / 1e9
+
+        # Check timeout
+        if dt > self.scan_timeout_sec:
+            self.get_logger().warn(
+                f'[Layer 3] SCAN_AT_WAYPOINT timeout after {dt:.1f}s. '
+                'Continuing to next waypoint.'
+            )
+            self._publish_stop()
+            self.state = 'SELECT_NEXT_WAYPOINT'
+            return
+
+        pose = self.current_pose.pose.pose
+        yaw = self._quat_to_yaw(pose.orientation)
+
+        if self.scan_last_yaw is None:
+            self.scan_last_yaw = yaw
+
+        # Increment accumulated absolute rotation
+        dyaw = self._normalize_angle(yaw - self.scan_last_yaw)
+        self.scan_accum_angle += abs(dyaw)
+        self.scan_last_yaw = yaw
+
+        required_angle = 2.0 * math.pi * self.scan_turns
+
+        if self.scan_accum_angle >= required_angle:
+            self.get_logger().info(
+                f'[Layer 3] SCAN_AT_WAYPOINT complete: '
+                f'accum_angle={self.scan_accum_angle:.2f} rad '
+                f'(required={required_angle:.2f}).'
+            )
+            self._publish_stop()
+            self.state = 'SELECT_NEXT_WAYPOINT'
+            return
+
+        # Command in-place rotation
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = float(self.scan_angular_vel)
+        self.cmd_vel_pub.publish(twist)
+
+        self.get_logger().info(
+            f'[Layer 3] SCAN_AT_WAYPOINT: accum_angle={self.scan_accum_angle:.2f} / '
+            f'{required_angle:.2f} rad, cmd_w={twist.angular.z:.2f}.',
+            throttle_duration_sec=0.5
+        )
+
     def _handle_avoid_obstacle(self):
         if self.avoidance_phase is None:
             self._start_avoidance()
@@ -1669,10 +1843,11 @@ class Task3(Node):
 
                 self.get_logger().info(
                     '[Layer 3] AVOID_OBSTACLE: maneuver complete. '
-                    'Switching to PLAN_TO_WAYPOINT for replanning.'
+                    'Returning to FOLLOW_PATH without replanning.'
                 )
 
-                self.state = 'PLAN_TO_WAYPOINT'
+                # Go back to following the existing active_path_points
+                self.state = 'FOLLOW_PATH'
                 return
 
     def _follow_active_path(self):
@@ -1695,6 +1870,8 @@ class Task3(Node):
                 f'{self.goal_tolerance:.3f}).'
             )
             self._publish_stop()
+            # We have finished this segment (global or local); allow future replans.
+            self.local_plan_active = False
             return True
 
         # Find nearest point on path
@@ -1848,57 +2025,58 @@ class Task3(Node):
 
     def _detect_balls_in_image(self, frame):
         """
-        Detect red, green, blue balls using calibrated HSV centers and
-        strong shape filtering to avoid brick / orange / text false positives.
+        Detect red, green, blue balls using HSV + soft shape scoring.
 
-        Updates:
-            - self.ball_pixel_obs[color] = (cx, cy)
-            - self.ball_world_est[color] if localization succeeds
-            - self.detected_balls[color] flags
-
-        Additionally:
-            - Once a ball color has been successfully localized (world pose available),
-              we skip processing that color on subsequent frames, so we don't keep
-              chasing already-found balls.
+        Changes vs previous version:
+        - Looser HSV and S/V thresholds (more candidates).
+        - Aspect, area, and circularity mostly handled by the score,
+            with only very weak hard rejections.
+        - Still keeps "best detection so far" via self.ball_detection_score[color].
         """
         if frame is None:
             return
-        
-        # Remember latest image width for alignment math
+
         self.last_image_width = frame.shape[1]
 
-        # --- Convert to HSV once ---
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
-
-        # Hue distance must be computed modulo 180, so use int16
         h = h.astype(np.int16)
 
-        # Calibrated hue centers from your example images (center of balls)
+        # Tuned hue centers (same as before)
         color_centers = {
-            'red': 0,      # redball center ~0
-            'green': 60,   # greenball center ~60
-            'blue': 120,   # blueball center ~120
+            'red': 0,
+            'green': 60,
+            'blue': 120,
         }
 
-        # Hue tolerances (in degrees)
+        # Slightly wider hue windows
         hue_tolerances = {
-            'red': 10,
-            'green': 10,
-            'blue': 10,
+            'red': 15,   # was 10
+            'green': 12, # was 10
+            'blue': 12,  # was 10
         }
 
-        # Strong saturation / brightness thresholds
-        s_thresh = 100
-        v_thresh = 60
+        # Looser S/V thresholds: allow slightly duller colors
+        s_thresh = 80   # was 100
+        v_thresh = 50   # was 60
 
-        # Per-color minimum area (pixels) to reject tiny blobs
-        base_min_area = float(self.ball_min_contour_area)
-        color_min_area = {
-            'red':  1.5* base_min_area,
-            'green': base_min_area,
-            'blue':  base_min_area,
+        # Base area threshold from parameter; we will be soft with it
+        base_min_area_param = float(self.ball_min_contour_area)
+        # Allow small blobs, but prefer larger ones
+        base_min_area_soft = 0.5 * base_min_area_param  # soft area threshold
+        base_min_area_hard = 0.2 * base_min_area_param  # anything below this is likely noise
+
+        # Per-color scaling (red slightly larger to avoid brick specks)
+        color_area_scale = {
+            'red': 1.1,
+            'green': 0.8,
+            'blue': 0.8,
         }
+
+        # Global circularity threshold from params
+        min_circ_param = float(self.ball_min_circularity)
+        circ_soft = max(0.35, 0.7 * min_circ_param)  # soft penalty region
+        circ_hard = 0.25                              # anything below this is too non-circular
 
         debug_frame = frame.copy()
 
@@ -1906,20 +2084,14 @@ class Task3(Node):
             if color not in color_centers:
                 continue
 
-            # Track if we have *some* world estimate already, but do not skip:
-            # new detections can still be *better* and replace the old one.
-            already_localized = (
-                self.detected_balls[color] and
-                self.ball_world_est.get(color) is not None
-            )
-            
             center_h = color_centers[color]
             h_tol = hue_tolerances[color]
-            min_area = color_min_area.get(color, base_min_area)
+            area_soft = color_area_scale.get(color, 1.0) * base_min_area_soft
+            area_hard = color_area_scale.get(color, 1.0) * base_min_area_hard
 
-            # --- Build color mask using hue distance + S/V ---
+            # --- Color mask ---
             diff = np.abs(h - center_h)
-            diff = np.minimum(diff, 180 - diff)  # wrap-around-safe distance
+            diff = np.minimum(diff, 180 - diff)
 
             mask = (
                 (diff <= h_tol) &
@@ -1945,56 +2117,122 @@ class Task3(Node):
                 continue
 
             best_contour = None
-            best_area = 0.0
-            best_circ = 0.0
+            best_score = float('-inf')
+            best_meta = None
+
+            img_width = frame.shape[1]
+            img_cx = img_width / 2.0
 
             for c in contours:
-                # Reject elongated blobs (brick edges, streaks, etc.)
                 x_c, y_c, rw, rh = cv2.boundingRect(c)
                 aspect = max(rw, rh) / max(1, min(rw, rh))
-                # Tunable: 1.7 means anything more stretched than ~1.7:1 is not “ball-like”
-                if aspect > 1.7:
+
+                # Very elongated things (e.g. big brick edges) – still reject hard
+                if aspect > 2.3:
                     continue
 
                 area, circ = self._contour_circularity(c)
 
+                # Hard area floor – tiny specks are noise
+                if area < area_hard:
+                    continue
+
+                # Very non-circular blobs are probably not balls at all
+                if circ < circ_hard:
+                    continue
+
+                cx = int(x_c + rw / 2)
+                cy = int(y_c + rh / 2)
+
+                center_offset = abs(cx - img_cx) / max(img_cx, 1.0)
+
+                # --- Soft scoring ---
+                # Larger area -> better (log to avoid domination by huge blobs)
+                score_area = math.log(area + 1.0)
+
+                # Prefer circular shapes; penalize slightly below soft thresh
+                if circ >= circ_soft:
+                    score_circ = circ
+                    circ_penalty = 0.0
+                else:
+                    score_circ = circ
+                    circ_penalty = (circ_soft - circ)  # positive penalty when circ < circ_soft
+
+                # Penalize off-center and elongated blobs
+                elongation = (aspect - 1.0) ** 2
+
+                # Base score: tune weights to your taste
+                score = (
+                    1.0 * score_area +
+                    1.0 * score_circ -
+                    0.6 * center_offset -
+                    0.8 * elongation -
+                    1.0 * circ_penalty
+                )
+
                 self.get_logger().info(
-                    f'[Layer 4] {color} candidate: area={area:.1f}, circ={circ:.3f}, aspect={aspect:.2f}',
+                    f'[Layer 4] {color} cand: area={area:.1f}, circ={circ:.3f}, '
+                    f'aspect={aspect:.2f}, off={center_offset:.2f}, score={score:.2f}',
                     throttle_duration_sec=0.5
                 )
 
-                if area < min_area:
-                    continue
-
-                if circ < self.ball_min_circularity:
-                    continue
-
-                if area > best_area:
-                    best_area = area
-                    best_circ = circ
+                if score > best_score:
+                    best_score = score
                     best_contour = c
+                    best_meta = {
+                        "area": float(area),
+                        "circ": float(circ),
+                        "aspect": float(aspect),
+                        "center_offset": float(center_offset),
+                        "bbox": (x_c, y_c, rw, rh),
+                        "cx": cx,
+                        "cy": cy,
+                    }
 
             if best_contour is None:
                 self.get_logger().info(
-                    f'[Layer 4] {color} candidates rejected by area/circularity '
-                    f'(min_area={min_area:.1f}, '
-                    f'min_circ={self.ball_min_circularity:.2f}).',
+                    f'[Layer 4] {color} candidates rejected after scoring.',
                     throttle_duration_sec=2.0
                 )
                 continue
 
-            # --- We have a good ball contour for this color ---
-            x, y, rw, rh = cv2.boundingRect(best_contour)
-            cx = int(x + rw / 2)
-            cy = int(y + rh / 2)
+            # === NEW: frame-to-frame stability filter ===
+            # Use ball_detection_meta[color] to track how many consecutive frames
+            # this color has had a valid candidate.
+            prev_meta = self.ball_detection_meta.get(color)
+            if prev_meta is None:
+                stable_frames = 1
+            else:
+                stable_frames = prev_meta.get("stable_frames", 1) + 1
+
+            # store the updated stable_frames into best_meta so it propagates
+            best_meta["stable_frames"] = stable_frames
+
+            # Require at least 3 consecutive frames before we trust this detection
+            if stable_frames < 3:
+                # Optional: draw for visualization but don't use it for alignment/localization
+                color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
+                x, y, rw, rh = best_meta["bbox"]
+                cx = best_meta["cx"]
+                cy = best_meta["cy"]
+                cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 1)
+                cv2.circle(debug_frame, (cx, cy), 3, color_bgr, -1)
+                self.ball_detection_meta[color] = best_meta
+                continue
+            # === END NEW BLOCK ===
+
+            # --- We have the best contour for this color in this frame ---
+            cx = best_meta["cx"]
+            cy = best_meta["cy"]
+            x, y, rw, rh = best_meta["bbox"]
+            center_offset = best_meta["center_offset"]
+            best_area = best_meta["area"]
+            best_circ = best_meta["circ"]
 
             img_width = frame.shape[1]
             img_cx = img_width / 2.0
-            # How far from the horizontal center of the image? 0 = perfect center, 1 = edge.
-            center_offset = abs(cx - img_cx) / max(img_cx, 1.0)
 
-            # Only try LiDAR-based localization when the ball is roughly centered.
-            # This forces the "ALIGN_TO_BALL" state to run first.
+            # Decide whether to try LiDAR now or wait for ALIGN_TO_BALL
             world_xy = None
             has_world = False
             if center_offset <= self.align_center_tolerance:
@@ -2002,104 +2240,75 @@ class Task3(Node):
                     color, cx, cy, frame.shape[1], frame.shape[0]
                 )
                 has_world = world_xy is not None
-            else:
-                self.get_logger().debug(
-                    f"[Layer 5] {color} ball off-center (offset={center_offset:.2f}), "
-                    "skipping LiDAR-based localization until aligned."
-                )
 
-            # -----------------------------
-            # Build a scalar quality score:
-            #   - larger area -> better
-            #   - more circular -> better
-            #   - closer to image center -> better
-            #   - having a valid world pose -> big bonus
-            # -----------------------------
-            # log(area) reduces crazy dominance of huge blobs
-            base_score = math.log(best_area + 1.0) + 0.8 * best_circ - 0.5 * center_offset
+            # Score we will compare to previous best for this color
+            base_score = best_score
 
+            # Boost if we got a world pose
             if has_world:
-                base_score += 2.0  # strong preference for localizable detections
+                base_score += 2.0
             elif self.ball_world_est.get(color) is not None:
-                # If we *already* have a world estimate, punish new detections that
-                # fail to produce one, so we don't overwrite good data with bad.
-                base_score -= 0.5
+                # If we already have world pose from before,
+                # don't let a weaker non-localizable detection overwrite it.
+                base_score -= 0.7
 
             prev_score = self.ball_detection_score.get(color, float('-inf'))
 
-            # Compare against the current best detection for this color
             if base_score <= prev_score:
                 self.get_logger().info(
-                    f"[Layer 5] New {color} detection (score={base_score:.2f}) "
-                    f"is worse than existing best (score={prev_score:.2f}); "
-                    f"keeping previous detection.",
+                    f"[Layer 5] New {color} detection (frame_score={base_score:.2f}) "
+                    f"worse than existing best (score={prev_score:.2f}); keeping old.",
                     throttle_duration_sec=1.0,
                 )
-                # Skip updating state/markers for this color
+                # still draw for visualization
+                color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
+                cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
+                cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
                 continue
 
-            # This detection wins! Update the "best" record.
+            # This frame's detection becomes the new champion
             self.ball_detection_score[color] = base_score
             self.ball_detection_meta[color] = {
-                "area": float(best_area),
-                "circ": float(best_circ),
-                "center_offset": float(center_offset),
-                "has_world": bool(has_world),
+                "area": best_area,
+                "circ": best_circ,
+                "center_offset": center_offset,
+                "has_world": has_world,
             }
-
             self.ball_pixel_obs[color] = (cx, cy)
 
             if has_world:
                 wx, wy = world_xy
                 self.ball_world_est[color] = (wx, wy)
-                self.detected_balls[color] = True  # only mark detected if we have a world pose
+                self.detected_balls[color] = True
 
                 self.get_logger().info(
-                    f'[Layer 5] UPDATED BEST {color} ball: '
-                    f'score={prev_score:.2f} -> {base_score:.2f}, '
-                    f'world ≈ ({wx:.2f}, {wy:.2f}), '
-                    f'area={best_area:.1f}, circ={best_circ:.3f}, '
+                    f'[Layer 5] UPDATED BEST {color} ball: score={prev_score:.2f} -> {base_score:.2f}, '
+                    f'world≈({wx:.2f},{wy:.2f}), area={best_area:.1f}, circ={best_circ:.3f}, '
                     f'center_offset={center_offset:.2f}.',
                     throttle_duration_sec=1.0,
                 )
             else:
                 self.get_logger().info(
-                    f'[Layer 5] UPDATED BEST {color} pixel-only detection: '
-                    f'score={prev_score:.2f} -> {base_score:.2f}, '
-                    f'no reliable world range yet, '
-                    f'area={best_area:.1f}, circ={best_circ:.3f}, '
-                    f'center_offset={center_offset:.2f}.',
+                    f'[Layer 5] UPDATED BEST {color} pixel-only: score={prev_score:.2f} -> {base_score:.2f}, '
+                    f'area={best_area:.1f}, circ={best_circ:.3f}, center_offset={center_offset:.2f}.',
                     throttle_duration_sec=1.0,
                 )
-            
-            # If we don't yet have a world pose for this color,
-            # and the ball is not well-centered, trigger "rotate-only" alignment.
-            if (
-                not self.detected_balls[color] and  # we haven't locked in a world pose yet
-                self.state not in ['ALIGN_TO_BALL', 'TASK_DONE']
-            ):
-                if center_offset > self.align_center_tolerance:
-                    self.align_ball_color = color
-                    self.align_start_time = self.get_clock().now()
-                    self.prev_state_before_align = self.state
-                    self.state = 'ALIGN_TO_BALL'
-                    self.get_logger().info(
-                        f"[Layer 5] Starting ALIGN_TO_BALL for '{color}' "
-                        f"(center_offset={center_offset:.2f} > tol={self.align_center_tolerance:.2f})."
-                    )
 
-            # Draw debug graphics for the *current* best detection
-            color_bgr = {
-                'red':   (0, 0, 255),
-                'green': (0, 255, 0),
-                'blue':  (255, 0, 0),
-            }[color]
+            # NEW: precise alignment state, used ONLY during scan at waypoint
+            if self.state == 'SCAN_AT_WAYPOINT' and not self.detected_balls[color]:
+                self.align_ball_color = color
+                self.prev_state_before_align = 'SCAN_AT_WAYPOINT'
+                self.state = 'ALIGN_MEASURE'
+                self.align_start_time = self.get_clock().now()
+                return
 
+            # Draw debug overlay for this best contour
+            color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
             cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
             cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
             cv2.putText(
                 debug_frame,
-                f"{color} s={base_score:.2f}",
+                f"{color} S={base_score:.2f}",
                 (x, y - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -2108,14 +2317,59 @@ class Task3(Node):
                 cv2.LINE_AA,
             )
 
-        # Show debug frame if enabled
         if self.show_debug_image:
             cv2.imshow('task3_camera_debug', debug_frame)
             key = cv2.waitKey(1) & 0xFF
-            # Press 'q' in the window to turn off debug display
             if key == ord('q'):
                 self.show_debug_image = False
                 cv2.destroyWindow('task3_camera_debug')
+
+    def _handle_align_measure(self):
+        color = self.align_ball_color
+        if color is None:
+            self.state = self.prev_state_before_align
+            return
+
+        pix = self.ball_pixel_obs.get(color)
+        if pix is None or self.last_image_width is None:
+            self._publish_stop()
+            return
+
+        cx, cy = pix
+        img_cx = self.last_image_width / 2.0
+        norm_err = (cx - img_cx) / img_cx
+
+        # aligned?
+        if abs(norm_err) <= self.align_center_tolerance:
+            self._publish_stop()
+            self.get_logger().info(f"[ALIGN_MEASURE] {color} centered; measuring distance...")
+
+            # ---- Measure using front LiDAR only ----
+            r = self._scan_min_in_sector(0.0, 10.0)
+            if math.isinf(r):
+                self.get_logger().warn("[ALIGN_MEASURE] No usable front LiDAR reading.")
+                return
+
+            # Compute world
+            pose = self.current_pose.pose.pose
+            yaw = self._quat_to_yaw(pose.orientation)
+            rx = pose.position.x
+            ry = pose.position.y
+
+            wx = rx + r * math.cos(yaw)
+            wy = ry + r * math.sin(yaw)
+
+            self.ball_world_est[color] = (wx, wy)
+            self.detected_balls[color] = True
+            self.align_ball_color = None
+            self.state = self.prev_state_before_align
+            return
+
+        # Otherwise rotate toward center
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = -self.align_angular_gain * norm_err
+        self.cmd_vel_pub.publish(twist)
 
     def _localize_ball_from_pixel(self, color, cx, cy, img_width, img_height):
         if self.latest_scan is None or self.current_pose is None:
@@ -2150,8 +2404,8 @@ class Task3(Node):
         )
 
         # Look in a small window around the laser bearing
-        range_window_rad = math.radians(10.0)
-        r = self._scan_min_in_sector_rad(bearing_laser, range_window_rad)
+        range_window_rad = math.radians(6.0)
+        r = self._scan_median_in_sector_rad(bearing_laser, range_window_rad)
         if math.isinf(r) or r <= 0.0:
             # No good LiDAR distance yet – keep this as an image-only detection.
             # The scoring logic will still keep the best image candidate, and
@@ -2195,91 +2449,6 @@ class Task3(Node):
             )
 
         return wx, wy
-    
-    def _handle_align_to_ball(self):
-        """
-        Rotate-in-place behavior to center the currently tracked ball in the camera.
-        Uses ball_pixel_obs[align_ball_color] to compute horizontal offset and
-        commands only angular velocity (no forward motion).
-        """
-        if self.align_ball_color is None:
-            self.get_logger().warn(
-                '[Layer 5] ALIGN_TO_BALL: no align_ball_color set, returning to previous state.'
-            )
-            self.state = self.prev_state_before_align or 'FOLLOW_PATH'
-            self._publish_stop()
-            return
-
-        color = self.align_ball_color
-
-        # Timeout protection
-        if self.align_start_time is not None:
-            dt = (self.get_clock().now() - self.align_start_time).nanoseconds / 1e9
-            if dt > self.align_timeout_sec:
-                self.get_logger().warn(
-                    f'[Layer 5] ALIGN_TO_BALL: timeout after {dt:.1f}s for {color}, '
-                    f'returning to {self.prev_state_before_align}.'
-                )
-                self.align_ball_color = None
-                self.state = self.prev_state_before_align or 'FOLLOW_PATH'
-                self._publish_stop()
-                return
-
-        pix = self.ball_pixel_obs.get(color)
-        if pix is None or self.last_image_width is None:
-            # No current target pixel; just stop and wait a bit
-            self._publish_stop()
-            return
-
-        cx, cy = pix
-        img_cx = self.last_image_width / 2.0
-
-        # normalized horizontal error: -1 (far left) .. 0 (center) .. +1 (far right)
-        norm_err = (cx - img_cx) / max(img_cx, 1.0)
-
-        # Tiny deadband: ignore tiny jitter
-        if abs(norm_err) < 0.02:
-            norm_err = 0.0
-
-        # Check if we are already aligned
-        if abs(norm_err) <= self.align_center_tolerance:
-            self.get_logger().info(
-                f"[Layer 5] ALIGN_TO_BALL: '{color}' centered "
-                f"(err={norm_err:.2f} <= tol={self.align_center_tolerance:.2f})."
-            )
-            self._publish_stop()
-            self.align_ball_color = None
-            self.state = self.prev_state_before_align or 'FOLLOW_PATH'
-            return
-
-        # Non-linear (cubic) shaping: large errors turn fast, small errors turn gently
-        shaped_err = norm_err ** 3
-        ang = - self.align_angular_gain * shaped_err  # sign: positive err -> rotate towards center
-
-        # Clamp to a gentler max specifically for alignment
-        if ang > self.align_max_angular_vel:
-            ang = self.align_max_angular_vel
-        elif ang < -self.align_max_angular_vel:
-            ang = -self.align_max_angular_vel
-
-        # Ensure we don't command absurdly tiny speeds when far from center:
-        if norm_err != 0.0:
-            min_turn = 0.15  # rad/s
-            if ang > 0.0:
-                ang = max(min_turn, ang)
-            else:
-                ang = min(-min_turn, ang)
-
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = float(ang)
-        self.cmd_vel_pub.publish(twist)
-
-        self.get_logger().info(
-            f"[Layer 5] ALIGN_TO_BALL: color={color}, norm_err={norm_err:.2f}, "
-            f"cmd_w={ang:.2f} rad/s",
-            throttle_duration_sec=0.5,
-        )
 
     # ----------------------------------------------------------------------
     # Layer 5: Ball markers & completion
@@ -2505,9 +2674,17 @@ class Task3(Node):
             '[Layer 4] New camera image received.',
         )
         frame = self._image_to_cv2(msg)
-        if frame is not None:
+        if frame is None:
+            return
+
+        # NEW: Only run detection when we are scanning or aligning to a ball.
+        if self.state in ['SCAN_AT_WAYPOINT', 'ALIGN_MEASURE']:
             self._detect_balls_in_image(frame)
             self._publish_ball_markers()
+        else:
+            # While driving between waypoints, we ignore vision
+            # so navigation can focus on moving quickly.
+            pass
 
     # ----------------------------------------------------------------------
     # Local replanning handler (RRT* detour)
@@ -2604,6 +2781,9 @@ class Task3(Node):
         self.current_path_index = 0
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
+
+        # NEW: mark that we are now following a local (RRT*) plan
+        self.local_plan_active = True
 
         self.get_logger().info(
             f'[Layer 3] REPLAN_LOCAL: local detour spliced into active path. '
@@ -2708,39 +2888,69 @@ class Task3(Node):
             self.state = 'FOLLOW_PATH'
             return
 
-        if self.state == 'ALIGN_TO_BALL':
-            self._handle_align_to_ball()
+        if self.state == 'SCAN_AT_WAYPOINT':
+            self._handle_scan_at_waypoint()
+            return
+
+        if self.state == 'ALIGN_MEASURE':
+            self._handle_align_measure()
             return
 
         if self.state == 'FOLLOW_PATH':
+            # 1) If LiDAR says something is very close ahead, treat it as a local blockage
+            #    and let RRT* handle it (if possible).
             if self._obstacle_too_close_ahead(max_distance=self.obstacle_avoid_distance):
                 self.get_logger().warn(
-                    '[Layer 3] FOLLOW_PATH: obstacle too close ahead. Entering AVOID_OBSTACLE.'
+                    '[Layer 3] FOLLOW_PATH: obstacle too close ahead. '
+                    'Treating as local blockage and triggering REPLAN_LOCAL (RRT*).'
                 )
-                self._start_avoidance()
-                self.state = 'AVOID_OBSTACLE'
+
+                if self.active_path_points and not self.local_plan_active:
+                    # Use current_path_index as start; try to reconnect a bit further along the path.
+                    start_idx = max(0, self.current_path_index)
+                    goal_idx = min(
+                        start_idx + self.block_check_lookahead_points,
+                        len(self.active_path_points) - 1
+                    )
+
+                    self.local_replan_start_index = start_idx
+                    self.local_replan_goal_index = goal_idx
+
+                    self._publish_stop()
+                    self.state = 'REPLAN_LOCAL'
+                else:
+                    # Fallback: if we have no path or are already on a local plan,
+                    # keep the old reactive avoidance behavior.
+                    self._start_avoidance()
+                    self.state = 'AVOID_OBSTACLE'
+
                 return
 
-            blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
-            if blocked:
-                self.local_replan_start_index = start_idx
-                self.local_replan_goal_index = goal_idx
-                self.get_logger().info(
-                    f'[Layer 3] FOLLOW_PATH: path blocked. Triggering REPLAN_LOCAL '
-                    f'from index {start_idx} to {goal_idx}.'
-                )
-                self._publish_stop()
-                self.state = 'REPLAN_LOCAL'
-                return
+            # 2) Normal blocked-path check using occupancy (static + dynamic)
+            if not self.local_plan_active:
+                blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
+                if blocked:
+                    self.local_replan_start_index = start_idx
+                    self.local_replan_goal_index = goal_idx
+                    self.get_logger().info(
+                        f'[Layer 3] FOLLOW_PATH: path blocked. Triggering REPLAN_LOCAL '
+                        f'from index {start_idx} to {goal_idx}.'
+                    )
+                    self._publish_stop()
+                    self.state = 'REPLAN_LOCAL'
+                    return
 
             reached = self._follow_active_path()
             if reached:
+                # Mark waypoint visited and start scan-at-waypoint
                 self.visited_waypoints.add(self.current_waypoint_idx)
                 self.get_logger().info(
                     f'[Layer 3] Waypoint #{self.current_waypoint_idx} reached. '
-                    f'Visited {len(self.visited_waypoints)}/{len(self.patrol_waypoints)}.'
+                    f'Visited {len(self.visited_waypoints)}/{len(self.patrol_waypoints)}. '
+                    'Starting SCAN_AT_WAYPOINT.'
                 )
-                self.state = 'SELECT_NEXT_WAYPOINT'
+                self._start_scan_at_waypoint()
+                self.state = 'SCAN_AT_WAYPOINT'
             return
 
         if self.state == 'REPLAN_LOCAL':
