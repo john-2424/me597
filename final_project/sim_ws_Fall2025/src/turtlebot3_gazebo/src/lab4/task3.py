@@ -71,12 +71,12 @@ class Task3(Node):
         # -------------------------
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')          # logical map name (map.yaml in maps/)
-        self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
+        self.declare_parameter('inflation_kernel', 12) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 1.8)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 2.5)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 4)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 3)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
@@ -84,13 +84,13 @@ class Task3(Node):
         self.declare_parameter('lookahead_distance', 0.5)     # m
         self.declare_parameter('goal_tolerance', 0.15)        # m
         self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
-        self.declare_parameter('obstacle_avoid_distance', 0.40)  # m, simple stop threshold
+        self.declare_parameter('obstacle_avoid_distance', 0.3)  # m, simple stop threshold
 
         # NEW: when heading error is large, rotate-only instead of "plowing forward"
         self.declare_parameter('heading_align_only_threshold', 0.5)  # rad (~30 deg)
 
         # NEW: slow down when something is near but not yet at avoid distance
-        self.declare_parameter('obstacle_slowdown_distance', 0.60)   # m
+        self.declare_parameter('obstacle_slowdown_distance', 0.50)   # m
 
         # Align-to-ball (rotate-only) params
         self.declare_parameter('align_center_tolerance', 0.15)  # normalized [0..1]
@@ -117,14 +117,14 @@ class Task3(Node):
 
         # Dynamic obstacle + RRT* related
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 7)
+        self.declare_parameter('dynamic_inflation_kernel', 9)
 
         # RRT* parameters (borrowed from Task2)
         self.declare_parameter('rrt_max_iterations', 1600)
         self.declare_parameter('rrt_step_size', 0.20)         # meters
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
         self.declare_parameter('rrt_neighbor_radius', 0.7)    # meters
-        self.declare_parameter('rrt_local_range', 3.5)        # meters (sampling window radius)
+        self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
         # NEW: how many consecutive RRT* failures before we give up and unstick via AVOID_OBSTACLE
         self.declare_parameter('rrt_fail_limit', 3)
@@ -921,11 +921,17 @@ class Task3(Node):
         start_xy = (start_x, start_y)
 
         self.get_logger().info(
-            f'[Layer 2] Building route from robot start at ({start_x:.2f}, {start_y:.2f}) '
-            f'over {len(pruned_world_points)} waypoints.'
+            f'[Layer 2] Building DIRECTIONAL route from robot start at '
+            f'({start_x:.2f}, {start_y:.2f}) over {len(pruned_world_points)} waypoints.'
         )
 
-        route_indices = self._nearest_neighbor_route(pruned_world_points, start_xy)
+        # NEW: quadrant-based, direction-respecting planning
+        route_indices = self._directional_nearest_route(pruned_world_points, start_xy)
+
+        # Optional: you can still run 2-opt on top if you want a little
+        # extra smoothing, but usually not needed with directional sweeps.
+        # If you prefer maximum “respect the direction” behavior, you can
+        # comment the 2-opt block out.
         if len(route_indices) > 2 and self.l2_two_opt_max_iters > 0:
             route_indices = self._two_opt_improvement(
                 pruned_world_points, route_indices, self.l2_two_opt_max_iters
@@ -1109,6 +1115,120 @@ class Task3(Node):
 
         self.get_logger().info(
             f'[Layer 2] Nearest neighbor route built. Route length={len(route)}.'
+        )
+        return route
+
+    def _directional_nearest_route(self, points, start_xy):
+        """
+        Directional nearest-neighbor route:
+
+        - First waypoint: globally closest to start_xy.
+        - Determine its "area" (quadrant) relative to the start:
+              Q0: +x, +y
+              Q1: +x, -y
+              Q2: -x, +y
+              Q3: -x, -y
+        - While there are points left in the current quadrant:
+              pick the nearest to the CURRENT robot position.
+        - When a quadrant is exhausted, move to the next quadrant that still
+          has points, in a fixed cyclic order, and repeat.
+
+        This guarantees:
+        - all waypoints in the initial direction (+x,+y etc.) are visited
+          before switching to opposite regions.
+        """
+        n = len(points)
+        if n == 0:
+            self.get_logger().warn('[Layer 2] _directional_nearest_route: no points.')
+            return []
+
+        # --- Precompute quadrant of each point relative to the *start* pose ---
+        def quadrant_for(dx, dy):
+            if dx >= 0.0 and dy >= 0.0:
+                return 0   # +x, +y
+            if dx >= 0.0 and dy < 0.0:
+                return 1   # +x, -y
+            if dx < 0.0 and dy >= 0.0:
+                return 2   # -x, +y
+            return 3       # -x, -y
+
+        q_of = {}
+        for i, (x, y) in enumerate(points):
+            dx = x - start_xy[0]
+            dy = y - start_xy[1]
+            q_of[i] = quadrant_for(dx, dy)
+
+        # --- Choose first waypoint: globally nearest to start ---
+        best_first = None
+        best_d = float('inf')
+        for i, (x, y) in enumerate(points):
+            d = math.hypot(x - start_xy[0], y - start_xy[1])
+            if d < best_d:
+                best_d = d
+                best_first = i
+
+        if best_first is None:
+            self.get_logger().warn(
+                '[Layer 2] _directional_nearest_route: could not pick first waypoint.'
+            )
+            return []
+
+        current_xy = start_xy
+        current_quadrant = q_of[best_first]
+
+        # Fixed cyclic order of quadrants starting from the initial one.
+        all_quads = [0, 1, 2, 3]
+        start_pos = all_quads.index(current_quadrant)
+        cyclic_quads = all_quads[start_pos:] + all_quads[:start_pos]
+
+        unvisited = set(range(n))
+        route = []
+
+        self.get_logger().info(
+            f'[Layer 2] _directional_nearest_route: first waypoint #{best_first}, '
+            f'initial quadrant={current_quadrant}.'
+        )
+
+        while unvisited:
+            # 1) Try to pick from the current quadrant
+            candidates = [i for i in unvisited if q_of[i] == current_quadrant]
+
+            if not candidates:
+                # 2) No more points in this quadrant: move to the next quadrant
+                remaining_quads = {q_of[i] for i in unvisited}
+                next_quad = None
+                for q in cyclic_quads:
+                    if q in remaining_quads and q != current_quadrant:
+                        next_quad = q
+                        break
+
+                if next_quad is None:
+                    # No quadrants left (should not really happen here)
+                    break
+
+                self.get_logger().info(
+                    f'[Layer 2] _directional_nearest_route: switching quadrant '
+                    f'{current_quadrant} -> {next_quad}.'
+                )
+                current_quadrant = next_quad
+                continue
+
+            # 3) Choose nearest waypoint in the current quadrant to the *current* position
+            best_idx = None
+            best_dist = float('inf')
+            for i in candidates:
+                x, y = points[i]
+                d = math.hypot(x - current_xy[0], y - current_xy[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+
+            route.append(best_idx)
+            unvisited.remove(best_idx)
+            current_xy = points[best_idx]
+
+        self.get_logger().info(
+            f'[Layer 2] _directional_nearest_route built route of length {len(route)}.'
         )
         return route
 
@@ -1485,6 +1605,50 @@ class Task3(Node):
             msg.poses.append(pose)
 
         return msg
+
+    def _find_unvisited_waypoint_on_path(self, path_world):
+        """
+        Given an A* path (list of (x,y)), check if any OTHER patrol waypoint
+        (unvisited & not unreachable) lies along this path.
+
+        We look for the earliest such waypoint along the path and return
+        its index in self.patrol_waypoints, or None if none found.
+        """
+        if not path_world or not self.patrol_waypoints:
+            return None
+
+        # Use at least goal_tolerance, but don't go crazy
+        tol = max(self.goal_tolerance, 0.75)
+
+        best_wp_idx = None
+        best_path_pos = None
+
+        for wp_idx, (wx, wy) in enumerate(self.patrol_waypoints):
+            # Skip the current target; we only care about "bonus" waypoints
+            if wp_idx == self.current_waypoint_idx:
+                continue
+
+            # Skip already handled waypoints
+            if wp_idx in self.visited_waypoints or wp_idx in self.unreachable_waypoints:
+                continue
+
+            # Find earliest point on the path that passes near this waypoint
+            for j, (px, py) in enumerate(path_world):
+                if math.hypot(px - wx, py - wy) <= tol:
+                    # Earlier along the path is better
+                    if best_path_pos is None or j < best_path_pos:
+                        best_path_pos = j
+                        best_wp_idx = wp_idx
+                    break  # no need to keep scanning this waypoint
+
+        if best_wp_idx is not None:
+            self.get_logger().info(
+                f"[Layer 3] _find_unvisited_waypoint_on_path: "
+                f"unvisited waypoint #{best_wp_idx} lies on A* path at "
+                f"path index {best_path_pos}."
+            )
+
+        return best_wp_idx
 
     def _nearest_path_index(self, x, y, path_points):
         if not path_points:
@@ -3255,31 +3419,53 @@ class Task3(Node):
             return
 
         if self.state == 'PLAN_TO_WAYPOINT':
-            wx, wy = self.patrol_waypoints[self.current_waypoint_idx]
+            target_idx = self.current_waypoint_idx
+            wx, wy = self.patrol_waypoints[target_idx]
             rx = self.current_pose.pose.pose.position.x
             ry = self.current_pose.pose.pose.position.y
 
             self.get_logger().info(
                 f'[Layer 3] PLAN_TO_WAYPOINT: A* from ({rx:.2f}, {ry:.2f}) '
-                f'to waypoint #{self.current_waypoint_idx} = ({wx:.2f}, {wy:.2f})'
+                f'to waypoint #{target_idx} = ({wx:.2f}, {wy:.2f})'
             )
 
-            # IMPORTANT: assign path_world BEFORE checking it
+            # First, plan to the intended target
             path_world = self.astar_plan((rx, ry), (wx, wy))
 
-            # If A* failed or returned a degenerate path, mark as UNREACHABLE,
-            # not "visited", so we don't lie to ourselves.
+            # If A* failed or returned a degenerate path, mark as UNREACHABLE
             if path_world is None or len(path_world) < 2:
                 self.get_logger().warn(
                     f'[Layer 3] A* failed or path too short to waypoint '
-                    f'#{self.current_waypoint_idx}. Marking as UNREACHABLE '
-                    'and selecting another.'
+                    f'#{target_idx}. Marking as UNREACHABLE and selecting another.'
                 )
-                self.unreachable_waypoints.add(self.current_waypoint_idx)
+                self.unreachable_waypoints.add(target_idx)
                 self.state = 'SELECT_NEXT_WAYPOINT'
                 return
 
-            # A* succeeded: store and publish path, then go to FOLLOW_PATH
+            # --- NEW: opportunistic pickup of waypoints that lie on this A* path ---
+            alt_idx = self._find_unvisited_waypoint_on_path(path_world)
+
+            if alt_idx is not None and alt_idx != target_idx:
+                awx, awy = self.patrol_waypoints[alt_idx]
+                self.get_logger().info(
+                    f'[Layer 3] PLAN_TO_WAYPOINT: switching goal from '
+                    f'#{target_idx} to on-path waypoint #{alt_idx} at '
+                    f'({awx:.2f}, {awy:.2f}). Replanning A*.'
+                )
+
+                # Try to replan directly to this on-path waypoint
+                new_path = self.astar_plan((rx, ry), (awx, awy))
+                if new_path is not None and len(new_path) >= 2:
+                    path_world = new_path
+                    self.current_waypoint_idx = alt_idx
+                else:
+                    self.get_logger().warn(
+                        f'[Layer 3] A* to on-path waypoint #{alt_idx} failed; '
+                        'keeping original target and path.'
+                    )
+                    # fall back to original target_idx and path_world
+
+            # A* (possibly re)planned successfully: store and publish path, then FOLLOW_PATH
             self.global_path_points = path_world
             self.active_path_points = list(path_world)
             self.current_path_index = 0
@@ -3366,8 +3552,27 @@ class Task3(Node):
             return
 
         if self.state == 'PATROL_DONE':
-            self._publish_stop()
+            # First, see if we can actually finish the task
             self._maybe_finish_task_if_balls_found()
+            if self.state == 'TASK_DONE':
+                # _maybe_finish_task_if_balls_found() already stopped the robot
+                return
+
+            # If we get here, PATROL_DONE was reached but not all balls are localized.
+            # Do NOT stay stuck forever – restart a new patrol pass over reachable
+            # waypoints to look for the remaining balls.
+            balls_found = sum(self.detected_balls.values())
+            self.get_logger().warn(
+                f"[Layer 3] PATROL_DONE reached with only {balls_found}/3 balls "
+                "localized. Restarting patrol over visited waypoints."
+            )
+
+            # Allow revisiting all reachable waypoints.
+            # Keep 'unreachable_waypoints' so we don't bang our head on truly bad ones.
+            self.visited_waypoints.clear()
+
+            # Jump back into the normal waypoint-selection loop
+            self.state = 'SELECT_NEXT_WAYPOINT'
             return
 
         if self.state == 'TASK_DONE':
