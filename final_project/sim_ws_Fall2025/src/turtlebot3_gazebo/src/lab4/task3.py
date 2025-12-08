@@ -92,7 +92,7 @@ class Task3(Node):
         # NEW: slow down when something is near but not yet at avoid distance
         self.declare_parameter('obstacle_slowdown_distance', 0.50)   # m
 
-        # Align-to-ball (rotate-only) params
+        # Align-to-ball (rotate-only) params 
         self.declare_parameter('align_center_tolerance', 0.1)  # normalized [0..1]
         self.declare_parameter('align_angular_gain', 1.0)       # rad/s per unit error
         # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
