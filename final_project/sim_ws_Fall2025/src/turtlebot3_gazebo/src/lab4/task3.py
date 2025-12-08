@@ -71,10 +71,10 @@ class Task3(Node):
         # -------------------------
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')          # logical map name (map.yaml in maps/)
-        self.declare_parameter('inflation_kernel', 12) # for static obstacle inflation
+        self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 2.5)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 3.0)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
         self.declare_parameter('l2_min_dt_cells', 3)          # min distance-to-obstacle in cells
 
@@ -93,18 +93,18 @@ class Task3(Node):
         self.declare_parameter('obstacle_slowdown_distance', 0.50)   # m
 
         # Align-to-ball (rotate-only) params
-        self.declare_parameter('align_center_tolerance', 0.15)  # normalized [0..1]
-        self.declare_parameter('align_angular_gain', 1.5)       # rad/s per unit error
+        self.declare_parameter('align_center_tolerance', 0.1)  # normalized [0..1]
+        self.declare_parameter('align_angular_gain', 1.0)       # rad/s per unit error
         # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
-        self.declare_parameter('align_max_angular_vel', 0.6)    # rad/s
+        self.declare_parameter('align_max_angular_vel', 0.3)    # rad/s
         self.declare_parameter('align_timeout_sec', 6.0)        # s
 
         # NEW: deadband and stability requirement for alignment
         self.declare_parameter('align_deadband', 0.03)          # norm error below this → treat as 0
-        self.declare_parameter('align_center_stable_frames', 3) # consecutive frames centered
+        self.declare_parameter('align_center_stable_frames', 5) # consecutive frames centered
 
         # NEW: scan-at-waypoint params (full 360° spin)
-        self.declare_parameter('scan_angular_vel', 0.5)         # rad/s
+        self.declare_parameter('scan_angular_vel', 0.3)         # rad/s
         self.declare_parameter('scan_turns', 1.0)               # number of full rotations
         self.declare_parameter('scan_timeout_sec', 12.0)        # safety timeout
 
@@ -117,7 +117,7 @@ class Task3(Node):
 
         # Dynamic obstacle + RRT* related
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 9)
+        self.declare_parameter('dynamic_inflation_kernel', 7)
 
         # RRT* parameters (borrowed from Task2)
         self.declare_parameter('rrt_max_iterations', 1600)
@@ -131,6 +131,9 @@ class Task3(Node):
 
         # Camera model (approximate)
         self.declare_parameter('camera_h_fov_deg', 60.0)      # assumed horizontal FOV
+        # Optional camera intrinsics (will override HFOV model if non-zero)
+        self.declare_parameter('camera_fx', 0.0)              # focal length in pixels
+        self.declare_parameter('camera_cx', 0.0)              # principal point x in pixels
 
         # 👇 much larger default: balls should be mid-sized blobs, not specks
         self.declare_parameter('ball_min_contour_area', 800.0)  # px, to filter noise
@@ -285,6 +288,12 @@ class Task3(Node):
 
         self.camera_h_fov_deg = (
             self.get_parameter('camera_h_fov_deg').get_parameter_value().double_value
+        )
+        self.camera_fx = (
+            self.get_parameter('camera_fx').get_parameter_value().double_value
+        )
+        self.camera_cx = (
+            self.get_parameter('camera_cx').get_parameter_value().double_value
         )
         # Treat this as float so we can do fractional thresholds
         self.ball_min_contour_area = (
@@ -1851,6 +1860,34 @@ class Task3(Node):
         self.rrt_start_xy = (sx, sy)
         self.rrt_start_idx = self.world_to_grid(sx, sy)
 
+        # --- Debug: check map validity of start / goal for RRT* ---
+        start_idx_dbg = self.world_to_grid(sx, sy)
+        goal_idx_dbg  = self.world_to_grid(gx, gy)
+        if start_idx_dbg is not None:
+            sr, sc = start_idx_dbg
+            self.get_logger().info(
+                f'[Layer 3] RRT*: start cell=({sr},{sc}), '
+                f'free_rrt={self.is_cell_free_rrt(sr, sc)}, '
+                f'free_static={self._is_cell_free(sr, sc)}'
+            )
+        else:
+            self.get_logger().warn('[Layer 3] RRT*: start outside map.')
+
+        if goal_idx_dbg is not None:
+            gr, gc = goal_idx_dbg
+            self.get_logger().info(
+                f'[Layer 3] RRT*: goal  cell=({gr},{gc}), '
+                f'free_rrt={self.is_cell_free_rrt(gr, gc)}, '
+                f'free_static={self._is_cell_free(gr, gc)}'
+            )
+        else:
+            self.get_logger().warn('[Layer 3] RRT*: goal outside map.')
+
+        # Per-run debug counters
+        samples_total = 0
+        segment_collision_fail = 0
+        goal_connect_attempts = 0
+
         self.get_logger().info(
             f'[Layer 3] RRT*: start={start_xy}, goal={goal_xy}, center={center_xy}, '
             f'max_iter={self.rrt_max_iterations}'
@@ -1867,14 +1904,27 @@ class Task3(Node):
                 )
 
             sample_x, sample_y = self._rrt_sample(cx, cy, gx, gy)
+            samples_total += 1
 
             nearest = self._rrt_nearest(nodes, sample_x, sample_y)
             if nearest is None:
+                self.get_logger().debug(
+                    f'[Layer 3] RRT*: no nearest node for sample '
+                    f'({sample_x:.2f},{sample_y:.2f})'
+                )
                 continue
 
             new_x, new_y = self._rrt_steer(nearest, sample_x, sample_y)
 
             if not self._segment_collision_free(nearest.x, nearest.y, new_x, new_y):
+                segment_collision_fail += 1
+                if segment_collision_fail % 50 == 0:
+                    self.get_logger().debug(
+                        f'[Layer 3] RRT*: collision on segment '
+                        f'({nearest.x:.2f},{nearest.y:.2f})'
+                        f' -> ({new_x:.2f},{new_y:.2f}) '
+                        f'(fails so far={segment_collision_fail})'
+                    )
                 continue
 
             new_node = self._RRTNode(new_x, new_y, parent=None, cost=float('inf'))
@@ -1901,6 +1951,7 @@ class Task3(Node):
 
             dist_to_goal = math.hypot(new_node.x - gx, new_node.y - gy)
             if dist_to_goal <= self.rrt_step_size * 2.0:
+                goal_connect_attempts += 1
                 if self._segment_collision_free(new_node.x, new_node.y, gx, gy):
                     goal_node = self._RRTNode(
                         gx, gy,
@@ -1908,12 +1959,29 @@ class Task3(Node):
                         cost=new_node.cost + dist_to_goal
                     )
                     self.get_logger().info(
-                        f'[Layer 3] RRT*: reached goal at iteration {it}, nodes={len(nodes)}.'
+                        f'[Layer 3] RRT*: reached goal at iteration {it}, '
+                        f'nodes={len(nodes)}, '
+                        f'samples={samples_total}, '
+                        f'goal_connect_attempts={goal_connect_attempts}.'
                     )
                     break
+                else:
+                    segment_collision_fail += 1
 
         if goal_node is None:
-            self.get_logger().warn('[Layer 3] RRT*: failed to find a local path.')
+            # Summarize why we failed
+            min_dist = min(
+                math.hypot(n.x - gx, n.y - gy) for n in nodes
+            ) if nodes else float('inf')
+
+            self.get_logger().warn(
+                '[Layer 3] RRT*: FAILED to find a local path. '
+                f'iters={self.rrt_max_iterations}, nodes={len(nodes)}, '
+                f'samples={samples_total}, '
+                f'segment_collision_fail={segment_collision_fail}, '
+                f'goal_connect_attempts={goal_connect_attempts}, '
+                f'min_dist_to_goal={min_dist:.2f} m.'
+            )
             self.rrt_start_idx = None
             return None
 
@@ -2366,16 +2434,22 @@ class Task3(Node):
         circ = 4.0 * math.pi * area / (perimeter * perimeter)
         return area, circ
 
-    def _bearing_from_pixel(self, cx: int, img_width: int) -> float:
+    def _bearing_from_pixel(self, u: int, img_width: int) -> float:
         """
-        Map an image x-coordinate to a bearing in the LASER frame (radians),
-        using camera HFOV and the camera_laser_yaw_offset_deg parameter.
-        """
-        img_cx = img_width / 2.0
-        pixel_offset = (cx - img_cx) / max(img_cx, 1.0)  # [-1, 1]
+        Map an image x-coordinate to a bearing in the LASER frame (radians).
 
-        hfov_rad = math.radians(self.camera_h_fov_deg)
-        bearing_cam = pixel_offset * (hfov_rad / 2.0)
+        If camera intrinsics (fx, cx) are provided, use:
+            bearing_cam = atan2(u - cx, fx)
+        otherwise fall back to the HFOV-based linear model.
+        """
+        # Prefer calibrated intrinsics if available
+        if self.camera_fx > 0.0 and self.camera_cx > 0.0:
+            bearing_cam = math.atan2((u - self.camera_cx), self.camera_fx)
+        else:
+            img_cx = img_width / 2.0
+            pixel_offset = (u - img_cx) / max(img_cx, 1.0)  # [-1, 1]
+            hfov_rad = math.radians(self.camera_h_fov_deg)
+            bearing_cam = pixel_offset * (hfov_rad / 2.0)
 
         yaw_offset_rad = math.radians(self.camera_laser_yaw_offset_deg)
         bearing_laser = bearing_cam + yaw_offset_rad
@@ -2765,16 +2839,23 @@ class Task3(Node):
                 f"{self.align_center_stable_counter} frames; measuring distance..."
             )
 
-            # Use front LiDAR only (ball should now be straight ahead)
-            r = self._scan_min_in_sector(0.0, 10.0)
+            r = self._scan_median_in_sector_rad(0.0, math.radians(3.0))
 
-            # NEW: treat None/inf/invalid as "no ball range" -> do NOT finalize
-            if r is None or math.isinf(r) or r <= 0.0:
+            if r is None or math.isnan(r) or math.isinf(r) or r <= 0.0:
                 self.get_logger().warn(
-                    f"[ALIGN_MEASURE] Invalid front LiDAR reading for {color} "
-                    f"(r={r}). Not finalizing; returning to scan."
+                    f"[ALIGN_MEASURE] Invalid / noisy LiDAR r={r} for color={color}. "
+                    "Staying in ALIGN_MEASURE and waiting for a better reading."
                 )
-                # reset align state but do NOT mark ball as localized
+                # Reset stability so we require a few good frames again
+                self.align_center_stable_counter = 0
+                return
+
+            # Sanity check: too short → almost certainly wall / furniture
+            if r < 0.25:
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] Rejecting LiDAR r={r:.2f} m for {color} "
+                    "(too close; likely wall/furniture)."
+                )
                 self.align_ball_color = None
                 self.align_center_stable_counter = 0
                 self.align_filtered_err = 0.0
@@ -2889,8 +2970,8 @@ class Task3(Node):
             throttle_duration_sec=0.5,
         )
 
-        # 2) Range: median LiDAR distance around that bearing
-        range_window_rad = math.radians(6.0)  # +/- 3 degrees
+        # 2) Range: median LiDAR distance around that bearing (narrow cone)
+        range_window_rad = math.radians(2.0)  # total width ≈ 2° (±1°)
         r = self._scan_median_in_sector_rad(bearing_laser, range_window_rad)
         if math.isinf(r) or r <= 0.0:
             self.get_logger().debug(
