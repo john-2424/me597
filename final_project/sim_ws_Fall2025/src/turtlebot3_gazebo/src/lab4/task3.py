@@ -74,14 +74,14 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 4.0)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 2.8)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 2)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 1)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
         self.declare_parameter('max_angular_vel', 0.9)        # rad/s
-        self.declare_parameter('lookahead_distance', 0.5)     # m
+        self.declare_parameter('lookahead_distance', 0.35)     # m
         self.declare_parameter('goal_tolerance', 0.15)        # m
         self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
         self.declare_parameter('obstacle_avoid_distance', 0.45)  # m, simple stop threshold
@@ -93,24 +93,24 @@ class Task3(Node):
         self.declare_parameter('obstacle_slowdown_distance', 0.70)   # m
 
         # Align-to-ball (rotate-only) params 
-        self.declare_parameter('align_center_tolerance', 0.05)  # normalized [0..1]
+        self.declare_parameter('align_center_tolerance', 0.1)  # normalized [0..1]
         self.declare_parameter('align_angular_gain', 1.0)       # rad/s per unit error
         # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
-        self.declare_parameter('align_max_angular_vel', 0.3)    # rad/s
-        self.declare_parameter('align_timeout_sec', 10.0)        # s
+        self.declare_parameter('align_max_angular_vel', 0.25)    # rad/s
+        self.declare_parameter('align_timeout_sec', 8.0)        # s
 
         # PID gains for heading alignment (image-center based)
-        self.declare_parameter('align_kp', 1.0)
+        self.declare_parameter('align_kp', 0.5)
         self.declare_parameter('align_ki', 0.0)
-        self.declare_parameter('align_kd', 0.0)
+        self.declare_parameter('align_kd', 0.1)
         # Integral windup clamp (in "error * seconds" units)
-        self.declare_parameter('align_i_max', 0.3)
+        self.declare_parameter('align_i_max', 0.15)
 
         # NEW: deadband and stability requirement for alignment
-        self.declare_parameter('align_deadband', 0.01)          # norm error below this → treat as 0
-        self.declare_parameter('align_center_stable_frames', 3) # consecutive frames centered
+        self.declare_parameter('align_deadband', 0.05)          # norm error below this → treat as 0
+        self.declare_parameter('align_center_stable_frames', 4) # consecutive frames centered
         # NEW: extra settle time with v=0, w=0 before LiDAR measurement
-        self.declare_parameter('align_settle_time_sec', 2.0)  # 0.3–0.5s is usually enough
+        self.declare_parameter('align_settle_time_sec', 5.0)  # 0.3–0.5s is usually enough
 
         # NEW: scan-at-waypoint params (full 360° spin)
         self.declare_parameter('scan_angular_vel', 0.9)         # rad/s
@@ -495,6 +495,9 @@ class Task3(Node):
         self.align_pid_i = 0.0
         self.align_pid_prev_err = 0.0
         self.align_pid_prev_time = None
+
+        # NEW: once True, we are in the "centered, settling" phase
+        self.align_center_latched = False
 
         # Quality tracking for "best" detection per color
         # Higher score = better ball candidate for that color.
@@ -2116,7 +2119,7 @@ class Task3(Node):
                 continue
 
             # Ignore extremes: walls far away or invalid close junk
-            if r < scan.range_min or r > 0.95 * scan.range_max:
+            if r < scan.range_min or r > 0.99 * scan.range_max:
                 angle += scan.angle_increment
                 continue
 
@@ -2157,7 +2160,7 @@ class Task3(Node):
                 continue
 
             # Ignore ranges at/near max range – often the wall behind the ball
-            if r < scan.range_min or r > 0.95 * scan.range_max:
+            if r < scan.range_min or r > 0.99 * scan.range_max:
                 angle += scan.angle_increment
                 continue
 
@@ -2840,7 +2843,20 @@ class Task3(Node):
                 self.align_ball_color = color
                 self.prev_state_before_align = 'SCAN_AT_WAYPOINT'
                 self.state = 'ALIGN_MEASURE'
-                self.align_start_time = self.get_clock().now()
+
+                # --- RESET ALIGN/MEASURE INTERNALS (important!) ---
+                now = self.get_clock().now()
+                self.align_start_time = now              # when we entered ALIGN_MEASURE
+                self.align_center_stable_counter = 0     # stable-frame counter
+                self.align_center_latched = False        # not latched yet
+                self.align_settle_start_time = None      # not settling yet
+
+                # reset PID
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
+
+                # reset champ score so ALIGN_MEASURE always uses fresh pixels
                 self.ball_detection_score[color] = float('-inf')
                 return
 
@@ -2874,7 +2890,7 @@ class Task3(Node):
             return
 
         # --- Safety: timeout so we don't spin forever on a bad detection ---
-        if self.align_start_time is not None:
+        if self.align_start_time is not None and not self.align_center_latched:
             dt_align = (self.get_clock().now() - self.align_start_time).nanoseconds / 1e9
             if dt_align > self.align_timeout_sec:
                 self.get_logger().warn(
@@ -2885,6 +2901,7 @@ class Task3(Node):
                 self.align_center_stable_counter = 0
                 self.align_filtered_err = 0.0  # legacy field, harmless
                 self.align_settle_start_time = None
+                self.align_center_latched = False
 
                 # reset PID state
                 self.align_pid_i = 0.0
@@ -2903,6 +2920,130 @@ class Task3(Node):
             self.align_settle_start_time = None
             # PID shouldn't integrate with junk
             self.align_pid_prev_time = self.get_clock().now()
+            return
+
+        # --------------------------------------------------------------
+        # If we're already in the settle phase, DO NOT keep running PID.
+        # Just hold v=0, w=0 and wait for align_settle_time_sec, then
+        # take the LiDAR measurement and finalize.
+        # --------------------------------------------------------------
+        if self.align_settle_start_time is not None:
+            now = self.get_clock().now()
+            dt_settle = (now - self.align_settle_start_time).nanoseconds / 1e9
+
+            # Always command a full stop while settling
+            self._publish_stop()
+
+            if dt_settle < self.align_settle_time_sec:
+                # Still settling – no LiDAR yet, no PID
+                return
+
+            # Settle time satisfied → read LiDAR straight ahead and finalize
+            self.get_logger().info(
+                f"[ALIGN_MEASURE] {color} centered & static for "
+                f"{dt_settle:.2f}s; measuring distance..."
+            )
+
+            r = self._scan_median_in_sector_rad(0.0, math.radians(4.0))  # widened from 3° to 4°
+
+            if r is None or math.isnan(r) or math.isinf(r) or r <= 0.0:
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] Invalid LiDAR r={r} for color={color}. "
+                    "Resetting settle and waiting for a better reading."
+                )
+                # Reset settle and stability, but stay in ALIGN_MEASURE
+                self.align_settle_start_time = None
+                self.align_center_stable_counter = 0
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
+                self.align_center_latched = False
+                self.align_start_time = None
+                return
+
+            # Slightly less strict "too close" rejection
+            if r < 0.20:  # was 0.25
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] Rejecting LiDAR r={r:.2f} m for {color} "
+                    "(too close; likely wall/furniture)."
+                )
+                self.align_ball_color = None
+                self.align_center_stable_counter = 0
+                self.align_settle_start_time = None
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
+                self._publish_stop()
+                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
+                self.align_center_latched = False
+                self.align_start_time = None
+                return
+
+            # Compute world position using front beam
+            pose = self.current_pose.pose.pose
+            yaw = self._quat_to_yaw(pose.orientation)
+            rx = pose.position.x
+            ry = pose.position.y
+
+            wx = rx + r * math.cos(yaw)
+            wy = ry + r * math.sin(yaw)
+
+            idx = self.world_to_grid(wx, wy)
+            if idx is None:
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] {color} ball world pose outside map "
+                    f"({wx:.2f}, {wy:.2f}); not finalizing."
+                )
+                self.align_ball_color = None
+                self.align_center_stable_counter = 0
+                self.align_settle_start_time = None
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
+                self._publish_stop()
+                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
+                self.align_center_latched = False
+                self.align_start_time = None
+                return
+
+            row, col = idx
+            static_occ = None
+            if self.static_occupancy is not None:
+                static_occ = int(self.static_occupancy[row, col])
+
+            if static_occ is not None and static_occ != 0:
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] {color} ball landed on STATIC occupied cell "
+                    f"({row},{col}); accepting but note overlap with static map."
+                )
+
+            if self.inflated_occupancy is not None and self.inflated_occupancy[row, col] != 0:
+                self.get_logger().warn(
+                    f"[ALIGN_MEASURE] {color} ball landed in INFLATED occupied cell "
+                    f"({row},{col}); accepting but note it is close to a wall."
+                )
+
+            self.ball_world_est[color] = (wx, wy)
+            self.detected_balls[color] = True
+
+            self.get_logger().info(
+                f"[ALIGN_MEASURE] Finalized {color} ball at world=({wx:.2f}, {wy:.2f}), r={r:.2f}m."
+            )
+
+            # Reset alignment internals
+            self.align_pid_i = 0.0
+            self.align_pid_prev_err = 0.0
+            self.align_pid_prev_time = None
+            self.align_center_stable_counter = 0
+            self.align_settle_start_time = None
+            self.align_center_latched = False
+            self.align_start_time = None
+            self.align_ball_color = None
+
+            # Return to scanning/patrol
+            self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
+            self._publish_ball_markers()
+            self._maybe_finish_task_if_balls_found()
             return
 
         # ------------------------------------------------------------------
@@ -2958,13 +3099,13 @@ class Task3(Node):
         elif w_cmd < -self.align_max_angular_vel:
             w_cmd = -self.align_max_angular_vel
 
-        # Update "centered" stability counter using the raw error magnitude
         if abs(err) <= self.align_center_tolerance:
             self.align_center_stable_counter += 1
         else:
             self.align_center_stable_counter = 0
-            # If we drifted out of tolerance, reset settle timer
-            self.align_settle_start_time = None
+            # Do NOT touch align_settle_start_time here.
+            # Once we enter settle mode, the early-return branch above
+            # keeps us there until we either finish or reset explicitly.
 
         self.get_logger().info(
             f"[ALIGN_MEASURE] err={err:.3f}, I={self.align_pid_i:.3f}, "
@@ -2972,132 +3113,35 @@ class Task3(Node):
             f"w_cmd={w_cmd:.3f}"
         )
 
-        # ------------------------------------------------------------------
-        # Phase B: ball centered & stable → settle then measure LiDAR
-        # ------------------------------------------------------------------
-        if self.align_center_stable_counter >= self.align_center_stable_frames:
-            now = self.get_clock().now()
+        # --------------------------------------------------------------
+        # LATCH WHEN CENTERED: enough stable frames + decent area
+        # --------------------------------------------------------------
+        meta = self.ball_detection_meta.get(color)
+        best_area = None
+        if meta is not None:
+            best_area = meta.get("area", None)
 
-            # First time we enter the settle phase: start timer and command stop.
-            if self.align_settle_start_time is None:
-                self.align_settle_start_time = now
-                self._publish_stop()
-                self.get_logger().info(
-                    f"[ALIGN_MEASURE] {color} centered; starting settle timer "
-                    f"for {self.align_settle_time_sec:.2f}s before LiDAR read."
-                )
-                return
+        if (
+            not self.align_center_latched and
+            self.align_center_stable_counter >= self.align_center_stable_frames and
+            best_area is not None and best_area > 20000.0  # tweak if needed
+        ):
+            # We've been centered for long enough on a solid blob -> latch
+            self.align_center_latched = True
+            self.align_settle_start_time = self.get_clock().now()
+            self.align_center_stable_counter = 0
 
-            dt_settle = (now - self.align_settle_start_time).nanoseconds / 1e9
+            self.get_logger().info(
+                f"[ALIGN_MEASURE] {color} centered; starting settle timer "
+                f"for {self.align_settle_time_sec:.2f}s before LiDAR read."
+            )
 
-            # Keep commanding full stop during settle
+            # Immediately stop; settle branch will keep us stopped
             self._publish_stop()
-
-            if dt_settle < self.align_settle_time_sec:
-                # Still settling: do NOT read LiDAR yet.
-                return
-
-            # --- Settle time satisfied: take LiDAR measurement in front (0 rad) ---
-            self.get_logger().info(
-                f"[ALIGN_MEASURE] {color} centered & static for "
-                f"{dt_settle:.2f}s; measuring distance..."
-            )
-
-            r = self._scan_median_in_sector_rad(0.0, math.radians(3.0))
-
-            if r is None or math.isnan(r) or math.isinf(r) or r <= 0.0:
-                self.get_logger().warn(
-                    f"[ALIGN_MEASURE] Invalid / noisy LiDAR r={r} for color={color}. "
-                    "Staying in ALIGN_MEASURE and waiting for a better reading."
-                )
-                # Reset settle so we demand another quiet period
-                self.align_settle_start_time = None
-                self.align_center_stable_counter = 0
-                # also clear PID state a bit
-                self.align_pid_i = 0.0
-                self.align_pid_prev_err = 0.0
-                return
-
-            # Sanity check: too short → almost certainly wall / furniture
-            if r < 0.25:
-                self.get_logger().warn(
-                    f"[ALIGN_MEASURE] Rejecting LiDAR r={r:.2f} m for {color} "
-                    "(too close; likely wall/furniture)."
-                )
-                self.align_ball_color = None
-                self.align_center_stable_counter = 0
-                self.align_filtered_err = 0.0
-                self.align_settle_start_time = None
-                self.align_pid_i = 0.0
-                self.align_pid_prev_err = 0.0
-                self.align_pid_prev_time = None
-                self._publish_stop()
-                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
-                return
-
-            # Use robot pose + yaw + **front** LiDAR beam to compute world (x, y)
-            pose = self.current_pose.pose.pose
-            yaw = self._quat_to_yaw(pose.orientation)
-            rx = pose.position.x
-            ry = pose.position.y
-
-            wx = rx + r * math.cos(yaw)
-            wy = ry + r * math.sin(yaw)
-
-            # Occupancy check before accepting this world pose
-            idx = self.world_to_grid(wx, wy)
-            if idx is None:
-                self.get_logger().warn(
-                    f"[ALIGN_MEASURE] {color} ball world pose outside map "
-                    f"({wx:.2f}, {wy:.2f}); not finalizing."
-                )
-                self.align_ball_color = None
-                self.align_center_stable_counter = 0
-                self.align_filtered_err = 0.0
-                self.align_settle_start_time = None
-                self.align_pid_i = 0.0
-                self.align_pid_prev_err = 0.0
-                self.align_pid_prev_time = None
-                self._publish_stop()
-                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
-                return
-
-            row, col = idx
-            static_occ = None
-            if self.static_occupancy is not None:
-                static_occ = int(self.static_occupancy[row, col])
-
-            if static_occ is not None and static_occ != 0:
-                # We *warn* but no longer reject the localization outright.
-                # Balls often sit right against walls; LiDAR will see the wall range.
-                self.get_logger().warn(
-                    f"[ALIGN_MEASURE] {color} ball landed on STATIC occupied cell "
-                    f"({row},{col}); accepting but note it overlaps static map."
-                )
-                # IMPORTANT: DO NOT reset state or return here – fall through and accept.
-
-            if self.inflated_occupancy is not None and self.inflated_occupancy[row, col] != 0:
-                self.get_logger().warn(
-                    f"[ALIGN_MEASURE] {color} ball landed in INFLATED occupied cell "
-                    f"({row},{col}); accepting but note it is close to a wall."
-                )
-                # Do NOT early-return here – just log and proceed.
-
-            # If we reach here, the ball is in free space with a valid range
-            self.ball_world_est[color] = (wx, wy)
-            self.detected_balls[color] = True
-
-            self.get_logger().info(
-                f"[ALIGN_MEASURE] Finalized {color} ball at world=({wx:.2f}, {wy:.2f}), r={r:.2f}m."
-            )
-
-            # Reset state and counters, go back to scanning/patrol
-            self.align_pid_i = 0.0
-            self.align_pid_prev_err = 0.0
-            self.align_pid_prev_time = None
+            return
 
         # ------------------------------------------------------------------
-        # Still in Phase A: not yet centered + stable → command PID-based turn
+        # Still in Phase A (not latched yet): command PID-based turn
         # ------------------------------------------------------------------
         twist = Twist()
         twist.linear.x = 0.0
