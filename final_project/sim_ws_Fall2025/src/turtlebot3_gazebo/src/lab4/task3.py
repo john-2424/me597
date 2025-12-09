@@ -422,6 +422,13 @@ class Task3(Node):
         self.task_start_time = None
         self.task_done_time = None
 
+        # Best (minimum) LiDAR distance seen so far for each color.
+        # We only update world pose if a new measurement is closer than this.
+        self.ball_range_est = {c: None for c in self.ball_colors}
+
+        # Small margin so we only treat "meaningfully closer" as an improvement
+        self.relocalize_range_margin = 0.05  # meters
+
         """# Per-color HSV ranges (BGR->HSV) as the *primary* color gate.
         # ⚠️ You should tune these ranges using the notebook slider on real
         # Gazebo screenshots. These are just reasonable starting points.
@@ -2838,27 +2845,60 @@ class Task3(Node):
                 throttle_duration_sec=1.0,
             )
 
-            # Trigger ALIGN_MEASURE for *new* colors during scan
-            if self.state == 'SCAN_AT_WAYPOINT' and not self.detected_balls[color]:
-                self.align_ball_color = color
-                self.prev_state_before_align = 'SCAN_AT_WAYPOINT'
-                self.state = 'ALIGN_MEASURE'
+            # Decide whether to trigger ALIGN_MEASURE from SCAN_AT_WAYPOINT.
+            # We ALWAYS allow a first localization for this color.
+            # After that, we only re-localize if we appear closer than the
+            # best range we've already recorded.
+            if self.state == 'SCAN_AT_WAYPOINT':
+                approx_r = self._range_from_pixel_bearing(cx, img_w)
+                prev_r = self.ball_range_est.get(color, None)
 
-                # --- RESET ALIGN/MEASURE INTERNALS (important!) ---
-                now = self.get_clock().now()
-                self.align_start_time = now              # when we entered ALIGN_MEASURE
-                self.align_center_stable_counter = 0     # stable-frame counter
-                self.align_center_latched = False        # not latched yet
-                self.align_settle_start_time = None      # not settling yet
+                trigger_align = False
 
-                # reset PID
-                self.align_pid_i = 0.0
-                self.align_pid_prev_err = 0.0
-                self.align_pid_prev_time = None
+                if not self.detected_balls[color]:
+                    # First time we see this color → always localize
+                    trigger_align = True
+                else:
+                    # Already have a pose; only re-localize if new range is closer
+                    if approx_r is not None and math.isfinite(approx_r) and prev_r is not None:
+                        if approx_r + self.relocalize_range_margin < prev_r:
+                            trigger_align = True
+                            self.get_logger().info(
+                                f"[Layer 5] {color} seen again at approx_r={approx_r:.2f}m "
+                                f"(best={prev_r:.2f}m); triggering re-localization."
+                            )
+                        else:
+                            self.get_logger().info(
+                                f"[Layer 5] {color} seen again at approx_r={approx_r:.2f}m, "
+                                f"not closer than best={prev_r:.2f}m; no ALIGN_MEASURE."
+                            )
+                    else:
+                        # No valid range estimate; fall back to first-detection behavior only
+                        self.get_logger().info(
+                            f"[Layer 5] {color} re-detected but approx range unavailable; "
+                            "keeping existing localization."
+                        )
 
-                # reset champ score so ALIGN_MEASURE always uses fresh pixels
-                self.ball_detection_score[color] = float('-inf')
-                return
+                if trigger_align:
+                    self.align_ball_color = color
+                    self.prev_state_before_align = 'SCAN_AT_WAYPOINT'
+                    self.state = 'ALIGN_MEASURE'
+
+                    # --- RESET ALIGN/MEASURE INTERNALS (important!) ---
+                    now = self.get_clock().now()
+                    self.align_start_time = now              # when we entered ALIGN_MEASURE
+                    self.align_center_stable_counter = 0     # stable-frame counter
+                    self.align_center_latched = False        # not latched yet
+                    self.align_settle_start_time = None      # not settling yet
+
+                    # reset PID
+                    self.align_pid_i = 0.0
+                    self.align_pid_prev_err = 0.0
+                    self.align_pid_prev_time = None
+
+                    # reset champ score so ALIGN_MEASURE always uses fresh pixels
+                    self.ball_detection_score[color] = float('-inf')
+                    return
 
             # Draw debug overlay for this best contour
             color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
@@ -3023,12 +3063,29 @@ class Task3(Node):
                     f"({row},{col}); accepting but note it is close to a wall."
                 )
 
-            self.ball_world_est[color] = (wx, wy)
-            self.detected_balls[color] = True
+            # -------------------------------
+            # BEST-SO-FAR RANGE LOGIC HERE 👇
+            # -------------------------------
+            prev_r = self.ball_range_est.get(color, None)
 
-            self.get_logger().info(
-                f"[ALIGN_MEASURE] Finalized {color} ball at world=({wx:.2f}, {wy:.2f}), r={r:.2f}m."
-            )
+            if (prev_r is None) or (r + self.relocalize_range_margin < prev_r):
+                # New measurement is closer → update stored pose and range
+                self.ball_world_est[color] = (wx, wy)
+                self.ball_range_est[color] = r
+                self.detected_balls[color] = True
+
+                self.get_logger().info(
+                    f"[ALIGN_MEASURE] Updated {color} ball pose: "
+                    f"r={r:.2f}m (prev={prev_r if prev_r is not None else float('nan'):.2f}), "
+                    f"world=({wx:.2f}, {wy:.2f})."
+                )
+            else:
+                # Keep the old (closer) estimate, but still mark as detected
+                self.detected_balls[color] = True
+                self.get_logger().info(
+                    f"[ALIGN_MEASURE] New {color} measurement r={r:.2f}m is not closer "
+                    f"than best r={prev_r:.2f}m; keeping existing world pose."
+                )
 
             # Reset alignment internals
             self.align_pid_i = 0.0
@@ -3795,6 +3852,10 @@ class Task3(Node):
             self.active_path_points = list(path_world)
             self.current_path_index = 0
 
+            # 🔧 NEW: fresh global path → fresh RRT* fuse
+            self.rrt_fail_count = 0
+            self.local_plan_active = False
+
             path_msg = self.build_path_msg(path_world)
             self.global_path_pub.publish(path_msg)
 
@@ -3899,6 +3960,10 @@ class Task3(Node):
 
             # Allow revisiting everything that’s not in unreachable
             self.visited_waypoints.clear()
+
+            # 🔧 Optional: new patrol sweep, so reset RRT* fail counter too
+            self.rrt_fail_count = 0
+
             self.state = 'SELECT_NEXT_WAYPOINT'
             return
 
