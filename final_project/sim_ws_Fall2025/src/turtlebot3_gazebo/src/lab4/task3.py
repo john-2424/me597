@@ -74,9 +74,9 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 3.0)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 4.0)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 3)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 2)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
@@ -84,29 +84,38 @@ class Task3(Node):
         self.declare_parameter('lookahead_distance', 0.5)     # m
         self.declare_parameter('goal_tolerance', 0.15)        # m
         self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
-        self.declare_parameter('obstacle_avoid_distance', 0.3)  # m, simple stop threshold
+        self.declare_parameter('obstacle_avoid_distance', 0.45)  # m, simple stop threshold
 
         # NEW: when heading error is large, rotate-only instead of "plowing forward"
         self.declare_parameter('heading_align_only_threshold', 0.5)  # rad (~30 deg)
 
         # NEW: slow down when something is near but not yet at avoid distance
-        self.declare_parameter('obstacle_slowdown_distance', 0.50)   # m
+        self.declare_parameter('obstacle_slowdown_distance', 0.70)   # m
 
         # Align-to-ball (rotate-only) params 
-        self.declare_parameter('align_center_tolerance', 0.1)  # normalized [0..1]
+        self.declare_parameter('align_center_tolerance', 0.05)  # normalized [0..1]
         self.declare_parameter('align_angular_gain', 1.0)       # rad/s per unit error
         # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
         self.declare_parameter('align_max_angular_vel', 0.3)    # rad/s
-        self.declare_parameter('align_timeout_sec', 6.0)        # s
+        self.declare_parameter('align_timeout_sec', 10.0)        # s
+
+        # PID gains for heading alignment (image-center based)
+        self.declare_parameter('align_kp', 1.0)
+        self.declare_parameter('align_ki', 0.0)
+        self.declare_parameter('align_kd', 0.0)
+        # Integral windup clamp (in "error * seconds" units)
+        self.declare_parameter('align_i_max', 0.3)
 
         # NEW: deadband and stability requirement for alignment
-        self.declare_parameter('align_deadband', 0.03)          # norm error below this → treat as 0
-        self.declare_parameter('align_center_stable_frames', 5) # consecutive frames centered
+        self.declare_parameter('align_deadband', 0.01)          # norm error below this → treat as 0
+        self.declare_parameter('align_center_stable_frames', 3) # consecutive frames centered
+        # NEW: extra settle time with v=0, w=0 before LiDAR measurement
+        self.declare_parameter('align_settle_time_sec', 2.0)  # 0.3–0.5s is usually enough
 
         # NEW: scan-at-waypoint params (full 360° spin)
-        self.declare_parameter('scan_angular_vel', 0.3)         # rad/s
+        self.declare_parameter('scan_angular_vel', 0.9)         # rad/s
         self.declare_parameter('scan_turns', 1.0)               # number of full rotations
-        self.declare_parameter('scan_timeout_sec', 12.0)        # safety timeout
+        self.declare_parameter('scan_timeout_sec', 30.0)        # safety timeout
 
         # Reactive avoidance tuning (simple escape maneuver)
         self.declare_parameter('obstacle_avoid_back_time', 1.0)      # s
@@ -213,6 +222,22 @@ class Task3(Node):
             self.get_parameter('align_max_angular_vel')
             .get_parameter_value().double_value
         )
+        self.align_kp = (
+            self.get_parameter('align_kp')
+            .get_parameter_value().double_value
+        )
+        self.align_ki = (
+            self.get_parameter('align_ki')
+            .get_parameter_value().double_value
+        )
+        self.align_kd = (
+            self.get_parameter('align_kd')
+            .get_parameter_value().double_value
+        )
+        self.align_i_max = (
+            self.get_parameter('align_i_max')
+            .get_parameter_value().double_value
+        )
 
         # NEW
         self.align_deadband = (
@@ -223,7 +248,12 @@ class Task3(Node):
             self.get_parameter('align_center_stable_frames')
             .get_parameter_value().integer_value
         )
-
+        # NEW: settle time
+        self.align_settle_time_sec = (
+            self.get_parameter('align_settle_time_sec')
+            .get_parameter_value().double_value
+        )
+        
         # NEW: scan-at-waypoint
         self.scan_angular_vel = (
             self.get_parameter('scan_angular_vel')
@@ -374,6 +404,8 @@ class Task3(Node):
         self.scan_start_yaw = None
         self.scan_last_yaw = None
         self.scan_accum_angle = 0.0
+        # NEW: task completion should wait until scan finishes
+        self.pending_task_done = False
 
         # Simple reactive avoidance state
         self.avoidance_phase = None               # 'BACK', 'TURN', 'FORWARD'
@@ -455,6 +487,14 @@ class Task3(Node):
         # NEW: filtered error + stability counter
         self.align_filtered_err = 0.0
         self.align_center_stable_counter = 0
+
+        # NEW: when we started the "settle with zero cmd_vel" phase
+        self.align_settle_start_time = None
+
+        # PID internal state for ALIGN_MEASURE (heading control)
+        self.align_pid_i = 0.0
+        self.align_pid_prev_err = 0.0
+        self.align_pid_prev_time = None
 
         # Quality tracking for "best" detection per color
         # Higher score = better ball candidate for that color.
@@ -2227,6 +2267,21 @@ class Task3(Node):
                 f'(required={required_angle:.2f}).'
             )
             self._publish_stop()
+
+            # NEW: if task completion is pending (all balls found),
+            # finalize *now* instead of going to next waypoint.
+            if self.pending_task_done:
+                self.get_logger().info(
+                    '[Layer 3] SCAN_AT_WAYPOINT: 360° done and '
+                    'pending_task_done=True → finalizing task.'
+                )
+                # Temporarily move out of SCAN state so _maybe_finish_task_...
+                # will actually finalize instead of deferring.
+                self.state = 'PATROL_DONE'
+                self._maybe_finish_task_if_balls_found()
+                return
+
+            # Normal behavior: go to next waypoint
             self.state = 'SELECT_NEXT_WAYPOINT'
             return
 
@@ -2619,8 +2674,8 @@ class Task3(Node):
             for c in contours:
                 area, circ = self._contour_circularity(c)
 
-                # Hard area and circularity cuts
-                if area < min_area_hard or area > max_area_hard:
+                # NEW: no hard max-area gate
+                if area < min_area_hard:
                     continue
                 if circ < circ_hard:
                     continue
@@ -2629,7 +2684,7 @@ class Task3(Node):
                 aspect = max(rw, rh) / max(1, min(rw, rh))
 
                 # Reject elongated blobs; balls should be close to round
-                if aspect > 1.6:
+                if aspect > 2.5:
                     continue
 
                 cx = int(x_c + rw / 2)
@@ -2652,9 +2707,9 @@ class Task3(Node):
                     R_exp = self._expected_ball_pixel_radius(range_est, img_w)
                     if R_exp is not None:
                         R_bbox = 0.5 * max(rw, rh)
-                        # Accept contours roughly within [0.5, 2.0] * expected radius
-                        if not (0.5 * R_exp <= R_bbox <= 2.0 * R_exp):
-                            size_gate_ok = False
+                        if range_est > 0.4:  # only gate when not *too* close
+                            if not (0.5 * R_exp <= R_bbox):
+                                size_gate_ok = False
 
                 if not size_gate_ok:
                     continue
@@ -2730,64 +2785,55 @@ class Task3(Node):
             center_offset = best_meta["center_offset"]
             best_area = best_meta["area"]
             best_circ = best_meta["circ"]
-
-            # Try to localize immediately if near center
-            world_xy = None
-            has_world = False
-            if center_offset <= self.align_center_tolerance:
-                world_xy = self._localize_ball_from_pixel(
-                    color, cx, cy, img_w, img_h
-                )
-                has_world = world_xy is not None
-
-            # Compare to previous champion
+            
+            # We **do not** localize here anymore.
+            # This block is only about picking the best pixel detection.
             base_score = best_score
-            if has_world:
-                base_score += 2.0
-            elif self.ball_world_est.get(color) is not None:
-                base_score -= 0.7
 
             prev_score = self.ball_detection_score.get(color, float('-inf'))
 
-            if base_score <= prev_score:
-                self.get_logger().info(
-                    f"[Layer 5] New {color} detection (frame_score={base_score:.2f}) "
-                    f"worse than existing best (score={prev_score:.2f}); keeping old.",
-                    throttle_duration_sec=1.0,
-                )
-                # still draw for visualization
-                color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
-                cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
-                cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
-                continue
-
-            # New champion for this color
-            self.ball_detection_score[color] = base_score
-            self.ball_detection_meta[color] = {
+            # Build meta once so we can reuse it in both branches
+            meta = {
                 "area": best_area,
                 "circ": best_circ,
                 "center_offset": center_offset,
-                "has_world": has_world,
+                # no has_world here anymore – ALIGN_MEASURE will handle world estimation
                 "stable_frames": best_meta["stable_frames"],
             }
-            self.ball_pixel_obs[color] = (cx, cy)
 
-            if has_world:
-                wx, wy = world_xy
-                self.ball_world_est[color] = (wx, wy)
-                self.detected_balls[color] = True
-                self.get_logger().info(
-                    f'[Layer 5] UPDATED BEST {color} ball: score={prev_score:.2f} -> {base_score:.2f}, '
-                    f'world≈({wx:.2f},{wy:.2f}), area={best_area:.1f}, circ={best_circ:.3f}, '
-                    f'center_offset={center_offset:.2f}.',
-                    throttle_duration_sec=1.0,
-                )
+            # --- SPECIAL CASE: while ALIGNING to this color, always track the latest pixel ---
+            if self.state == 'ALIGN_MEASURE' and color == self.align_ball_color:
+                # Ignore champion-score gate; PID / align logic needs the freshest pixel
+                self.ball_detection_score[color] = base_score
+                self.ball_detection_meta[color] = meta
+                self.ball_pixel_obs[color] = (cx, cy)
+
             else:
-                self.get_logger().info(
-                    f'[Layer 5] UPDATED BEST {color} pixel-only: score={prev_score:.2f} -> {base_score:.2f}, '
-                    f'area={best_area:.1f}, circ={best_circ:.3f}, center_offset={center_offset:.2f}.',
-                    throttle_duration_sec=1.0,
-                )
+                # Normal champion logic (for SCAN_AT_WAYPOINT etc.)
+                if base_score <= prev_score:
+                    self.get_logger().info(
+                        f"[Layer 5] New {color} detection (frame_score={base_score:.2f}) "
+                        f"worse than existing best (score={prev_score:.2f}); keeping old.",
+                        throttle_duration_sec=1.0,
+                    )
+                    # still draw for visualization
+                    color_bgr = {'red': (0,0,255), 'green': (0,255,0), 'blue': (255,0,0)}[color]
+                    cv2.rectangle(debug_frame, (x, y), (x + rw, y + rh), color_bgr, 2)
+                    cv2.circle(debug_frame, (cx, cy), 5, color_bgr, -1)
+                    continue
+
+                self.ball_detection_score[color] = base_score
+                self.ball_detection_meta[color] = meta
+                self.ball_pixel_obs[color] = (cx, cy)
+
+            # Only pixel champion here; world localization happens in ALIGN_MEASURE
+            self.get_logger().info(
+                f'[Layer 5] UPDATED BEST {color} pixel-only: '
+                f'score={prev_score:.2f} -> {base_score:.2f}, '
+                f'area={best_area:.1f}, circ={best_circ:.3f}, '
+                f'center_offset={center_offset:.2f}.',
+                throttle_duration_sec=1.0,
+            )
 
             # Trigger ALIGN_MEASURE for *new* colors during scan
             if self.state == 'SCAN_AT_WAYPOINT' and not self.detected_balls[color]:
@@ -2795,6 +2841,7 @@ class Task3(Node):
                 self.prev_state_before_align = 'SCAN_AT_WAYPOINT'
                 self.state = 'ALIGN_MEASURE'
                 self.align_start_time = self.get_clock().now()
+                self.ball_detection_score[color] = float('-inf')
                 return
 
             # Draw debug overlay for this best contour
@@ -2828,15 +2875,22 @@ class Task3(Node):
 
         # --- Safety: timeout so we don't spin forever on a bad detection ---
         if self.align_start_time is not None:
-            dt = (self.get_clock().now() - self.align_start_time).nanoseconds / 1e9
-            if dt > self.align_timeout_sec:
+            dt_align = (self.get_clock().now() - self.align_start_time).nanoseconds / 1e9
+            if dt_align > self.align_timeout_sec:
                 self.get_logger().warn(
                     f"[ALIGN_MEASURE] Timeout aligning to {color} after "
-                    f"{dt:.1f}s. Returning to {self.prev_state_before_align}."
+                    f"{dt_align:.1f}s. Returning to {self.prev_state_before_align}."
                 )
                 self.align_ball_color = None
                 self.align_center_stable_counter = 0
-                self.align_filtered_err = 0.0
+                self.align_filtered_err = 0.0  # legacy field, harmless
+                self.align_settle_start_time = None
+
+                # reset PID state
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
+
                 self._publish_stop()
                 self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
                 return
@@ -2845,34 +2899,108 @@ class Task3(Node):
         if pix is None or self.last_image_width is None:
             # no current measurement; just stop and wait
             self._publish_stop()
+            # also reset settle timer; we don't want to reuse old one
+            self.align_settle_start_time = None
+            # PID shouldn't integrate with junk
+            self.align_pid_prev_time = self.get_clock().now()
             return
 
+        # ------------------------------------------------------------------
+        # Phase A: PID-based heading alignment to image center
+        # ------------------------------------------------------------------
         cx, cy = pix
         img_cx = self.last_image_width / 2.0
 
-        # Raw normalized error in [-1, 1]
+        # Raw normalized error in [-1, 1]: +ve => ball to the right of center
         raw_err = (cx - img_cx) / max(img_cx, 1.0)
 
-        # Simple low-pass filter to smooth jitter
-        alpha = 0.3  # 0 → no new info, 1 → no smoothing
-        self.align_filtered_err = (1.0 - alpha) * self.align_filtered_err + alpha * raw_err
-        norm_err = self.align_filtered_err
+        # Apply deadband: tiny errors treated as zero
+        if abs(raw_err) < self.align_deadband:
+            err = 0.0
+        else:
+            err = raw_err
 
-        # Deadband: tiny errors are treated as perfect
-        if abs(norm_err) < self.align_deadband:
-            norm_err = 0.0
+        # PID time step
+        now = self.get_clock().now()
+        if self.align_pid_prev_time is None:
+            dt = 0.0
+        else:
+            dt = (now - self.align_pid_prev_time).nanoseconds / 1e9
+        self.align_pid_prev_time = now
 
-        # Update stability counter: how many frames in a row we're "centered enough"
-        if abs(norm_err) <= self.align_center_tolerance:
+        # Protect against absurd dt (e.g. first frame)
+        if dt < 1e-4:
+            dt = 0.0
+
+        # --- PID update on heading error (image-based) ---
+        # Integral term
+        if dt > 0.0:
+            self.align_pid_i += err * dt
+            # clamp integral to avoid windup
+            self.align_pid_i = max(-self.align_i_max, min(self.align_i_max, self.align_pid_i))
+
+        # Derivative term
+        if dt > 0.0:
+            d_err = (err - self.align_pid_prev_err) / dt
+        else:
+            d_err = 0.0
+
+        self.align_pid_prev_err = err
+
+        # PID output -> angular velocity command (sign flipped because
+        # positive error means ball is to the RIGHT, so we need to turn LEFT)
+        u = self.align_kp * err + self.align_ki * self.align_pid_i + self.align_kd * d_err
+        w_cmd = -u
+
+        # Clamp to a gentle max angular speed
+        if w_cmd > self.align_max_angular_vel:
+            w_cmd = self.align_max_angular_vel
+        elif w_cmd < -self.align_max_angular_vel:
+            w_cmd = -self.align_max_angular_vel
+
+        # Update "centered" stability counter using the raw error magnitude
+        if abs(err) <= self.align_center_tolerance:
             self.align_center_stable_counter += 1
         else:
             self.align_center_stable_counter = 0
+            # If we drifted out of tolerance, reset settle timer
+            self.align_settle_start_time = None
 
+        self.get_logger().info(
+            f"[ALIGN_MEASURE] err={err:.3f}, I={self.align_pid_i:.3f}, "
+            f"stable={self.align_center_stable_counter}/{self.align_center_stable_frames}, "
+            f"w_cmd={w_cmd:.3f}"
+        )
+
+        # ------------------------------------------------------------------
+        # Phase B: ball centered & stable → settle then measure LiDAR
+        # ------------------------------------------------------------------
         if self.align_center_stable_counter >= self.align_center_stable_frames:
+            now = self.get_clock().now()
+
+            # First time we enter the settle phase: start timer and command stop.
+            if self.align_settle_start_time is None:
+                self.align_settle_start_time = now
+                self._publish_stop()
+                self.get_logger().info(
+                    f"[ALIGN_MEASURE] {color} centered; starting settle timer "
+                    f"for {self.align_settle_time_sec:.2f}s before LiDAR read."
+                )
+                return
+
+            dt_settle = (now - self.align_settle_start_time).nanoseconds / 1e9
+
+            # Keep commanding full stop during settle
             self._publish_stop()
+
+            if dt_settle < self.align_settle_time_sec:
+                # Still settling: do NOT read LiDAR yet.
+                return
+
+            # --- Settle time satisfied: take LiDAR measurement in front (0 rad) ---
             self.get_logger().info(
-                f"[ALIGN_MEASURE] {color} centered and stable for "
-                f"{self.align_center_stable_counter} frames; measuring distance..."
+                f"[ALIGN_MEASURE] {color} centered & static for "
+                f"{dt_settle:.2f}s; measuring distance..."
             )
 
             r = self._scan_median_in_sector_rad(0.0, math.radians(3.0))
@@ -2882,8 +3010,12 @@ class Task3(Node):
                     f"[ALIGN_MEASURE] Invalid / noisy LiDAR r={r} for color={color}. "
                     "Staying in ALIGN_MEASURE and waiting for a better reading."
                 )
-                # Reset stability so we require a few good frames again
+                # Reset settle so we demand another quiet period
+                self.align_settle_start_time = None
                 self.align_center_stable_counter = 0
+                # also clear PID state a bit
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
                 return
 
             # Sanity check: too short → almost certainly wall / furniture
@@ -2895,10 +3027,15 @@ class Task3(Node):
                 self.align_ball_color = None
                 self.align_center_stable_counter = 0
                 self.align_filtered_err = 0.0
+                self.align_settle_start_time = None
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
                 self._publish_stop()
                 self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
                 return
 
+            # Use robot pose + yaw + **front** LiDAR beam to compute world (x, y)
             pose = self.current_pose.pose.pose
             yaw = self._quat_to_yaw(pose.orientation)
             rx = pose.position.x
@@ -2907,7 +3044,7 @@ class Task3(Node):
             wx = rx + r * math.cos(yaw)
             wy = ry + r * math.sin(yaw)
 
-            # NEW: occupancy check before accepting this world pose
+            # Occupancy check before accepting this world pose
             idx = self.world_to_grid(wx, wy)
             if idx is None:
                 self.get_logger().warn(
@@ -2917,6 +3054,10 @@ class Task3(Node):
                 self.align_ball_color = None
                 self.align_center_stable_counter = 0
                 self.align_filtered_err = 0.0
+                self.align_settle_start_time = None
+                self.align_pid_i = 0.0
+                self.align_pid_prev_err = 0.0
+                self.align_pid_prev_time = None
                 self._publish_stop()
                 self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
                 return
@@ -2927,28 +3068,20 @@ class Task3(Node):
                 static_occ = int(self.static_occupancy[row, col])
 
             if static_occ is not None and static_occ != 0:
+                # We *warn* but no longer reject the localization outright.
+                # Balls often sit right against walls; LiDAR will see the wall range.
                 self.get_logger().warn(
                     f"[ALIGN_MEASURE] {color} ball landed on STATIC occupied cell "
-                    f"({row},{col}); not marking as localized."
+                    f"({row},{col}); accepting but note it overlaps static map."
                 )
-                self.align_ball_color = None
-                self.align_center_stable_counter = 0
-                self.align_filtered_err = 0.0
-                self._publish_stop()
-                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
-                return
+                # IMPORTANT: DO NOT reset state or return here – fall through and accept.
 
             if self.inflated_occupancy is not None and self.inflated_occupancy[row, col] != 0:
                 self.get_logger().warn(
                     f"[ALIGN_MEASURE] {color} ball landed in INFLATED occupied cell "
-                    f"({row},{col}); not marking as localized."
+                    f"({row},{col}); accepting but note it is close to a wall."
                 )
-                self.align_ball_color = None
-                self.align_center_stable_counter = 0
-                self.align_filtered_err = 0.0
-                self._publish_stop()
-                self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
-                return
+                # Do NOT early-return here – just log and proceed.
 
             # If we reach here, the ball is in free space with a valid range
             self.ball_world_est[color] = (wx, wy)
@@ -2958,26 +3091,17 @@ class Task3(Node):
                 f"[ALIGN_MEASURE] Finalized {color} ball at world=({wx:.2f}, {wy:.2f}), r={r:.2f}m."
             )
 
-            # Reset state and counters, go back to scanning
-            self.align_ball_color = None
-            self.align_center_stable_counter = 0
-            self.align_filtered_err = 0.0
-            self._publish_stop()
-            self.state = self.prev_state_before_align or 'SCAN_AT_WAYPOINT'
-            return
+            # Reset state and counters, go back to scanning/patrol
+            self.align_pid_i = 0.0
+            self.align_pid_prev_err = 0.0
+            self.align_pid_prev_time = None
 
-        # --- Otherwise: keep rotating gently toward center (one ball at a time) ---
+        # ------------------------------------------------------------------
+        # Still in Phase A: not yet centered + stable → command PID-based turn
+        # ------------------------------------------------------------------
         twist = Twist()
         twist.linear.x = 0.0
-        twist.angular.z = -self.align_angular_gain * norm_err
-
-        # Clamp to align_max_angular_vel for gentler motion
-        if twist.angular.z > self.align_max_angular_vel:
-            twist.angular.z = self.align_max_angular_vel
-        elif twist.angular.z < -self.align_max_angular_vel:
-            twist.angular.z = -self.align_max_angular_vel
-
-        # If norm_err == 0, this will publish zero angular velocity (pure stop)
+        twist.angular.z = w_cmd
         self.cmd_vel_pub.publish(twist)
 
     def _localize_ball_from_pixel(self, color, cx, cy, img_width, img_height):
@@ -3058,10 +3182,9 @@ class Task3(Node):
         # Optionally also reject inflated obstacles (very close to walls)
         if self.inflated_occupancy is not None and self.inflated_occupancy[row, col] != 0:
             self.get_logger().info(
-                f'[Layer 5] Localized {color} ball in INFLATED occupied cell '
-                f'({row},{col}), candidate=({wx:.2f}, {wy:.2f}). Rejecting.'
-            )
-            return None
+                    f'[Layer 5] {color} ball fell on INFLATED cell ({row},{col}); '
+                    'accepting but note it is close to a wall.'
+                )
 
         return wx, wy
 
@@ -3288,6 +3411,22 @@ class Task3(Node):
         if not all(self.detected_balls.values()):
             return
 
+        # ---- NEW BLOCK: delay finalization until scan is done ----
+        required_angle = 2.0 * math.pi * self.scan_turns
+        if (
+            self.state in ['SCAN_AT_WAYPOINT', 'ALIGN_MEASURE']
+            and self.scan_accum_angle < required_angle - 1e-3
+        ):
+            # We know all balls are done, but we're in the middle of a scan.
+            # Mark that task completion is pending, but do not finalize yet.
+            if not self.pending_task_done:
+                self.get_logger().info(
+                    '[Layer 5] All balls localized during scan; '
+                    'will finalize after current 360° completes.'
+                )
+            self.pending_task_done = True
+            return
+        
         # Already finalized once – don't spam topics or keep re-stopping
         if self.task_done_time is not None and self.state == 'TASK_DONE':
             return
@@ -3307,6 +3446,9 @@ class Task3(Node):
         # Freeze the state machine and stop the robot
         self.state = 'TASK_DONE'
         self._publish_stop()
+
+        # NEW: clear pending flag
+        self.pending_task_done = False
 
     # ----------------------------------------------------------------------
     # Subscriber callbacks
