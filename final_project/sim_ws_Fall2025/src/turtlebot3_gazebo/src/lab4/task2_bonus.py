@@ -41,29 +41,31 @@ class Task2(Node):
         # -------------------------
         self.declare_parameter('namespace', '')
         self.declare_parameter('map', 'map')
-        self.declare_parameter('inflation_kernel', 6)
+        self.declare_parameter('inflation_kernel', 9)
         # How many future waypoints to check for blockage
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 6)
+        self.declare_parameter('dynamic_inflation_kernel', 5)
 
         # RRT* parameters (slightly more generous defaults)
-        self.declare_parameter('rrt_max_iterations', 1200)
-        self.declare_parameter('rrt_step_size', 0.25)         # meters
+        self.declare_parameter('rrt_max_iterations', 1600)
+        self.declare_parameter('rrt_step_size', 0.20)         # meters
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
-        self.declare_parameter('rrt_neighbor_radius', 0.9)    # meters
+        self.declare_parameter('rrt_neighbor_radius', 0.5)    # meters
         self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
+        # How many consecutive RRT* failures before we stop trying to be clever
+        self.declare_parameter('rrt_fail_limit', 3)
 
         # Path-following controller parameters
-        self.declare_parameter('max_linear_vel', 0.40)        # m/s
-        self.declare_parameter('max_angular_vel', 1.0)       # rad/s
-        self.declare_parameter('lookahead_distance', 0.50)    # m
+        self.declare_parameter('max_linear_vel', 0.30)        # m/s
+        self.declare_parameter('max_angular_vel', 0.9)       # rad/s
+        self.declare_parameter('lookahead_distance', 0.35)    # m
         self.declare_parameter('waypoint_tolerance', 0.05)    # m
         self.declare_parameter('goal_tolerance', 0.15)        # m
-        self.declare_parameter('angular_gain', 1.8)           # P-gain on heading error
+        self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
 
         # Obstacle avoidance (reactive) parameters
-        self.declare_parameter('obstacle_avoid_distance', 0.35)      # m, too-close threshold
+        self.declare_parameter('obstacle_avoid_distance', 0.45)      # m, too-close threshold
         self.declare_parameter('obstacle_avoid_back_time', 1.0)      # s
         self.declare_parameter('obstacle_avoid_turn_time', 1.0)      # s
         self.declare_parameter('obstacle_avoid_forward_time', 1.0)   # s
@@ -104,6 +106,9 @@ class Task2(Node):
         )
         self.rrt_clearance_cells = (
             self.get_parameter('rrt_clearance_cells').get_parameter_value().integer_value
+        )
+        self.rrt_fail_limit = (
+            self.get_parameter('rrt_fail_limit').get_parameter_value().integer_value
         )
 
         self.max_linear_vel = (
@@ -185,6 +190,8 @@ class Task2(Node):
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
         self.rrt_fail_count = 0  # count consecutive local failures
+        self.rrt_start_idx = None     # grid cell of the RRT* start (for special-case free)
+        self.rrt_start_xy = None      # world coords of RRT* start (debug/consistency)
 
         # Timing
         self.navigation_start_time = None
@@ -479,13 +486,88 @@ class Task2(Node):
 
         return True
 
+    def _is_cell_free_static(self, row: int, col: int) -> bool:
+        """
+        Check if a cell is free using ONLY the inflated static map
+        (ignores dynamic_occupancy). Used as a relaxed constraint for
+        global A* so temporary dynamic obstacles don't make goals unreachable.
+        """
+        if (
+            row < 0 or row >= self.map_height or
+            col < 0 or col >= self.map_width
+        ):
+            return False
+
+        if self.inflated_occupancy[row, col] != 0:
+            return False
+
+        return True
+
     def is_cell_free_rrt(self, row: int, col: int) -> bool:
+        """
+        RRT*-specific free check.
+
+        Special case: allow the RRT* start cell even if inflated/dynamic
+        occupancy says it's blocked. This lets the tree grow out of a
+        "stuck" start cell (e.g., too close to inflated obstacles).
+        """
+        # If we know the RRT* start cell, treat it as free
+        if self.rrt_start_idx is not None:
+            sr, sc = self.rrt_start_idx
+            if row == sr and col == sc:
+                return True
+
+        # Normal clearance everywhere else
         k = max(0, int(self.rrt_clearance_cells))
         for r in range(row - k, row + k + 1):
             for c in range(col - k, col + k + 1):
                 if not self.is_cell_free(r, c):
                     return False
         return True
+
+    def _find_nearest_free_goal_cell_rrt(self, g_row: int, g_col: int, max_radius: int = 5):
+        """
+        RRT*-specific version of goal snapping:
+        look for the nearest cell that is free according to is_cell_free_rrt()
+        (including clearance).
+        """
+        best = None
+        best_dist = None
+
+        for dr in range(-max_radius, max_radius + 1):
+            for dc in range(-max_radius, max_radius + 1):
+                r = g_row + dr
+                c = g_col + dc
+                if not self.is_cell_free_rrt(r, c):
+                    continue
+                d = math.hypot(dr, dc)
+                if best is None or d < best_dist:
+                    best = (r, c)
+                    best_dist = d
+
+        return best
+
+    def _find_nearest_free_goal_cell(self, g_row: int, g_col: int, max_radius: int = 5):
+        """
+        A*-level goal snapping:
+        look for the nearest cell free according to is_cell_free()
+        (inflated + dynamic).
+        """
+        best = None
+        best_dist = None
+
+        for dr in range(-max_radius, max_radius + 1):
+            for dc in range(-max_radius, max_radius + 1):
+                r = g_row + dr
+                c = g_col + dc
+                if not self.is_cell_free(r, c):
+                    continue
+                d = math.hypot(dr, dc)
+                if best is None or d < best_dist:
+                    best = (r, c)
+                    best_dist = d
+
+        return best
 
     def astar_plan(self, start_world, goal_world):
         if not self.map_loaded:
@@ -502,17 +584,32 @@ class Task2(Node):
         s_row, s_col = start_idx
         g_row, g_col = goal_idx
 
-        # Allow planning even if the start cell is in inflated/dynamic collision.
-        # This can happen in narrow corridors or close to obstacles.
+        # Stage 0: allow planning even if the start cell is in collision
         if not self.is_cell_free(s_row, s_col):
             self.get_logger().warn(
-                'Start cell is occupied (static or dynamic); '
+                'A*: start cell is occupied (static or dynamic); '
                 'continuing A* planning anyway.'
             )
 
+        # Stage 1: ensure goal cell is free, or snap to nearest free cell
         if not self.is_cell_free(g_row, g_col):
-            self.get_logger().warn('Goal cell is occupied (static or dynamic).')
-            return None
+            self.get_logger().warn(
+                'A*: goal cell is not free in inflated/dynamic map. '
+                'Searching nearby free cell for goal...'
+            )
+            snapped = self._find_nearest_free_goal_cell(g_row, g_col, max_radius=5)
+            if snapped is None:
+                self.get_logger().warn(
+                    'A*: no nearby free cell found for goal within radius 5. '
+                    'Treating this goal as unreachable.'
+                )
+                return None
+            g_row, g_col = snapped
+            gx, gy = self.grid_to_world(g_row, g_col)
+            self.get_logger().info(
+                f'A*: snapped goal to nearest free cell at '
+                f'grid=({g_row},{g_col}), world=({gx:.2f},{gy:.2f}).'
+            )
 
         neighbors = [
             (-1,  0, 1.0),
@@ -525,60 +622,75 @@ class Task2(Node):
             ( 1,  1, math.sqrt(2)),
         ]
 
-        def heuristic(r, c):
-            return math.hypot(r - g_row, c - g_col)
+        def run_astar(cell_free_fn):
+            def heuristic(r, c):
+                return math.hypot(r - g_row, c - g_col)
 
-        open_set = []
-        heapq.heappush(open_set, (0.0, (s_row, s_col)))
+            open_set = []
+            heapq.heappush(open_set, (0.0, (s_row, s_col)))
 
-        came_from = {}
-        g_score = {(s_row, s_col): 0.0}
-        closed_set = set()
+            came_from = {}
+            g_score = {(s_row, s_col): 0.0}
+            closed_set = set()
 
-        iterations = 0
-        max_iterations = self.map_width * self.map_height
+            iterations = 0
+            max_iterations = self.map_width * self.map_height
 
-        while open_set and iterations < max_iterations:
-            iterations += 1
-            current_f, (cur_row, cur_col) = heapq.heappop(open_set)
+            while open_set and iterations < max_iterations:
+                iterations += 1
+                current_f, (cur_row, cur_col) = heapq.heappop(open_set)
 
-            if (cur_row, cur_col) in closed_set:
-                continue
-
-            if (cur_row, cur_col) == (g_row, g_col):
-                return self._reconstruct_path(came_from, (cur_row, cur_col))
-
-            closed_set.add((cur_row, cur_col))
-
-            for dr, dc, move_cost in neighbors:
-                nr = cur_row + dr
-                nc = cur_col + dc
-
-                if not self.is_cell_free(nr, nc):
+                if (cur_row, cur_col) in closed_set:
                     continue
 
-                neighbor = (nr, nc)
-                tentative_g = g_score[(cur_row, cur_col)] + move_cost
+                if (cur_row, cur_col) == (g_row, g_col):
+                    # Return grid-cell path; we'll convert to world coords afterwards
+                    return self._reconstruct_path(came_from, (cur_row, cur_col))
 
-                if neighbor in g_score and tentative_g >= g_score[neighbor]:
-                    continue
+                closed_set.add((cur_row, cur_col))
 
-                g_score[neighbor] = tentative_g
-                f_score = tentative_g + heuristic(nr, nc)
-                came_from[neighbor] = (cur_row, cur_col)
-                heapq.heappush(open_set, (f_score, neighbor))
+                for dr, dc, move_cost in neighbors:
+                    nr = cur_row + dr
+                    nc = cur_col + dc
 
-        self.get_logger().warn('A*: failed to find a path within iteration limit.')
-        return None
+                    if not cell_free_fn(nr, nc):
+                        continue
 
-    def _reconstruct_path(self, came_from, current_cell):
-        path_cells = [current_cell]
-        while current_cell in came_from:
-            current_cell = came_from[current_cell]
-            path_cells.append(current_cell)
+                    neighbor = (nr, nc)
+                    tentative_g = g_score[(cur_row, cur_col)] + move_cost
 
-        path_cells.reverse()
+                    if neighbor in g_score and tentative_g >= g_score[neighbor]:
+                        continue
 
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + heuristic(nr, nc)
+                    came_from[neighbor] = (cur_row, cur_col)
+                    heapq.heappush(open_set, (f_score, neighbor))
+
+            return None
+
+        # Stage 2: A* with full constraints (inflated + dynamic)
+        path_cells = run_astar(self.is_cell_free)
+        if path_cells is None:
+            self.get_logger().warn(
+                'A* with dynamic obstacles failed or no path found. '
+                'Retrying with STATIC map only (ignoring dynamic layer)...'
+            )
+            # Stage 3: A* with static-only constraints (inflated_occupancy only)
+            path_cells = run_astar(self._is_cell_free_static)
+            if path_cells is None:
+                self.get_logger().warn(
+                    'A*: failed to find a path within iteration limit, '
+                    'even with static-only map.'
+                )
+                return None
+            else:
+                self.get_logger().warn(
+                    'A* succeeded with STATIC-only map. '
+                    'FOLLOW_PATH / RRT* will handle dynamic obstacles locally.'
+                )
+
+        # Convert grid path to world coordinates
         path_world = []
         for (r, c) in path_cells:
             world_xy = self.grid_to_world(r, c)
@@ -587,6 +699,22 @@ class Task2(Node):
 
         self.get_logger().info(f'A*: path length (cells) = {len(path_world)}')
         return path_world
+
+    def _reconstruct_path(self, came_from, current_cell):
+        """
+        Reconstruct the path in GRID CELL coordinates only.
+
+        astar_plan() is responsible for converting these (row, col)
+        cells into world (x, y) points.
+        """
+        path_cells = [current_cell]
+        while current_cell in came_from:
+            current_cell = came_from[current_cell]
+            path_cells.append(current_cell)
+
+        path_cells.reverse()
+        self.get_logger().info(f'A*: path length (cells) = {len(path_cells)}')
+        return path_cells
 
     def build_path_msg(self, path_points):
         msg = Path()
@@ -631,44 +759,6 @@ class Task2(Node):
         row, col = idx
         return not self.is_cell_free(row, col)
 
-    '''def _check_path_blocked_ahead(self):
-        if not self.active_path_points or self.current_pose is None:
-            return False, None, None
-
-        rx = self.current_pose.pose.pose.position.x
-        ry = self.current_pose.pose.pose.position.y
-
-        nearest_idx, _ = self._nearest_path_index(rx, ry, self.active_path_points)
-        if nearest_idx is None:
-            return False, None, None
-
-        max_idx = min(
-            nearest_idx + self.block_check_lookahead_points,
-            len(self.active_path_points) - 1
-        )
-
-        blocked = False
-        first_blocked_idx = None
-
-        for i in range(nearest_idx, max_idx + 1):
-            x, y = self.active_path_points[i]
-            if self._is_waypoint_blocked(x, y):
-                blocked = True
-                first_blocked_idx = i
-                break
-
-        if not blocked:
-            return False, nearest_idx, max_idx
-
-        reconnect_idx = min(first_blocked_idx + 5, len(self.active_path_points) - 1)
-
-        self.get_logger().info(
-            f'Path blocked detected: nearest_idx={nearest_idx}, '
-            f'first_blocked_idx={first_blocked_idx}, reconnect_idx={reconnect_idx}'
-        )
-
-        return True, nearest_idx, reconnect_idx'''
-    
     def _check_path_blocked_ahead(self):
         """
         Check if the active path is blocked within a lookahead window.
@@ -734,6 +824,24 @@ class Task2(Node):
             f'first_blocked_idx={first_blocked_idx}, last_blocked_idx={last_blocked_idx}, '
             f'reconnect_idx={reconnect_idx}'
         )
+
+        # Find a reconnect index: first FREE waypoint after the blocked run
+        reconnect_idx = last_blocked_idx + 1
+
+        while reconnect_idx < len(self.active_path_points):
+            x, y = self.active_path_points[reconnect_idx]
+            idx = self.world_to_grid(x, y)
+            if idx is None:
+                # Off-map, don't even try RRT on this tail
+                self.get_logger().warn(
+                    'Path blocked: reconnect waypoint lies outside map. '
+                    'Skipping local replanning for this blockage.'
+                )
+                return False, nearest_idx, max_idx
+
+            if not self._is_waypoint_blocked(x, y):
+                break
+            reconnect_idx += 1
 
         return True, nearest_idx, reconnect_idx
 
@@ -980,6 +1088,51 @@ class Task2(Node):
         gx, gy = goal_xy
         cx, cy = center_xy
 
+        # Remember the RRT* start cell so is_cell_free_rrt can treat it as free
+        self.rrt_start_xy = (sx, sy)
+        self.rrt_start_idx = self.world_to_grid(sx, sy)
+
+        # Optional debug: check map validity of start/goal for RRT*
+        start_idx_dbg = self.world_to_grid(sx, sy)
+        goal_idx_dbg = self.world_to_grid(gx, gy)
+        if start_idx_dbg is not None:
+            sr, sc = start_idx_dbg
+            self.get_logger().info(
+                f'RRT*: start cell=({sr},{sc}), free={self.is_cell_free_rrt(sr, sc)}'
+            )
+        else:
+            self.get_logger().warn('RRT*: start outside map.')
+
+        if goal_idx_dbg is not None:
+            gr, gc = goal_idx_dbg
+            self.get_logger().info(
+                f'RRT*: goal cell=({gr},{gc}), free={self.is_cell_free_rrt(gr, gc)}'
+            )
+        else:
+            self.get_logger().warn('RRT*: goal outside map.')
+
+        # Snap RRT goal to nearest RRT-free cell if needed
+        if goal_idx_dbg is not None:
+            g_row, g_col = goal_idx_dbg
+            if not self.is_cell_free_rrt(g_row, g_col):
+                self.get_logger().warn(
+                    'RRT*: goal cell not free with clearance. '
+                    'Searching nearby RRT-free cell for local goal...'
+                )
+                snapped = self._find_nearest_free_goal_cell_rrt(g_row, g_col, max_radius=5)
+                if snapped is None:
+                    self.get_logger().warn(
+                        'RRT*: no nearby RRT-free cell found for goal. '
+                        'Local replanning will fail.'
+                    )
+                    return None
+                g_row, g_col = snapped
+                gx, gy = self.grid_to_world(g_row, g_col)
+                self.get_logger().info(
+                    f'RRT*: snapped local goal to grid=({g_row},{g_col}), '
+                    f'world=({gx:.2f},{gy:.2f}).'
+                )
+
         start_node = self._RRTNode(sx, sy, parent=None, cost=0.0)
         nodes = [start_node]
         goal_node = None
@@ -996,7 +1149,7 @@ class Task2(Node):
             if not self._segment_collision_free(nearest.x, nearest.y, new_x, new_y):
                 continue
 
-            new_node = self._RRTNode(new_x, new_y, parent=None, cost=float('inf'))
+            new_node = self._RRTNode(new_x, new_y)
 
             neighbors = self._rrt_neighbors(nodes, new_node)
             best_parent = nearest
@@ -1021,9 +1174,14 @@ class Task2(Node):
             dist_to_goal = math.hypot(new_node.x - gx, new_node.y - gy)
             if dist_to_goal <= self.rrt_step_size * 2.0:
                 if self._segment_collision_free(new_node.x, new_node.y, gx, gy):
-                    goal_node = self._RRTNode(gx, gy, parent=new_node,
-                                              cost=new_node.cost + dist_to_goal)
-                    self.get_logger().info(f'RRT*: reached goal at iteration {it}.')
+                    goal_node = self._RRTNode(
+                        gx, gy,
+                        parent=new_node,
+                        cost=new_node.cost + dist_to_goal
+                    )
+                    self.get_logger().info(
+                        f'RRT*: reached goal at iteration {it}.'
+                    )
                     break
 
         if goal_node is None:
@@ -1054,6 +1212,9 @@ class Task2(Node):
         self.goal_active = True
         self.navigation_start_time = self.get_clock().now()
         self.navigation_time_reported = False  # Step 8: reset timing flag
+        # 🔧 ADD THIS: new RViz goal ⇒ give RRT* a fresh start
+        self.rrt_fail_count = 0
+        
         self.state = 'PLAN_GLOBAL'
         self.get_logger().info(
             f'New goal received at '
@@ -1103,11 +1264,22 @@ class Task2(Node):
                 self.state = 'AVOID_OBSTACLE'
                 return
 
-            # 1) Check if the path ahead is actually blocked in the map
             blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
             if blocked:
                 self.local_replan_start_index = start_idx
                 self.local_replan_goal_index = goal_idx
+
+                # If we've already failed RRT* too many times, stop trying
+                if self.rrt_fail_count >= self.rrt_fail_limit:
+                    self.get_logger().warn(
+                        f'FOLLOW_PATH: path blocked but rrt_fail_count={self.rrt_fail_count} '
+                        f'>= limit={self.rrt_fail_limit}. '
+                        'Falling back to AVOID_OBSTACLE instead of more RRT*.'
+                    )
+                    self._start_avoidance()
+                    self.state = 'AVOID_OBSTACLE'
+                    return
+
                 self.get_logger().info(
                     f'FOLLOW_PATH: path blocked. Triggering local replanning '
                     f'from index {start_idx} to {goal_idx}.'
@@ -1165,6 +1337,9 @@ class Task2(Node):
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
 
+        # 🔧 ADD THIS: reset RRT failure counter on successful global plan
+        self.rrt_fail_count = 0
+
         path_msg = self.build_path_msg(path_world)
         self.global_path_pub.publish(path_msg)
 
@@ -1203,28 +1378,24 @@ class Task2(Node):
         # Debug: log whether start/goal cells are free
         start_idx_cell = self.world_to_grid(start_xy[0], start_xy[1])
         goal_idx_cell = self.world_to_grid(goal_xy[0], goal_xy[1])
-        if start_idx_cell is not None:
-            sr, sc = start_idx_cell
-            self.get_logger().info(
-                f'REPLAN_LOCAL: start cell ({sr},{sc}) free={self.is_cell_free(sr, sc)}'
-            )
-        else:
-            self.get_logger().info('REPLAN_LOCAL: start cell is outside map.')
-
         if goal_idx_cell is not None:
             gr, gc = goal_idx_cell
             self.get_logger().info(
                 f'REPLAN_LOCAL: goal cell ({gr},{gc}) free={self.is_cell_free(gr, gc)}'
             )
         else:
-            self.get_logger().info('REPLAN_LOCAL: goal cell is outside map.')
+            self.get_logger().warn(
+                'REPLAN_LOCAL: goal cell is outside map. '
+                'Skipping RRT* and falling back to global A* replanning.'
+            )
+            self.state = 'PLAN_GLOBAL'
+            return
 
         self.get_logger().info(
             f'REPLAN_LOCAL: running RRT* from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) '
             f'to ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
             f'with local_range={self.rrt_local_range:.2f}.'
         )
-
         local_path = self.plan_rrt_star(start_xy, goal_xy, center_xy)
 
         if local_path is None or len(local_path) < 2:
