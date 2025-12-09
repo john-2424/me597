@@ -117,13 +117,13 @@ class Task3(Node):
 
         # Dynamic obstacle + RRT* related
         self.declare_parameter('block_check_lookahead_points', 30)
-        self.declare_parameter('dynamic_inflation_kernel', 7)
+        self.declare_parameter('dynamic_inflation_kernel', 5)
 
         # RRT* parameters (borrowed from Task2)
         self.declare_parameter('rrt_max_iterations', 1600)
         self.declare_parameter('rrt_step_size', 0.20)         # meters
         self.declare_parameter('rrt_goal_sample_rate', 0.25)  # probability [0,1]
-        self.declare_parameter('rrt_neighbor_radius', 0.7)    # meters
+        self.declare_parameter('rrt_neighbor_radius', 0.5)    # meters
         self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
         # NEW: how many consecutive RRT* failures before we give up and unstick via AVOID_OBSTACLE
@@ -1425,6 +1425,31 @@ class Task3(Node):
                     return False
         return True
 
+    def _find_nearest_free_goal_cell_rrt(self, g_row: int, g_col: int, max_radius: int = 5):
+        """
+        RRT*-specific version of goal snapping:
+        look for the nearest cell that is free according to is_cell_free_rrt()
+        (i.e., including clearance), *not* the looser _is_cell_free().
+        """
+        best = None
+        best_dist = None
+
+        for dr in range(-max_radius, max_radius + 1):
+            for dc in range(-max_radius, max_radius + 1):
+                r = g_row + dr
+                c = g_col + dc
+
+                # Use the RRT notion of free (with clearance)
+                if not self.is_cell_free_rrt(r, c):
+                    continue
+
+                d = math.hypot(dr, dc)
+                if best is None or d < best_dist:
+                    best = (r, c)
+                    best_dist = d
+
+        return best
+
     def _find_nearest_free_goal_cell(self, g_row: int, g_col: int, max_radius: int = 5):
         """
         Search in a square neighborhood around (g_row, g_col) for the nearest cell
@@ -2413,6 +2438,17 @@ class Task3(Node):
                 )
                 return i
 
+        # --- NEW: all waypoints seem "unreachable" → clear that blacklist and try once more
+        if self.patrol_waypoints and len(self.unreachable_waypoints) == len(self.patrol_waypoints):
+            self.get_logger().warn(
+                '[Layer 3] _choose_next_waypoint_index: all patrol waypoints are in '
+                'unreachable_waypoints. Clearing unreachable set and retrying.'
+            )
+            self.unreachable_waypoints.clear()
+
+            # One more attempt with a clean slate
+            return self._choose_next_waypoint_index()
+    
         # Nothing left
         return None
 
@@ -3359,11 +3395,33 @@ class Task3(Node):
 
         if goal_idx_cell is not None:
             gr, gc = goal_idx_cell
-            self.get_logger().info(
-                f'[Layer 3] REPLAN_LOCAL: goal cell ({gr},{gc}) free={self._is_cell_free(gr, gc)}'
-            )
-        else:
-            self.get_logger().info('[Layer 3] REPLAN_LOCAL: goal cell is outside map.')
+
+            # If RRT sees the goal as not free (due to dynamic + clearance),
+            # snap it to the nearest cell that *RRT* considers free.
+            if not self.is_cell_free_rrt(gr, gc):
+                self.get_logger().warn(
+                    f'[Layer 3] REPLAN_LOCAL: RRT* goal cell ({gr},{gc}) not free. '
+                    'Searching nearby RRT-free cell...'
+                )
+                snapped = self._find_nearest_free_goal_cell_rrt(gr, gc, max_radius=5)
+                if snapped is None:
+                    # No safe local goal → bail out and mark this waypoint unreachable
+                    self.get_logger().warn(
+                        '[Layer 3] REPLAN_LOCAL: no nearby RRT-free cell for local goal. '
+                        'Marking current waypoint unreachable and switching to AVOID_OBSTACLE.'
+                    )
+                    if self.current_waypoint_idx is not None:
+                        self.unreachable_waypoints.add(self.current_waypoint_idx)
+                    self._start_avoidance()
+                    self.state = 'AVOID_OBSTACLE'
+                    return
+
+                ngr, ngc = snapped
+                goal_xy = self.grid_to_world(ngr, ngc)
+                self.get_logger().info(
+                    f'[Layer 3] REPLAN_LOCAL: snapped RRT* goal from ({gr},{gc}) '
+                    f'to nearest RRT-free ({ngr},{ngc}) at world=({goal_xy[0]:.2f},{goal_xy[1]:.2f}).'
+                )
 
         self.get_logger().info(
             f'[Layer 3] REPLAN_LOCAL: running RRT* from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) '
@@ -3633,26 +3691,28 @@ class Task3(Node):
             return
 
         if self.state == 'PATROL_DONE':
-            # First, see if we can actually finish the task
+            # Maybe we actually finished:
             self._maybe_finish_task_if_balls_found()
             if self.state == 'TASK_DONE':
-                # _maybe_finish_task_if_balls_found() already stopped the robot
                 return
 
-            # If we get here, PATROL_DONE was reached but not all balls are localized.
-            # Do NOT stay stuck forever – restart a new patrol pass over reachable
-            # waypoints to look for the remaining balls.
             balls_found = sum(self.detected_balls.values())
             self.get_logger().warn(
                 f"[Layer 3] PATROL_DONE reached with only {balls_found}/3 balls "
-                "localized. Restarting patrol over visited waypoints."
+                "localized. Restarting patrol over reachable waypoints."
             )
 
-            # Allow revisiting all reachable waypoints.
-            # Keep 'unreachable_waypoints' so we don't bang our head on truly bad ones.
-            self.visited_waypoints.clear()
+            # If *every* waypoint is currently marked unreachable, the blacklist
+            # is clearly too aggressive – clear it and start fresh.
+            if self.patrol_waypoints and len(self.unreachable_waypoints) == len(self.patrol_waypoints):
+                self.get_logger().warn(
+                    '[Layer 3] PATROL_DONE: all waypoints marked unreachable. '
+                    'Clearing unreachable_waypoints so we can attempt them again.'
+                )
+                self.unreachable_waypoints.clear()
 
-            # Jump back into the normal waypoint-selection loop
+            # Allow revisiting everything that’s not in unreachable
+            self.visited_waypoints.clear()
             self.state = 'SELECT_NEXT_WAYPOINT'
             return
 
