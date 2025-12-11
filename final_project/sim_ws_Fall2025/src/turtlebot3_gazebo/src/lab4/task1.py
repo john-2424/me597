@@ -3,6 +3,7 @@
 import math
 import heapq
 import numpy as np
+from collections import deque
 from typing import Optional, Tuple, List, Dict, Set
 
 import rclpy
@@ -104,6 +105,8 @@ class Task1(Node):
     # NEW: max radius (in cells) when snapping start/goal to nearest traversable
     NEAREST_TRAVERSABLE_RADIUS_CELLS = 18
 
+    BLOCKED_GOAL_RADIUS_CELLS = 3
+
     def __init__(self):
         super().__init__('task1_node')
 
@@ -158,6 +161,11 @@ class Task1(Node):
         self.front_range_filt: Optional[float] = None
         self.obstacle_stop_dist = 0.30  # m
 
+        self.min_front_range = None
+        self.front_range_filt = None
+        self.min_left_range = None
+        self.min_right_range = None
+
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
@@ -195,9 +203,11 @@ class Task1(Node):
         # ---------------------------
         self.state = "WAIT_FOR_MAP"  # or "EXPLORE", "DONE"
 
-        # Blocked frontier goals (cells that caused repeated failures)
-        self.blocked_goals: List[Tuple[int, int]] = []
-        self.BLOCKED_GOAL_RADIUS_CELLS = 8   # ~8 cells ≈ 0.4 m with 0.05 m resolution
+        # Blocked goal bookkeeping (permanent-fix)
+        self.blocked_goal_ttl_s = 25.0          # tune: 15–40s works well
+        self.blocked_goals_max = 800            # hard cap so it can't explode
+        self.blocked_goals = deque()            # holds tuples: (mx, my, stamp_sec)
+        self.blocked_goals_set = set()          # fast dedupe
 
         # Frontier visit counts: how many times each frontier goal has been reached
         self.frontier_visit_counts: Dict[Tuple[int, int], int] = {}
@@ -212,6 +222,15 @@ class Task1(Node):
         # NEW: dynamic path clearance (for A* traversability / smoothing)
         self.path_clearance_current = self.PATH_CLEARANCE_CELLS
         self.path_clearance_min = 0
+
+        self.escape_active = False
+        self.escape_until = 0.0
+        self.escape_dir = 1.0           # +1 left, -1 right
+        self.escape_w = 0.8             # rad/s
+        self.escape_duration_s = 0.9    # seconds per escape attempt
+        self.escape_attempts = 0
+        self.escape_attempt_limit = 5
+
         # ---------------------------
         # Misc counters
         # ---------------------------
@@ -230,7 +249,7 @@ class Task1(Node):
             OccupancyGridUpdate,
             '/map_updates',
             self.map_update_callback,
-            30
+            40
         )
         self.scan_sub = self.create_subscription(
             LaserScan,
@@ -298,6 +317,11 @@ class Task1(Node):
 
             self.map_data = list(msg.data)
             self.map_received = True
+
+            # Map geometry changed => old blocked-goal grid coords are unreliable
+            self.blocked_goals.clear()
+            self.blocked_goals_set.clear()
+            self.inflated_filtered_frontiers.clear()  # also good to reset
 
             # Invalidate the current path on any geometry change
             if self.current_path is not None:
@@ -431,40 +455,37 @@ class Task1(Node):
     # -------------------------------------------------------------------------
 
     def scan_callback(self, msg: LaserScan):
-        """
-        Store min range in front sector to detect close obstacles.
-        """
         if not msg.ranges:
             return
 
-        n = len(msg.ranges)
-        center = n // 2
-        half_window = max(1, n // 20)  # ~10% of FOV
-        start = max(0, center - half_window)
-        end = min(n, center + half_window)
+        # Helper: min range inside [a0, a1] radians
+        def sector_min(a0, a1):
+            vals = []
+            for i, r in enumerate(msg.ranges):
+                if math.isinf(r) or math.isnan(r) or r <= 0.0:
+                    continue
+                ang = msg.angle_min + i * msg.angle_increment
+                if a0 <= ang <= a1:
+                    vals.append(r)
+            return min(vals) if vals else None
 
-        vals = [
-            r for r in msg.ranges[start:end]
-            if not math.isinf(r) and not math.isnan(r) and r > 0.0
-        ]
+        # Sectors (tweak if needed)
+        front = sector_min(math.radians(-20), math.radians(20))
+        left  = sector_min(math.radians(20),  math.radians(80))
+        right = sector_min(math.radians(-80), math.radians(-20))
 
-        if not vals:
-            # No valid measurement in the front window – keep previous filtered value
-            self.min_front_range = None
+        self.min_front_range = front
+        self.min_left_range  = left
+        self.min_right_range = right
+
+        # Low-pass filter front to avoid jitter false-stops
+        if front is None:
+            self.front_range_filt = None
             return
-
-        # raw minimum
-        self.min_front_range = min(vals)
-
-        # Smooth front range to avoid jittery false-stops
         if self.front_range_filt is None:
-            # first valid reading
-            self.front_range_filt = self.min_front_range
+            self.front_range_filt = front
         else:
-            # low-pass filter: new = 80% old + 20% new
-            self.front_range_filt = (
-                0.8 * self.front_range_filt + 0.2 * self.min_front_range
-            )
+            self.front_range_filt = 0.8 * self.front_range_filt + 0.2 * front
 
     # -------------------------------------------------------------------------
     # TF-based robot pose update (Stage 2)
@@ -831,20 +852,34 @@ class Task1(Node):
     # Frontier detection & clustering (Stage 4)
     # -------------------------------------------------------------------------
 
-    def is_blocked_goal_cell(self, mx: int, my: int) -> bool:
-        """
-        Return True if (mx, my) is inside the 'blocked' region around
-        any previously failed frontier goal.
-        """
-        if not self.blocked_goals:
-            return False
+    def _now_sec(self) -> float:
+        return float(self.get_clock().now().nanoseconds) * 1e-9
 
-        for bx, by in self.blocked_goals:
-            dx = mx - bx
-            dy = my - by
-            if dx * dx + dy * dy <= self.BLOCKED_GOAL_RADIUS_CELLS ** 2:
-                return True
-        return False
+    def _prune_blocked_goals(self):
+        if not self.blocked_goals:
+            return
+        now = self._now_sec()
+        # pop from left while expired
+        while self.blocked_goals and (now - self.blocked_goals[0][2] > self.blocked_goal_ttl_s):
+            mx, my, _ = self.blocked_goals.popleft()
+            self.blocked_goals_set.discard((mx, my))
+
+    def add_blocked_goal(self, mx: int, my: int):
+        self._prune_blocked_goals()
+        key = (mx, my)
+        if key in self.blocked_goals_set:
+            return
+        self.blocked_goals.append((mx, my, self._now_sec()))
+        self.blocked_goals_set.add(key)
+
+        # enforce max size
+        while len(self.blocked_goals) > self.blocked_goals_max:
+            ox, oy, _ = self.blocked_goals.popleft()
+            self.blocked_goals_set.discard((ox, oy))
+
+    def is_blocked_goal_cell(self, mx: int, my: int) -> bool:
+        self._prune_blocked_goals()
+        return (mx, my) in self.blocked_goals_set
 
     def remember_inflated_frontier(self, cell: Tuple[int, int]):
         """
@@ -1522,30 +1557,54 @@ class Task1(Node):
         # --- UNION OBSTACLE CRITERIA ---
 
         # 1) /scan-based obstacle
-        if (
-            self.front_range_filt is not None and
-            self.front_range_filt < self.obstacle_stop_dist
-        ):
-            if self.frontier_goal is not None:
-                # block the entire cluster
-                cl = self.which_cluster_contains(self.frontier_clusters, self.frontier_goal)
-                if cl:
-                    for cell in cl:
-                        self.blocked_goals.append(cell)
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
 
-                self.get_logger().warn(
-                    f"Frontier {self.frontier_goal} too risky (front={self.front_range_filt:.2f} m). "
-                    f"Blocking its entire cluster and replanning."
-                )
+        # If we are currently escaping, keep doing it until timeout
+        if self.escape_active and now_sec < self.escape_until:
+            self.publish_cmd_vel(0.0, self.escape_dir * self.escape_w)
+            return
+        else:
+            self.escape_active = False
+
+        # --- Obstacle logic (smarter) ---
+        if self.front_range_filt is not None and self.front_range_filt < self.obstacle_stop_dist:
+            # Pick turn direction by whichever side has more clearance
+            l = self.min_left_range if self.min_left_range is not None else -1.0
+            r = self.min_right_range if self.min_right_range is not None else -1.0
+
+            if l == -1.0 and r == -1.0:
+                self.escape_dir = 1.0
             else:
+                self.escape_dir = 1.0 if l >= r else -1.0
+
+            self.escape_attempts += 1
+
+            # Try a few escape turns BEFORE giving up on this goal/path
+            if self.escape_attempts <= self.escape_attempt_limit:
+                self.escape_active = True
+                self.escape_until = now_sec + self.escape_duration_s
                 self.get_logger().warn(
-                    f"Obstacle too close (front={self.front_range_filt:.2f} m). "
-                    f"Stopping and replanning."
+                    f"Obstacle close (front={self.front_range_filt:.2f}m). "
+                    f"Escape-turn attempt {self.escape_attempts}/{self.escape_attempt_limit} "
+                    f"dir={'L' if self.escape_dir > 0 else 'R'}."
+                )
+                self.publish_cmd_vel(0.0, self.escape_dir * self.escape_w)
+                return
+
+            # If we STILL can't clear it after multiple turns, then block & replan
+            if self.frontier_goal is not None:
+                gx, gy = self.frontier_goal
+                self.add_blocked_goal(gx, gy)  # upgraded in Fix 2 below
+                self.get_logger().warn(
+                    f"Escape failed; blocking goal region around {self.frontier_goal} and replanning."
                 )
 
-            # Stop following this path now
+            self.escape_attempts = 0
             self.clear_current_path()
             return
+
+        # If we got here, no immediate obstacle → reset escape counter
+        self.escape_attempts = 0
 
         # 2) map-based obstacle along path (traversability including clearance)
         if not self.is_path_still_valid():
@@ -1977,7 +2036,7 @@ class Task1(Node):
                     original_path_clearance = self.path_clearance_current
                     found_valid_goal = False
 
-                    while self.frontier_clearance_current >= self.frontier_clearance_min and not found_valid_goal:
+                    '''while self.frontier_clearance_current >= self.frontier_clearance_min and not found_valid_goal:
                         remaining_clusters = list(clusters)
 
                         self.get_logger().info(
@@ -2066,7 +2125,86 @@ class Task1(Node):
                                 self.path_clearance_current = new_path
                             else:
                                 # Already at minimum; break out.
+                                break'''
+
+                    # Try with gradually relaxed frontier clearance in a guaranteed staircase:
+                    # (frontier = N, N-1, ..., min)
+                    # and keep path clearance in lockstep.
+                    for clearance in range(original_frontier_clearance, self.frontier_clearance_min - 1, -1):
+                        # decrease frontier clearance step-by-step
+                        self.frontier_clearance_current = clearance
+
+                        # decrease path clearance by the same number of steps (lockstep)
+                        step = original_frontier_clearance - clearance
+                        self.path_clearance_current = max(self.path_clearance_min, original_path_clearance - step)
+
+                        remaining_clusters = list(clusters)
+
+                        self.get_logger().info(
+                            f'Trying frontier selection with clearance={self.frontier_clearance_current} cells.'
+                        )
+
+                        while remaining_clusters and not found_valid_goal:
+                            raw_goal = self.choose_frontier_goal(remaining_clusters)
+                            if raw_goal is None:
                                 break
+
+                            cluster_for_goal = self.which_cluster_contains(remaining_clusters, raw_goal)
+                            if cluster_for_goal is None:
+                                cluster_for_goal = [raw_goal]
+
+                            alt_goal = self.find_alternative_goal_for_cluster(
+                                desired_goal=raw_goal,
+                                cluster=cluster_for_goal,
+                                neighborhood_radius=4,
+                            )
+
+                            if alt_goal is None:
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'No valid alternative goal near frontier {raw_goal} '
+                                    f'with clearance={self.frontier_clearance_current}; '
+                                    f'skipping this cluster (added to inflated backlog).'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            gx, gy = alt_goal
+                            path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
+                            if path is None:
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'A*: no path to adjusted frontier goal {alt_goal} '
+                                    f'for original {raw_goal} at clearance={self.frontier_clearance_current} '
+                                    f'— skipping this cluster.'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            smoothed = self.smooth_path(path)
+
+                            self.get_logger().info(
+                                f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
+                                f'start={(self.robot_mx, self.robot_my)}, end={smoothed[-1] if smoothed else None}, '
+                                f'raw_goal={raw_goal}, used_goal={(gx, gy)}, clearance={self.frontier_clearance_current}'
+                            )
+
+                            self.frontier_goal = alt_goal
+                            self.last_frontier_goal = raw_goal
+                            self.set_current_path(smoothed)
+                            found_valid_goal = True
+
+                        # If we still didn't find anything at this clearance,
+                        # try far-alt backlog goals at the same clearance.
+                        if not found_valid_goal:
+                            used_backlog = self.try_inflated_backlog_goals()
+                            if used_backlog:
+                                found_valid_goal = True
+
+                        if found_valid_goal:
+                            break
 
                     if not found_valid_goal:
                         # Could not find any goal even with clearance reduced down to min.
