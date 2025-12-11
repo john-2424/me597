@@ -87,6 +87,14 @@ class Task1(Node):
     CLUSTER_RADIUS_CELLS = 2       # how far neighbors can be and still be in same cluster
     MIN_GOAL_DIST_CELLS = 12        # minimum distance of goal from the robot (in grid cells)
 
+    # NEW: frontier path-length band (in cells along A* path)
+    FRONTIER_PATH_LEN_MIN_CELLS = 12
+    FRONTIER_PATH_LEN_MAX_CELLS = 24
+
+    # NEW: parameters for "far" alternative goals for inflated frontiers
+    FRONTIER_FAR_ALT_MIN_OFFSET_CELLS = 4     # start this many cells away from original
+    FRONTIER_FAR_ALT_MAX_OFFSET_CELLS = 15    # max search offset along rays
+
     # main inflation radius for A* / traversability
     PATH_CLEARANCE_CELLS = 6       # 6 cells * 0.05 m ≈ 0.30 m
 
@@ -191,6 +199,9 @@ class Task1(Node):
         # Frontier visit counts: how many times each frontier goal has been reached
         self.frontier_visit_counts: Dict[Tuple[int, int], int] = {}
 
+        # NEW: frontier cells whose clusters were rejected due to inflation / clearance
+        self.inflated_filtered_frontiers: List[Tuple[int, int]] = []
+
         # ---------------------------
         # Misc counters
         # ---------------------------
@@ -209,13 +220,13 @@ class Task1(Node):
             OccupancyGridUpdate,
             '/map_updates',
             self.map_update_callback,
-            50
+            20
         )
         self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
-            50
+            20
         )
 
         # ---------------------------
@@ -639,9 +650,13 @@ class Task1(Node):
         - it is free
         - there is no occupied cell within `clearance_cells` in grid space.
         """
-        if not self.is_free(mx, my):
+        v_center = self.cell_value(mx, my)
+        if v_center is None:
             return False
-
+        # Only treat >=50 as obstacle; allow free (0) and unknown (-1)
+        if v_center >= 50:
+            return False
+        
         if self.map_width is None or self.map_height is None:
             return False
 
@@ -798,6 +813,14 @@ class Task1(Node):
             if dx * dx + dy * dy <= self.BLOCKED_GOAL_RADIUS_CELLS ** 2:
                 return True
         return False
+
+    def remember_inflated_frontier(self, cell: Tuple[int, int]):
+        """
+        Record a frontier-related cell whose cluster was rejected because
+        no traversable goal could be found near it (inflation / clearance).
+        """
+        if cell not in self.inflated_filtered_frontiers:
+            self.inflated_filtered_frontiers.append(cell)
 
     def is_frontier_cell(self, mx: int, my: int) -> bool:
         """
@@ -1043,71 +1066,103 @@ class Task1(Node):
 
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         """
-        Choose the **nearest** safe frontier-related cell to the robot,
-        but bias toward frontier goals that have been visited the least.
+        Choose a frontier-related cell according to this priority:
 
-        - First minimize visit count (0 visits preferred over 1, etc.)
-        - Among those with the same visit count, pick the nearest to the robot.
+        1) Among one representative cell per cluster, prefer those whose
+           A* path length is in [FRONTIER_PATH_LEN_MIN_CELLS,
+                                FRONTIER_PATH_LEN_MAX_CELLS],
+           and pick the one with:
+              - smallest visit count, then
+              - largest path length (farthest in that band).
+        2) If none fall in that band, among all remaining representatives,
+           pick the one with:
+              - smallest visit count, then
+              - smallest path length (closest by A*).
         """
         if not clusters:
             return None
         if self.robot_mx is None or self.robot_my is None:
             return None
 
-        best_goal: Optional[Tuple[int, int]] = None
-        best_dist2: float = float('inf')
-        best_visits: Optional[int] = None
+        # Gather one representative candidate per cluster:
+        # the cell in the cluster that is closest (Euclidean) to the robot,
+        # optionally backed slightly into known-safe territory.
+        cluster_candidates: List[Tuple[int, int]] = []
 
         for cluster in clusters:
             if not cluster:
                 continue
 
+            # pick frontier cell in this cluster that is nearest to robot (Euclidean)
+            best_cell = None
+            best_d2 = float('inf')
             for (mx, my) in cluster:
-                # start from the frontier cell
-                tx, ty = mx, my
+                dx = mx - self.robot_mx
+                dy = my - self.robot_my
+                d2 = dx * dx + dy * dy
+                if best_cell is None or d2 < best_d2:
+                    best_cell = (mx, my)
+                    best_d2 = d2
 
-                # Prefer a known-safe cell slightly inside explored space
-                backed = self.backoff_to_known_safe_cell(
-                    tx, ty,
-                    max_back_cells=4,
-                    clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
-                )
-                if backed is not None:
-                    tx, ty = backed
+            if best_cell is None:
+                continue
 
-                # Must be traversable with inflation
-                if not self.is_traversable(tx, ty):
-                    continue
+            tx, ty = best_cell
 
-                dx = tx - self.robot_mx
-                dy = ty - self.robot_my
-                dist2 = dx * dx + dy * dy
+            # Prefer a known-safe cell slightly inside explored space if possible
+            backed = self.backoff_to_known_safe_cell(
+                tx, ty,
+                max_back_cells=4,
+                clearance_cells=None,
+            )
+            if backed is not None:
+                tx, ty = backed
 
-                # Skip goals that are too close to the robot
-                if dist2 < self.MIN_GOAL_DIST_CELLS ** 2:
-                    continue
+            cluster_candidates.append((tx, ty))
 
-                # How many times have we already visited this goal cell?
-                visits = self.frontier_visit_counts.get((tx, ty), 0)
+        if not cluster_candidates:
+            return None
 
-                # Selection rule:
-                #  1. Prefer smaller visit count
-                #  2. Break ties by distance
-                if best_goal is None:
-                    best_goal = (tx, ty)
-                    best_dist2 = dist2
-                    best_visits = visits
-                else:
-                    if visits < best_visits:
-                        best_goal = (tx, ty)
-                        best_dist2 = dist2
-                        best_visits = visits
-                    elif visits == best_visits and dist2 < best_dist2:
-                        best_goal = (tx, ty)
-                        best_dist2 = dist2
-                        best_visits = visits
+        band_min = self.FRONTIER_PATH_LEN_MIN_CELLS
+        band_max = self.FRONTIER_PATH_LEN_MAX_CELLS
 
-        return best_goal
+        band_candidates: List[Tuple[int, int, int]] = []   # (visits, path_len, mx, my)
+        close_candidates: List[Tuple[int, int, int]] = []  # (visits, path_len, mx, my)
+
+        for (tx, ty) in cluster_candidates:
+            # A* distance from robot to candidate
+            path = self.astar_plan((self.robot_mx, self.robot_my), (tx, ty))
+            if path is None:
+                continue
+
+            path_len = len(path)
+
+            # Enforce a hard minimum distance from the robot
+            if path_len < self.MIN_GOAL_DIST_CELLS:
+                continue
+
+            visits = self.frontier_visit_counts.get((tx, ty), 0)
+
+            if band_min <= path_len <= band_max:
+                band_candidates.append((visits, path_len, tx, ty))
+            else:
+                close_candidates.append((visits, path_len, tx, ty))
+
+        # 1) First priority: in-band, farthest path, smallest visit count
+        if band_candidates:
+            # sort by (visits asc, path_len desc)
+            band_candidates.sort(key=lambda t: (t[0], -t[1]))
+            _, _, gx, gy = band_candidates[0]
+            return (gx, gy)
+
+        # 2) Second priority: closest by A* path, smallest visit count
+        if close_candidates:
+            # sort by (visits asc, path_len asc)
+            close_candidates.sort(key=lambda t: (t[0], t[1]))
+            _, _, gx, gy = close_candidates[0]
+            return (gx, gy)
+
+        return None
 
     # -------------------------------------------------------------------------
     # Visualization helpers (Stage 4)
@@ -1657,6 +1712,106 @@ class Task1(Node):
         valid_scored.sort(key=lambda x: x[0])
         return valid_scored[0][1]
 
+    def compute_far_alternative_goal(
+        self,
+        mx: int,
+        my: int,
+        max_offset_cells: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        For a frontier cell that was rejected due to inflation / clearance,
+        search in axis and diagonal directions for a traversable cell that is
+        farther away from the original inflated area.
+
+        This is deliberately cheap: we only walk along a few rays.
+        """
+        if self.map_width is None or self.map_height is None:
+            return None
+
+        if max_offset_cells is None:
+            max_offset_cells = self.FRONTIER_FAR_ALT_MAX_OFFSET_CELLS
+
+        directions = [
+            (1, 0),  (-1, 0),
+            (0, 1),  (0, -1),
+            (1, 1),  (1, -1),
+            (-1, 1), (-1, -1),
+        ]
+
+        for step in range(self.FRONTIER_FAR_ALT_MIN_OFFSET_CELLS,
+                          max_offset_cells + 1):
+            for dx, dy in directions:
+                ax = mx + dx * step
+                ay = my + dy * step
+
+                if self.map_index(ax, ay) is None:
+                    continue
+
+                # Must be traversable (respects PATH_CLEARANCE_CELLS and unknown-as-free change)
+                if not self.is_traversable(ax, ay):
+                    continue
+
+                # Respect blocked-goal exclusion
+                if self.is_blocked_goal_cell(ax, ay):
+                    continue
+
+                # Keep some minimum distance from robot
+                if self.robot_mx is not None and self.robot_my is not None:
+                    ddx = ax - self.robot_mx
+                    ddy = ay - self.robot_my
+                    if ddx * ddx + ddy * ddy < self.MIN_GOAL_DIST_CELLS ** 2:
+                        continue
+
+                return (ax, ay)
+
+        return None
+
+    def try_inflated_backlog_goals(self) -> bool:
+        """
+        Third-tier: try to use 'far' alternative goals for frontiers whose
+        clusters were rejected due to inflation / clearance.
+        Returns True if we successfully set a new path.
+        """
+        if self.robot_mx is None or self.robot_my is None:
+            return False
+        if not self.inflated_filtered_frontiers:
+            return False
+
+        # Work on a copy so we can safely pop while iterating
+        for idx, (fx, fy) in enumerate(list(self.inflated_filtered_frontiers)):
+            alt = self.compute_far_alternative_goal(fx, fy)
+            if alt is None:
+                continue
+
+            gx, gy = alt
+            path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
+            if path is None:
+                continue
+
+            smoothed = self.smooth_path(path)
+
+            self.get_logger().info(
+                f'A* to far-alt frontier: raw_len={len(path)}, '
+                f'start={smoothed[0]}, end={smoothed[-1]}, '
+                f'raw_frontier={(fx, fy)}, alt_goal={alt}'
+            )
+
+            # Use the alternate as the actual goal; remember original
+            self.frontier_goal = alt
+            self.last_frontier_goal = (fx, fy)
+            self.set_current_path(smoothed)
+
+            # Remove this frontier from backlog now that we used it
+            try:
+                self.inflated_filtered_frontiers.pop(idx)
+            except IndexError:
+                pass
+
+            return True
+
+        # Could not find any usable far-alt goal
+        return False
+
     def timer_cb(self):
         """
         Behavior loop:
@@ -1756,7 +1911,6 @@ class Task1(Node):
                         if cluster_for_goal is None:
                             cluster_for_goal = [raw_goal]
 
-                        # --- NEW: project goal to nearest valid cell in that area ---
                         alt_goal = self.find_alternative_goal_for_cluster(
                             desired_goal=raw_goal,
                             cluster=cluster_for_goal,
@@ -1765,9 +1919,12 @@ class Task1(Node):
 
                         if alt_goal is None:
                             # This cluster really has no valid traversable cell near the desired goal
+                            # Record this "inflated filtered" frontier for third-tier handling.
+                            self.remember_inflated_frontier(raw_goal)
+
                             self.get_logger().warn(
                                 f'No valid alternative goal near frontier {raw_goal}; '
-                                f'skipping this cluster.'
+                                f'skipping this cluster (added to inflated backlog).'
                             )
                             if cluster_for_goal in remaining_clusters:
                                 remaining_clusters.remove(cluster_for_goal)
@@ -1775,11 +1932,11 @@ class Task1(Node):
 
                         gx, gy = alt_goal
 
-                        # Try A* to the adjusted goal
                         path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
                         if path is None:
                             # We tried a projected goal and still cannot reach it;
                             # treat this whole cluster as unreachable for now.
+                            self.remember_inflated_frontier(raw_goal)
                             self.get_logger().warn(
                                 f'A*: no path to adjusted frontier goal {alt_goal} '
                                 f'for original {raw_goal} — skipping this cluster.'
@@ -1803,10 +1960,14 @@ class Task1(Node):
                         found_valid_goal = True
 
                     if not found_valid_goal:
-                        # No goal in any cluster could satisfy all constraints *even after* projection.
-                        self.frontier_goal = None
-                        self.clear_current_path()
-                        self.get_logger().warn('No valid (even adjusted) frontier goal in ANY cluster.')
+                        # Second-chance: try third-tier "far" alternate goals for
+                        # previously inflation-filtered frontier cells.
+                        used_backlog = self.try_inflated_backlog_goals()
+
+                        if not used_backlog:
+                            # No goal in any cluster and no usable backlog goals.
+                            self.frontier_goal = None
+                            self.clear_current_path()
 
             # 4) Visualization
             self.publish_frontier_markers()
