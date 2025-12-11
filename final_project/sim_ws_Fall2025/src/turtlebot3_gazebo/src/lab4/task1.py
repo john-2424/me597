@@ -208,6 +208,10 @@ class Task1(Node):
         # NEW: dynamic frontier clearance (we can shrink this in narrow passages)
         self.frontier_clearance_current = self.FRONTIER_CLEARANCE_CELLS
         self.frontier_clearance_min = 0
+
+        # NEW: dynamic path clearance (for A* traversability / smoothing)
+        self.path_clearance_current = self.PATH_CLEARANCE_CELLS
+        self.path_clearance_min = 0
         # ---------------------------
         # Misc counters
         # ---------------------------
@@ -417,10 +421,10 @@ class Task1(Node):
     def is_traversable(self, mx: int, my: int) -> bool:
         """
         Traversable for the global planner:
-        - must be free
+        - must be free/unknown
         - must have some clearance to occupied cells
         """
-        return self.is_safe_for_path(mx, my, clearance_cells=self.PATH_CLEARANCE_CELLS)
+        return self.is_safe_for_path(mx, my, clearance_cells=self.path_clearance_current)
 
     # -------------------------------------------------------------------------
     # Scan callback (Stage 5)
@@ -575,8 +579,8 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            # require inflated safety, not just "not occupied"
-            if not self.is_safe_for_path(mx, my, self.PATH_CLEARANCE_CELLS):
+            # require inflated safety using the *current* path clearance
+            if not self.is_safe_for_path(mx, my, self.path_clearance_current):
                 return False
 
         return True
@@ -1168,7 +1172,7 @@ class Task1(Node):
                 tx,
                 ty,
                 max_back_cells=4,
-                clearance_cells=self.FRONTIER_CLEARANCE_CELLS,
+                clearance_cells=self.frontier_clearance_current,
             )
             if backed is not None:
                 tx, ty = backed
@@ -1615,8 +1619,9 @@ class Task1(Node):
                     throttle_duration_sec=2.0
                 )
 
-            # Reset frontier clearance back to the original safe value
+            # Reset both clearances back to their original safe values
             self.frontier_clearance_current = self.FRONTIER_CLEARANCE_CELLS
+            self.path_clearance_current = self.PATH_CLEARANCE_CELLS
 
             self.clear_current_path()
             return
@@ -1968,7 +1973,8 @@ class Task1(Node):
                 if self.current_path is None:
                     # Try with gradually relaxed frontier clearance:
                     # start from current value down to 0.
-                    original_clearance = self.frontier_clearance_current
+                    original_frontier_clearance = self.frontier_clearance_current
+                    original_path_clearance = self.path_clearance_current
                     found_valid_goal = False
 
                     while self.frontier_clearance_current >= self.frontier_clearance_min and not found_valid_goal:
@@ -2042,13 +2048,22 @@ class Task1(Node):
                                 found_valid_goal = True
                                 break
 
-                            # No goal even with backlog; relax clearance by 1 and try all clusters again.
-                            if self.frontier_clearance_current > self.frontier_clearance_min:
+                            if (self.frontier_clearance_current > self.frontier_clearance_min or
+                                self.path_clearance_current > self.path_clearance_min):
+
+                                new_frontier = max(self.frontier_clearance_min,
+                                                    self.frontier_clearance_current - 1)
+                                new_path = max(self.path_clearance_min,
+                                                self.path_clearance_current - 1)
+
                                 self.get_logger().warn(
-                                    f'No valid frontier goals for clearance={self.frontier_clearance_current}. '
-                                    f'Reducing clearance to {self.frontier_clearance_current - 1} and retrying.'
+                                    f'No valid frontier goals for clearance='
+                                    f'(frontier={self.frontier_clearance_current}, path={self.path_clearance_current}). '
+                                    f'Reducing to (frontier={new_frontier}, path={new_path}) and retrying.'
                                 )
-                                self.frontier_clearance_current -= 1
+
+                                self.frontier_clearance_current = new_frontier
+                                self.path_clearance_current = new_path
                             else:
                                 # Already at minimum; break out.
                                 break
@@ -2061,8 +2076,8 @@ class Task1(Node):
                         )
                         self.frontier_goal = None
                         self.clear_current_path()
-                        # Restore clearance to original setting for next cycle.
-                        self.frontier_clearance_current = original_clearance
+                        self.frontier_clearance_current = original_frontier_clearance
+                        self.path_clearance_current = original_path_clearance
 
             # 4) Visualization
             self.publish_frontier_markers()
