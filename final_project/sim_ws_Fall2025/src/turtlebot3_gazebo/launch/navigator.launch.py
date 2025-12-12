@@ -13,7 +13,7 @@ from launch.conditions import IfCondition, UnlessCondition
 def generate_launch_description():
     # Set the directory paths
     package_dir = get_package_share_directory('turtlebot3_gazebo')
-    map_file_path = os.path.join(package_dir, 'maps', 'sync_classroom_map.yaml')
+    map_file_path = os.path.join(package_dir, 'maps', 'map.yaml')
 
     # Declare launch arguments
     return LaunchDescription([
@@ -116,7 +116,7 @@ def generate_launch_description():
         # Task2 Algorithm Node
         Node(
             package='turtlebot3_gazebo',
-            executable='task2',
+            executable='task2.py',
             name='task2_algorithm',
             output='screen',
             parameters=[{
@@ -135,7 +135,7 @@ def generate_launch_description():
 
         Node(
             package='turtlebot3_gazebo',
-            executable='task2_bonus',
+            executable='task2_bonus.py',
             name='task2bonus_algorithm',
             output='screen',
             parameters=[{
@@ -156,7 +156,7 @@ def generate_launch_description():
         # Task3 Algorithm Node (for dynamic obstacles)
         Node(
             package='turtlebot3_gazebo',
-            executable='task3',
+            executable='task3.py',
             name='task3_algorithm',
             output='screen',
             parameters=[{

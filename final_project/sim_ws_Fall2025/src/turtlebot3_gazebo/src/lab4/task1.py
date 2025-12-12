@@ -2,6 +2,8 @@
 
 import math
 import heapq
+import numpy as np
+from collections import deque
 from typing import Optional, Tuple, List, Dict, Set
 
 import rclpy
@@ -80,39 +82,30 @@ def wrap_angle(angle: float) -> float:
 class Task1(Node):
     """
     Task 1 – Autonomous Mapping
-
-    Stage 1:
-        - Maintain an up-to-date occupancy grid using /map and /map_updates.
-
-    Stage 2:
-        - Use TF (map -> base_footprint) to track robot pose in the map frame,
-          and convert that to grid indices on the occupancy grid.
-
-    Stage 3:
-        - Implement a grid-based A* planner that can compute a path between
-          two cells on the occupancy grid.
-
-    Stage 4:
-        - Detect frontier cells (free adjacent to unknown), cluster them,
-          select a frontier goal (closest cluster + closest point in it),
-          and visualize clusters, chosen goal, and A* path in RViz.
-
-    Stage 5:
-        - Follow the current A* path using PID control for speed and heading,
-          publish /cmd_vel, and perform simple obstacle avoidance using /scan.
-
-    Stage 6:
-        - Add a simple exploration state machine:
-            WAIT_FOR_MAP -> EXPLORE -> DONE
-          Stop exploring only when there are no more frontiers.
     """
 
-    # clustering parameters
-    CLUSTER_RADIUS_CELLS = 1      # how far neighbors can be and still be in same cluster
-    MIN_CLUSTER_SIZE = 3          # ignore tiny clusters as noise
-    MIN_GOAL_DIST_CELLS = 4       # minumum distance of frontier from the robot
-    NEAR_FRONTIER_MAX_DIST_CELLS = 40  # Prefer exploring "local" frontiers before going far away. With 0.05 m resolution, 40 cells ≈ 2.0 m
-    SMOOTHING_CLEARANCE_CELLS = 4  # extra safety margin for path smoothing (in grid cells)
+    # clustering / planning parameters
+    CLUSTER_RADIUS_CELLS = 2       # how far neighbors can be and still be in same cluster
+    MIN_GOAL_DIST_CELLS = 12        # minimum distance of goal from the robot (in grid cells)
+
+    # NEW: frontier path-length band (in cells along A* path)
+    FRONTIER_PATH_LEN_MIN_CELLS = 12
+    FRONTIER_PATH_LEN_MAX_CELLS = 24
+
+    # NEW: parameters for "far" alternative goals for inflated frontiers
+    FRONTIER_FAR_ALT_MIN_OFFSET_CELLS = 4     # start this many cells away from original
+    FRONTIER_FAR_ALT_MAX_OFFSET_CELLS = 15    # max search offset along rays
+
+    # main inflation radius for A* / traversability
+    PATH_CLEARANCE_CELLS = 6       # 6 cells * 0.05 m ≈ 0.30 m
+
+    # extra safety for frontier / goal cells (pulled slightly further from walls)
+    FRONTIER_CLEARANCE_CELLS = 6
+
+    # NEW: max radius (in cells) when snapping start/goal to nearest traversable
+    NEAREST_TRAVERSABLE_RADIUS_CELLS = 18
+
+    BLOCKED_GOAL_RADIUS_CELLS = 3
 
     def __init__(self):
         super().__init__('task1_node')
@@ -156,6 +149,7 @@ class Task1(Node):
         # ---------------------------
         self.frontier_clusters: List[List[Tuple[int, int]]] = []
         self.frontier_goal: Optional[Tuple[int, int]] = None
+        self.last_frontier_goal: Optional[Tuple[int, int]] = None  # remember last goal
         self.current_path: Optional[List[Tuple[int, int]]] = None
         self.current_path_world: Optional[List[Tuple[float, float]]] = None
         self.path_idx: Optional[int] = None
@@ -166,33 +160,46 @@ class Task1(Node):
         # ---------------------------
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
-        self.obstacle_stop_dist: float = 0.4  # m
+        self.obstacle_stop_dist = 0.35  # m
+
+        self.min_front_range = None
+        self.front_range_filt = None
+        self.min_left_range = None
+        self.min_right_range = None
 
         # ---------------------------
         # PID controllers (Stage 5)
         # ---------------------------
-        self.speed_max = 0.40
-        self.speed_min = 0.20      # slight bump, avoids crawling too slowly
-        self.heading_max = 2.0     # keep same, TB3 can handle this
+        # slightly slower but smoother body motion
+        self.speed_max = 0.60      # linear speed cap
+        self.speed_min = 0.08      # minimum creeping speed
 
-        self.yaw_tol = 0.1
-        self.slow_down_dist = 0.35  # start braking a bit earlier
+        # sharper heading control
+        self.heading_max = 1.0     # rad/s (faster turning allowed)
+        self.heading_deadband = 0.04  # rad ≈ 2.3 degrees
+
+        self.yaw_tol = 0.1         # rad
+        self.slow_down_dist = 1.10 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []
 
+        self.max_accel = 0.35        # m/s^2  (safe-ish)
+        self.max_decel = 0.55        # m/s^2  (can brake harder than accel)
+        self.prev_speed_cmd = 0.0
+
         self.pid_speed = PID(
-            kp=2.4,  # slightly less aggressive
-            ki=0.08,
-            kd=0.20,
-            i_limit=0.8,
+            kp=2.2,      # was 3.0
+            ki=0.08,     # was 0.10
+            kd=0.25,     # was 0.20 (more damping)
+            i_limit=1.0,
             out_limit=(-self.speed_max, self.speed_max)
         )
         self.pid_heading = PID(
-            kp=4.8,
-            ki=0.01,
-            kd=0.48,
-            i_limit=0.8,
+            kp=0.9,
+            ki=0.008,
+            kd=0.24,
+            i_limit=0.6,
             out_limit=(-self.heading_max, self.heading_max)
         )
 
@@ -200,6 +207,52 @@ class Task1(Node):
         # Exploration state (Stage 6)
         # ---------------------------
         self.state = "WAIT_FOR_MAP"  # or "EXPLORE", "DONE"
+
+        # Blocked goal bookkeeping (permanent-fix)
+        self.blocked_goal_ttl_s = 25.0          # tune: 15–40s works well
+        self.blocked_goals_max = 800            # hard cap so it can't explode
+        self.blocked_goals = deque()            # holds tuples: (mx, my, stamp_sec)
+        self.blocked_goals_set = set()          # fast dedupe
+
+        # Frontier visit counts: how many times each frontier goal has been reached
+        self.frontier_visit_counts: Dict[Tuple[int, int], int] = {}
+
+        # NEW: frontier cells whose clusters were rejected due to inflation / clearance
+        self.inflated_filtered_frontiers: List[Tuple[int, int]] = []
+
+        # NEW: dynamic frontier clearance (we can shrink this in narrow passages)
+        self.frontier_clearance_current = self.FRONTIER_CLEARANCE_CELLS
+        self.frontier_clearance_min = 0
+
+        # NEW: dynamic path clearance (for A* traversability / smoothing)
+        self.path_clearance_current = self.PATH_CLEARANCE_CELLS
+        self.path_clearance_min = 0
+
+        self.escape_active = False
+        self.escape_until = 0.0
+        self.escape_dir = 1.0           # +1 left, -1 right
+        self.escape_w = 0.8             # rad/s
+        self.escape_duration_s = 0.9    # seconds per escape attempt
+        self.escape_attempts = 0
+        self.escape_attempt_limit = 5
+
+        # --- NEW: pre-clear (wall un-sticking) state ---
+        self.preclear_active = False
+        self.preclear_phase = 0          # 0=BACK, 1=TURN
+        self.preclear_until = 0.0
+        self.preclear_dir = 1.0          # +1 left, -1 right
+
+        # Tunables (meters, seconds, speeds)
+        self.wall_clear_dist_side  = 0.35   # side too close -> preclear
+        self.wall_clear_dist_front = 0.30   # front too close -> preclear (can be a bit > obstacle_stop_dist)
+        self.preclear_back_v = -0.05        # reverse a little (negative!)
+        self.preclear_turn_w = 0.9          # turn speed while clearing
+        self.preclear_back_s = 0.35         # how long to back up
+        self.preclear_turn_s = 0.45         # then turn away
+
+        # Final-goal approach tuning (NEW)
+        self.goal_slow_down_dist = 0.8     # m: start braking earlier for FINAL waypoint
+        self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
 
         # ---------------------------
         # Spin-in-place exploration helper
@@ -231,7 +284,7 @@ class Task1(Node):
             OccupancyGridUpdate,
             '/map_updates',
             self.map_update_callback,
-            10
+            40
         )
         self.scan_sub = self.create_subscription(
             LaserScan,
@@ -264,7 +317,10 @@ class Task1(Node):
         # ---------------------------
         self.timer = self.create_timer(0.1, self.timer_cb)  # 10 Hz control
 
-        self.get_logger().info('Task1 node initialized (Stage 1–6).')
+        self.get_logger().info(
+            f'Task1 node initialized. PATH_CLEARANCE_CELLS={self.PATH_CLEARANCE_CELLS}, '
+            f'FRONTIER_CLEARANCE_CELLS={self.FRONTIER_CLEARANCE_CELLS}'
+        )
 
     # -------------------------------------------------------------------------
     # Map callbacks (Stage 1)
@@ -306,6 +362,19 @@ class Task1(Node):
             self.map_data = list(msg.data)
             self.map_received = True
 
+            # Map geometry changed => old blocked-goal grid coords are unreliable
+            self.blocked_goals.clear()
+            self.blocked_goals_set.clear()
+            self.inflated_filtered_frontiers.clear()  # also good to reset
+
+            # Invalidate the current path on any geometry change
+            if self.current_path is not None:
+                self.get_logger().info(
+                    'Map geometry changed (size/origin/resolution). '
+                    'Clearing current path to replan on updated grid.'
+                )
+                self.clear_current_path()
+
             self.get_logger().info(
                 f'/map received: size=({self.map_width} x {self.map_height}), '
                 f'res={self.map_resolution:.3f} m/cell, '
@@ -318,8 +387,9 @@ class Task1(Node):
                 '/map updated with same size (refresh).',
                 throttle_duration_sec=5.0
             )
-        
-        if self.map_received: self.stop_dist_tol = 0.6 * self.map_resolution
+
+        if self.map_received and self.map_resolution is not None:
+            self.stop_dist_tol = 0.6 * self.map_resolution
 
     def map_update_callback(self, msg: OccupancyGridUpdate):
         """
@@ -419,51 +489,47 @@ class Task1(Node):
     def is_traversable(self, mx: int, my: int) -> bool:
         """
         Traversable for the global planner:
-        - must be free
+        - must be free/unknown
         - must have some clearance to occupied cells
         """
-        # tune clearance_cells as needed (2–3 is typical with 5cm resolution)
-        return self.is_safe_frontier_cell(mx, my, clearance_cells=4)
+        return self.is_safe_for_path(mx, my, clearance_cells=self.path_clearance_current)
 
     # -------------------------------------------------------------------------
     # Scan callback (Stage 5)
     # -------------------------------------------------------------------------
-    
+
     def scan_callback(self, msg: LaserScan):
-        """
-        Store min range in front sector to detect close obstacles.
-        """
         if not msg.ranges:
             return
 
-        n = len(msg.ranges)
-        center = n // 2
-        half_window = max(1, n // 20)  # ~10% of FOV
-        start = max(0, center - half_window)
-        end = min(n, center + half_window)
+        # Helper: min range inside [a0, a1] radians
+        def sector_min(a0, a1):
+            vals = []
+            for i, r in enumerate(msg.ranges):
+                if math.isinf(r) or math.isnan(r) or r <= 0.0:
+                    continue
+                ang = msg.angle_min + i * msg.angle_increment
+                if a0 <= ang <= a1:
+                    vals.append(r)
+            return min(vals) if vals else None
 
-        vals = [
-            r for r in msg.ranges[start:end]
-            if not math.isinf(r) and not math.isnan(r) and r > 0.0
-        ]
+        # Sectors (tweak if needed)
+        front = sector_min(math.radians(-20), math.radians(20))
+        left  = sector_min(math.radians(20),  math.radians(80))
+        right = sector_min(math.radians(-80), math.radians(-20))
 
-        if not vals:
-            # No valid measurement in the front window – keep previous filtered value
-            self.min_front_range = None
+        self.min_front_range = front
+        self.min_left_range  = left
+        self.min_right_range = right
+
+        # Low-pass filter front to avoid jitter false-stops
+        if front is None:
+            self.front_range_filt = None
             return
-
-        # raw minimum
-        self.min_front_range = min(vals)
-
-        # Smooth front range to avoid jittery false-stops
         if self.front_range_filt is None:
-            # first valid reading
-            self.front_range_filt = self.min_front_range
+            self.front_range_filt = front
         else:
-            # low-pass filter: new = 80% old + 20% new
-            self.front_range_filt = (
-                0.8 * self.front_range_filt + 0.2 * self.min_front_range
-            )
+            self.front_range_filt = 0.8 * self.front_range_filt + 0.2 * front
 
     # -------------------------------------------------------------------------
     # TF-based robot pose update (Stage 2)
@@ -521,99 +587,6 @@ class Task1(Node):
     # -------------------------------------------------------------------------
     # A* implementation (Stage 3)
     # -------------------------------------------------------------------------
-    
-    def _extend_collinear_segment_world(self, start_idx: int, tol: float = 1e-6) -> int:
-        """
-        From start_idx, look forward in current_path_world and find the longest
-        contiguous run of points that lie on the same infinite line defined by
-        points[start_idx] and points[start_idx+1]. Returns the last index of that run.
-        """
-        if self.current_path_world is None:
-            return 0
-
-        pts = self.current_path_world
-        N = len(pts)
-
-        # Handle invalid start_idx gracefully
-        if start_idx is None:
-            return 0
-        if start_idx < 0:
-            start_idx = 0
-        if start_idx >= N - 1:
-            return start_idx  # nothing to extend
-
-        i = start_idx
-
-        x0, y0 = pts[i]
-        x1, y1 = pts[i + 1]
-        dx = x1 - x0
-        dy = y1 - y0
-
-        # If direction is (near) zero (duplicate points), just move one step.
-        if abs(dx) < tol and abs(dy) < tol:
-            return min(i + 1, N - 1)
-
-        last_good = i + 1
-        # Check collinearity of each subsequent point with the line through (x0, y0) and direction (dx, dy)
-        for j in range(i + 1, N):
-            xj, yj = pts[j]
-            rx = xj - x0
-            ry = yj - y0
-            # 2D cross product of d and (rx, ry)
-            cross = rx * dy - ry * dx
-            if abs(cross) > tol:
-                # first non-collinear point → stop, previous was last collinear
-                break
-            last_good = j
-
-        return last_good
-
-    def select_path_waypoint_index(self, lookahead_points: int = 2) -> Optional[int]:
-        """
-        Choose the next waypoint along the current_path_world.
-
-        Strategy:
-        - From the current path_idx forward, find the waypoint with
-            the smallest squared distance to the robot.
-        - Optionally lookahead a few indices to avoid getting "stuck"
-            on a single point.
-        """
-        if not self.current_path_world:
-            return None
-        if self.robot_x is None or self.robot_y is None:
-            return None
-
-        pts = self.current_path_world
-        N = len(pts)
-        if self.path_idx is None:
-            self.path_idx = 0
-
-        rx, ry = self.robot_x, self.robot_y
-
-        best_i = self.path_idx
-        best_d2 = float('inf')
-
-        self.get_logger().info(f'Robot: rx: {rx}; ry: {ry}')
-        self.get_logger().info(f'Waypoints: {N}: {pts}')
-
-        # 1) find the closest waypoint from current index forward
-        for i in range(self.path_idx, N):
-            x, y = pts[i]
-            dx = x - rx
-            dy = y - ry
-            d2 = dx * dx + dy * dy
-            if d2 < best_d2:
-                best_d2 = d2
-                best_i = i
-
-        # 2) small index lookahead (avoid aiming EXACTLY at closest point)
-        target_idx = min(best_i + lookahead_points, N - 1)
-
-        self.get_logger().info(f'Waypoints: Best i: {best_i}')
-        self.get_logger().info(f'Waypoints: Target i: {target_idx}')
-
-        self.path_idx = target_idx
-        return target_idx
 
     def bresenham_line(self, x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
         """
@@ -653,14 +626,12 @@ class Task1(Node):
 
     def has_line_of_sight(self, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
         """
-        Return True if there is a collision-free, *inflated* straight line between
-        cells a and b.
+        Return True if there is a collision-free *inflated* straight line
+        between cells a and b.
 
-        Instead of only checking for hard collisions with occupied cells, we also
-        require each cell along the line to have a safety buffer from obstacles
-        (via is_safe_frontier_cell with a larger clearance).
-
-        This prevents smoothing from pulling the path too close to walls/obstacles.
+        We require every cell along the line to be safe for path planning
+        (free + clearance to obstacles). This preserves the inflation
+        radius even after smoothing.
         """
         if not self.map_received or self.map_data is None:
             return False
@@ -673,11 +644,8 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            # Require an inflated safe cell (free + clearance from occupied)
-            if not self.is_safe_frontier_cell(
-                mx, my,
-                clearance_cells=self.SMOOTHING_CLEARANCE_CELLS
-            ):
+            # require inflated safety using the *current* path clearance
+            if not self.is_safe_for_path(mx, my, self.path_clearance_current):
                 return False
 
         return True
@@ -685,7 +653,7 @@ class Task1(Node):
     def smooth_path(self, path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """
         Simplify an A* path by removing intermediate waypoints where possible,
-        keeping the path collision-free using has_line_of_sight.
+        keeping the path collision-free AND inflated using has_line_of_sight.
 
         Returns a new, shorter list of (mx, my) cells.
         """
@@ -716,76 +684,81 @@ class Task1(Node):
         return smoothed
     
     def find_nearest_traversable(self, mx: int, my: int,
-                                 max_radius: int = 7) -> Optional[Tuple[int, int]]:
+                                 max_radius: Optional[int] = None) -> Optional[Tuple[int, int]]:
         """
-        Search in an expanding square around (mx, my) for a good start cell.
+        Search in expanding 'rings' around (mx, my) for the nearest traversable cell.
 
-        Stage 1: try to find a *strictly traversable* cell
-                 (free + inflated clearance) using is_traversable.
-        Stage 2: if none found, relax and look for any *free* cell
-                 (v == 0) as an "escape" cell.
+        Uses is_traversable (free/unknown + PATH_CLEARANCE_CELLS) and stops
+        as soon as it finds *any* traversable cell on the ring at radius r.
 
-        Returns:
-            (nx, ny) or None if nothing usable is found within max_radius.
+        Complexity: O(R^2) cells for radius R (8 * sum_{r=1..R} r),
+        which is cheap even for R ~ 20.
         """
         if self.map_width is None or self.map_height is None:
             return None
 
-        # ------------------------
-        # Stage 1: strict traversable
-        # ------------------------
-        best_cell = None
-        best_dist2 = float('inf')
+        if max_radius is None:
+            max_radius = self.NEAREST_TRAVERSABLE_RADIUS_CELLS
 
-        for r in range(0, max_radius + 1):
+        # If the center is already traversable, return it immediately
+        if self.is_traversable(mx, my):
+            return (mx, my)
+
+        # Expand outwards in Chebyshev distance r = 1..max_radius
+        for r in range(1, max_radius + 1):
+            # top and bottom edges of the square ring
             for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
+                for dy in (-r, r):
                     nx = mx + dx
                     ny = my + dy
                     if self.map_index(nx, ny) is None:
                         continue
+                    if self.is_traversable(nx, ny):
+                        return (nx, ny)
 
-                    if not self.is_traversable(nx, ny):
-                        continue
-
-                    dist2 = dx * dx + dy * dy
-                    if dist2 < best_dist2:
-                        best_dist2 = dist2
-                        best_cell = (nx, ny)
-
-            if best_cell is not None:
-                # Found a nice, strictly-traversable start
-                return best_cell
-
-        # ------------------------
-        # Stage 2: relaxed "escape" (any free cell)
-        # ------------------------
-        best_free = None
-        best_free_dist2 = float('inf')
-
-        for r in range(0, max_radius + 1):
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
+            # left and right edges (excluding corners which were checked above)
+            for dy in range(-r + 1, r):
+                for dx in (-r, r):
                     nx = mx + dx
                     ny = my + dy
                     if self.map_index(nx, ny) is None:
                         continue
+                    if self.is_traversable(nx, ny):
+                        return (nx, ny)
 
-                    # allow any free cell (even if close to obstacles)
-                    if not self.is_free(nx, ny):
-                        continue
-
-                    dist2 = dx * dx + dy * dy
-                    if dist2 < best_free_dist2:
-                        best_free_dist2 = dist2
-                        best_free = (nx, ny)
-
-            if best_free is not None:
-                # Found at least some free spot to "escape" to
-                return best_free
-
-        # Nothing usable within the search radius
+        # Nothing found within max_radius
         return None
+
+    def is_safe_for_path(self, mx: int, my: int,
+                         clearance_cells: int) -> bool:
+        """
+        A cell is safe for path planning if:
+        - it is free
+        - there is no occupied cell within `clearance_cells` in grid space.
+        """
+        v_center = self.cell_value(mx, my)
+        if v_center is None:
+            return False
+        # Only treat >=50 as obstacle; allow free (0) and unknown (-1)
+        if v_center >= 50:
+            return False
+        
+        if self.map_width is None or self.map_height is None:
+            return False
+
+        for dx in range(-clearance_cells, clearance_cells + 1):
+            for dy in range(-clearance_cells, clearance_cells + 1):
+                nx = mx + dx
+                ny = my + dy
+                if self.map_index(nx, ny) is None:
+                    continue
+                v = self.cell_value(nx, ny)
+                if v is None:
+                    continue
+                if v >= 50:     # treat as obstacle
+                    return False
+
+        return True
 
     def astar_plan(
         self,
@@ -806,8 +779,8 @@ class Task1(Node):
         sx, sy = start
         gx, gy = goal
 
-        '''if not self.is_traversable(sx, sy):
-            alt = self.find_nearest_traversable(sx, sy, max_radius=7)
+        if not self.is_traversable(sx, sy):
+            alt = self.find_nearest_traversable(sx, sy, max_radius=self.NEAREST_TRAVERSABLE_RADIUS_CELLS)
             if alt is None:
                 self.get_logger().warn(
                     f"A*: start cell {start} is not traversable and no nearby escape cell found."
@@ -818,10 +791,21 @@ class Task1(Node):
                     f"A*: start cell {start} not traversable, using nearby escape cell {alt} as start."
                 )
                 sx, sy = alt
-                start = (sx, sy)'''
+                start = (sx, sy)
+
         if not self.is_traversable(gx, gy):
-            self.get_logger().warn(f'A*: goal cell {goal} is not traversable.')
-            return None
+            alt_goal = self.find_nearest_traversable(gx, gy, max_radius=self.NEAREST_TRAVERSABLE_RADIUS_CELLS)
+            if alt_goal is None:
+                self.get_logger().warn(
+                    f'A*: goal cell {goal} is not traversable and no nearby free cell found.'
+                )
+                return None
+            else:
+                self.get_logger().info(
+                    f'A*: goal cell {goal} not traversable, using nearest free cell {alt_goal} as goal.'
+                )
+                gx, gy = alt_goal
+                goal = (gx, gy)
 
         # Neighbor motions: dx, dy, cost
         if allow_diagonal:
@@ -912,6 +896,43 @@ class Task1(Node):
     # Frontier detection & clustering (Stage 4)
     # -------------------------------------------------------------------------
 
+    def _now_sec(self) -> float:
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
+    def _prune_blocked_goals(self):
+        if not self.blocked_goals:
+            return
+        now = self._now_sec()
+        # pop from left while expired
+        while self.blocked_goals and (now - self.blocked_goals[0][2] > self.blocked_goal_ttl_s):
+            mx, my, _ = self.blocked_goals.popleft()
+            self.blocked_goals_set.discard((mx, my))
+
+    def add_blocked_goal(self, mx: int, my: int):
+        self._prune_blocked_goals()
+        key = (mx, my)
+        if key in self.blocked_goals_set:
+            return
+        self.blocked_goals.append((mx, my, self._now_sec()))
+        self.blocked_goals_set.add(key)
+
+        # enforce max size
+        while len(self.blocked_goals) > self.blocked_goals_max:
+            ox, oy, _ = self.blocked_goals.popleft()
+            self.blocked_goals_set.discard((ox, oy))
+
+    def is_blocked_goal_cell(self, mx: int, my: int) -> bool:
+        self._prune_blocked_goals()
+        return (mx, my) in self.blocked_goals_set
+
+    def remember_inflated_frontier(self, cell: Tuple[int, int]):
+        """
+        Record a frontier-related cell whose cluster was rejected because
+        no traversable goal could be found near it (inflation / clearance).
+        """
+        if cell not in self.inflated_filtered_frontiers:
+            self.inflated_filtered_frontiers.append(cell)
+
     def is_frontier_cell(self, mx: int, my: int) -> bool:
         """
         A frontier cell is:
@@ -933,13 +954,16 @@ class Task1(Node):
         return False
 
     def is_safe_known_cell(self, mx: int, my: int,
-                        clearance_cells: int = 5) -> bool:
+                           clearance_cells: Optional[int] = None) -> bool:
         """
         A 'safe known' cell:
         - is free
         - is NOT a frontier (so it is fully in explored space)
         - has no occupied cells within the given clearance radius.
         """
+        if clearance_cells is None:
+            clearance_cells = self.frontier_clearance_current
+
         # must be free
         if not self.is_free(mx, my):
             return False
@@ -1021,21 +1045,19 @@ class Task1(Node):
                         visited.add(neighbor)
                         queue.append(neighbor)
 
-            # ignore tiny clusters as noise
-            # if len(cluster) >= self.MIN_CLUSTER_SIZE:
             clusters.append(cluster)
 
         return clusters
-    
+
     def is_safe_frontier_cell(self, mx: int, my: int,
-                              clearance_cells: int = 4) -> bool:
+                              clearance_cells: Optional[int] = None) -> bool:
         """
         A 'safe' frontier cell is free AND has no occupied cells
         within a given radius in grid space.
-
-        This acts like a cheap inflation layer: we avoid goals that are
-        right next to walls/obstacles.
         """
+        if clearance_cells is None:
+            clearance_cells = self.frontier_clearance_current
+
         if not self.is_free(mx, my):
             return False
 
@@ -1051,18 +1073,17 @@ class Task1(Node):
                 v = self.cell_value(nx, ny)
                 if v is None:
                     continue
-                # treat anything above occ_threshold as obstacle
                 if v >= 50:
                     return False
 
         return True
-    
+
     def backoff_from_obstacle(
         self,
         mx: int,
         my: int,
-        max_back_cells: int = 3,
-        clearance_cells: int = 4,
+        max_back_cells: int = 5,
+        clearance_cells: Optional[int] = None,
     ) -> Optional[Tuple[int, int]]:
         """
         Given a (possibly unsafe) frontier cell (mx, my),
@@ -1072,6 +1093,9 @@ class Task1(Node):
 
         Returns (bx, by) or None if no suitable cell found.
         """
+        if clearance_cells is None:
+            clearance_cells = self.frontier_clearance_current
+
         if self.robot_mx is None or self.robot_my is None:
             return None
 
@@ -1102,13 +1126,13 @@ class Task1(Node):
                 return (bx, by)
 
         return None
-    
+
     def backoff_to_known_safe_cell(
         self,
         mx: int,
         my: int,
-        max_back_cells: int = 3,
-        clearance_cells: int = 4,
+        max_back_cells: int = 4,
+        clearance_cells: Optional[int] = None,
     ) -> Optional[Tuple[int, int]]:
         """
         Given a frontier cell (mx, my), step back along the line from
@@ -1117,10 +1141,10 @@ class Task1(Node):
         - free
         - not a frontier (already explored)
         - has clearance from obstacles (is_safe_known_cell).
-
-        This gives a goal slightly inside explored space but still close
-        to the original frontier cell.
         """
+        if clearance_cells is None:
+            clearance_cells = self.frontier_clearance_current
+
         if self.robot_mx is None or self.robot_my is None:
             return None
 
@@ -1152,6 +1176,21 @@ class Task1(Node):
         return None
     
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
+        """
+        Choose a frontier-related cell using a *geometric* distance band instead of
+        repeatedly running A* for scoring.
+
+        Priority:
+          1) Cells whose straight-line distance (in cells) to the robot lies in
+             [FRONTIER_PATH_LEN_MIN_CELLS, FRONTIER_PATH_LEN_MAX_CELLS], with
+             smallest visit count and then largest distance (farthest in band).
+          2) All other "safe" candidates (same filters) with smallest visit
+             count and then smallest distance.
+          3) NEW: if no safe candidate exists at all, fall back to the nearest
+             raw frontier cell (closest to the robot), even if it doesn't yet
+             pass clearance/min-distance; later stages will try to adjust or
+             reject it.
+        """
         if not clusters:
             return None
         if self.robot_mx is None or self.robot_my is None:
@@ -1166,78 +1205,123 @@ class Task1(Node):
             if self.map_index(cell[0], cell[1]) is not None
         ]
 
-        if not all_frontiers:
-            return None
+        band_min = self.FRONTIER_PATH_LEN_MIN_CELLS
+        band_max = self.FRONTIER_PATH_LEN_MAX_CELLS
 
-        # -------------------------------------------------------------
-        # Step 2 — Sort frontiers by true distance to the robot
-        # -------------------------------------------------------------
-        def dist2(cell):
-            dx = cell[0] - rx
-            dy = cell[1] - ry
-            return dx*dx + dy*dy
+        band_min2 = band_min * band_min
+        band_max2 = band_max * band_max
 
-        all_frontiers.sort(key=dist2)
+        # Each entry: (visits, dist2, mx, my)
+        band_candidates: List[Tuple[int, int, int, int]] = []
+        fb_candidates: List[Tuple[int, int, int, int]] = []
 
-        # -------------------------------------------------------------
-        # Step 3 — Try each frontier in order of closeness
-        # -------------------------------------------------------------
-        for (mx, my) in all_frontiers:
-            if self.last_goal_cell is not None and self.last_goal_cell == (mx, my):
+        # NEW: raw per-cluster fallback candidates (no clearance/min-dist filters)
+        raw_frontiers: List[Tuple[int, int, int, int]] = []
+
+        for cluster in clusters:
+            if not cluster:
                 continue
 
-            # 1) Hard skip: don’t pick the robot’s own cell
-            dist = dist2((mx, my))
-            if dist == 0:
-                # optional debug:
-                self.get_logger().debug(f'Skipping frontier at robot cell ({mx},{my})')
+            # 1) pick the frontier cell in this cluster that is nearest (Euclidean) to the robot
+            best_cell = None
+            best_d2 = float("inf")
+
+            for (mx, my) in cluster:
+                dx = mx - self.robot_mx
+                dy = my - self.robot_my
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_cell = (mx, my)
+
+            if best_cell is None:
                 continue
 
-            # If frontier cell is already safe → perfect
-            if self.is_safe_frontier_cell(mx, my, clearance_cells=4):
-                return (mx, my)
+            bx, by = best_cell
 
-            # Otherwise "push back" along ray robot → frontier
-            backed = self.backoff_from_obstacle(
-                mx, my,
-                max_back_cells=3,
-                clearance_cells=4
+            # NEW: skip clusters whose representative is in a blocked-goal region
+            if self.is_blocked_goal_cell(bx, by):
+                self.get_logger().info(
+                    f'Skipping frontier cluster whose representative ({bx}, {by}) '
+                    f'is inside a blocked-goal region.'
+                )
+                continue
+
+            # record raw representative for "desperate" fallback later
+            raw_visits = self.frontier_visit_counts.get((bx, by), 0)
+            raw_frontiers.append((raw_visits, best_d2, bx, by))
+
+            # From here on, we try to build a *safe* candidate
+
+            tx, ty = bx, by
+
+            # 2) back off slightly into known-safe territory if possible
+            backed = self.backoff_to_known_safe_cell(
+                tx,
+                ty,
+                max_back_cells=4,
+                clearance_cells=self.frontier_clearance_current,
             )
-
             if backed is not None:
-                if self.last_goal_cell is not None and self.last_goal_cell == backed:
-                    continue
-                bmx, bmy = backed
-                bdist = dist2((bmx, bmy))
-                if bdist == 0:
-                    # optional debug:
-                    self.get_logger().debug(f'Skipping frontier at robot cell ({bmx},{bmy})')
-                    continue
-                return backed
+                tx, ty = backed
 
-            # If backoff_from_obstacle fails, try known safe interior cell
-            backed2 = self.backoff_to_known_safe_cell(
-                mx, my,
-                max_back_cells=3,
-                clearance_cells=4
-            )
+            # 3) must be traversable with inflation
+            if not self.is_traversable(tx, ty):
+                continue
 
-            if backed2 is not None:
-                if self.last_goal_cell is not None and self.last_goal_cell == backed2:
-                    continue
-                b2mx, b2my = backed2
-                b2dist = dist2((b2mx, b2my))
-                if b2dist == 0:
-                    # optional debug:
-                    self.get_logger().debug(f'Skipping frontier at robot cell ({b2mx},{b2my})')
-                    continue
-                return backed2
+            dx = tx - self.robot_mx
+            dy = ty - self.robot_my
+            dist2 = dx * dx + dy * dy
 
-            # Otherwise: skip this frontier and continue to next
+            # enforce a hard minimum distance from the robot
+            if dist2 < self.MIN_GOAL_DIST_CELLS * self.MIN_GOAL_DIST_CELLS:
+                continue
 
-        # -------------------------------------------------------------
-        # Step 4 — If none work, return None
-        # -------------------------------------------------------------
+            visits = self.frontier_visit_counts.get((tx, ty), 0)
+
+            # Use d^2 instead of d to avoid sqrt; band boundaries are squared too.
+            if band_min2 <= dist2 <= band_max2:
+                band_candidates.append((visits, dist2, tx, ty))
+            else:
+                fb_candidates.append((visits, dist2, tx, ty))
+
+        # 4) pick according to priority rules
+
+        # First: candidates whose distance lies in [band_min, band_max],
+        # with smallest visit count and *largest* distance in that band.
+        if band_candidates:
+            band_candidates.sort(key=lambda t: (t[0], -t[1]))  # (visits asc, dist2 desc)
+            _, _, gx, gy = band_candidates[0]
+            return (gx, gy)
+
+        # Second: all other "safe" candidates, with smallest visit count and *smallest* distance.
+        if fb_candidates:
+            fb_candidates.sort(key=lambda t: (t[0], t[1]))  # (visits asc, dist2 asc)
+            _, _, gx, gy = fb_candidates[0]
+            return (gx, gy)
+
+        # Third (NEW): if no safe candidate exists at all, fall back to the nearest
+        # raw frontier representative (closest to robot), ignoring safety filters.
+        if raw_frontiers:
+            # NEW: ignore raw representatives inside blocked-goal regions
+            usable_raw = [
+                t for t in raw_frontiers
+                if not self.is_blocked_goal_cell(t[2], t[3])
+            ]
+
+            if usable_raw:
+                usable_raw.sort(key=lambda t: (t[0], t[1]))  # (visits asc, dist2 asc)
+                _, _, gx, gy = usable_raw[0]
+                self.get_logger().warn(
+                    f'choose_frontier_goal: no safe candidates; '
+                    f'falling back to raw frontier cell ({gx}, {gy}).'
+                )
+                return (gx, gy)
+
+        # Truly nothing usable
+        return None
+
+        # Truly nothing usable
         return None
 
     # -------------------------------------------------------------------------
@@ -1392,10 +1476,9 @@ class Task1(Node):
         Check if the upcoming part of the current path remains safe
         in the occupancy grid for *local* execution.
 
-        For exploration, we only treat *occupied* cells as hard obstacles.
-        Unknown (-1) is allowed, so the robot can still move toward frontiers.
-        If any upcoming path cell becomes occupied, the path is considered
-        invalid and we should replan.
+        We now re-check full traversability (inflated safety), not just
+        "not occupied", so if an obstacle appears near the path, the
+        path becomes invalid and we replan.
         """
         if self.current_path is None or self.path_idx is None:
             return False
@@ -1410,11 +1493,112 @@ class Task1(Node):
             if self.map_index(mx, my) is None:
                 return False
 
-            # Only hard-block on occupied cells (unknown allowed for exploration)
-            if self.is_occupied(mx, my):
+            # require traversability (free + clearance), not just non-occupied
+            if not self.is_traversable(mx, my):
                 return False
 
         return True
+
+    def _extend_collinear_segment(self, start_idx, curr_path_wrld, tol=1e-6):
+        """
+        From start_idx, look forward and find the longest contiguous run of points
+        that lie on the same infinite line defined by waypoints[start_idx] and
+        waypoints[start_idx+1]. Returns the last index of that collinear run.
+        """
+        N = len(curr_path_wrld)
+        i = start_idx
+        if i >= N-1:
+            return i  # nothing to extend
+
+        p0 = curr_path_wrld[i]
+        d = curr_path_wrld[i+1] - p0
+        # If the direction is (near) zero (duplicate points), just stop here.
+        if np.allclose(d, 0, atol=tol):
+            return i+1
+
+        # Cross-product test for collinearity with all subsequent points
+        rel = curr_path_wrld[i+1:] - p0                    # shape (N-i-1, 2)
+        cross = rel[:, 0] * d[1] - rel[:, 1] * d[0]   # scalar 2D cross
+        mask = np.isclose(cross, 0.0, atol=tol)
+
+        # We only want the longest *contiguous* True prefix
+        if mask.all():
+            prefix_len = len(mask)
+        else:
+            # index of first False in mask (prefix length of True)
+            prefix_len = np.argmax(~mask)
+
+        # Last collinear index = i + prefix_len (since mask starts at i+1)
+        return i + prefix_len
+    
+    def choose_next(self, rx, ry):
+        curr_path_wrld = np.array(self.current_path_world)
+        N = len(curr_path_wrld)
+
+        if self.path_idx is None:
+            self.path_idx = 0
+
+        # If we are already at (or beyond) the final index, just stick to it
+        if self.path_idx >= N - 1:
+            return N - 1
+
+        # Consider only strictly future indices
+        idxs = np.arange(self.path_idx + 1, N)
+
+        dx = curr_path_wrld[idxs, 0] - rx
+        dy = curr_path_wrld[idxs, 1] - ry
+        distances = np.sqrt(dx**2 + dy**2)
+
+        # Closest future index
+        rel = np.argmin(distances)
+        next_idx_o = idxs[rel]
+
+        # Extend collinear segment forward from that index
+        next_idx = self._extend_collinear_segment(next_idx_o, curr_path_wrld)
+
+        self.get_logger().info(f'[**DEBUG**] Robot: {rx}, {ry}; Curr Path World: {curr_path_wrld}; Indexes: {idxs}; Distances: {distances}; Next Index Before Extend: {next_idx_o}; Next Index After Extend: {next_idx}')
+
+        self.last_idx = next_idx
+        if self.last_idx == N - 1:
+            self.final_idx = True
+
+        return next_idx
+    
+    def advance_waypoint_if_reached(self, rx: float, ry: float, waypoint_tol: float):
+        """
+        Strictly follow the path in order:
+        - Only move to the next waypoint when the current one is within waypoint_tol.
+        - Never jump ahead to the 'closest' waypoint.
+        """
+        if self.current_path_world is None or self.path_idx is None:
+            return
+
+        N = len(self.current_path_world)
+        # Progress through waypoints in order, but don't skip any
+        while self.path_idx < N - 1:
+            wx, wy = self.current_path_world[self.path_idx]
+            dist = math.hypot(wx - rx, wy - ry)
+            if dist < waypoint_tol:
+                self.path_idx += 1
+            else:
+                break
+
+    def _range_or_inf(self, r):
+        return float('inf') if (r is None or math.isinf(r) or math.isnan(r) or r <= 0.0) else r
+
+    def _start_preclear(self, now_sec: float):
+        # Decide which way to turn: turn away from the closer side
+        l = self._range_or_inf(self.min_left_range)
+        r = self._range_or_inf(self.min_right_range)
+
+        if l < r:
+            self.preclear_dir = -1.0   # left is closer => turn right
+        else:
+            self.preclear_dir =  1.0   # right is closer (or equal) => turn left
+
+        self.preclear_active = True
+        self.preclear_phase = 0  # BACK first
+        self.preclear_until = now_sec + self.preclear_back_s
 
     def follow_current_path(self):
         """
@@ -1426,7 +1610,9 @@ class Task1(Node):
         """
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
-        goal_tol = 1.50 * cell
+        waypoint_tol = 0.5 * cell  # for intermediate waypoints
+        goal_tol     = 0.8 * cell  # for final goal
+        min_goal_speed = 0.02
 
         if (self.current_path_world is None or
                 not self.current_path_world or
@@ -1442,22 +1628,100 @@ class Task1(Node):
         # --- UNION OBSTACLE CRITERIA ---
 
         # 1) /scan-based obstacle
-        if (
-            self.front_range_filt is not None and
-            self.front_range_filt < self.obstacle_stop_dist
-        ):
-            self.get_logger().warn(
-                f'Obstacle too close (scan front range={self.front_range_filt:.2f} m). '
-                f'Stopping and clearing path for replanning.',
-                throttle_duration_sec=1.0
-            )
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        # --- NEW: pre-clear if too close to ANY wall before doing path tracking ---
+        front = self._range_or_inf(self.front_range_filt)
+        left  = self._range_or_inf(self.min_left_range)
+        right = self._range_or_inf(self.min_right_range)
+
+        too_close = (
+            front < self.wall_clear_dist_front or
+            left  < self.wall_clear_dist_side  or
+            right < self.wall_clear_dist_side
+        )
+
+        # If currently in a preclear maneuver, keep executing it
+        if self.preclear_active:
+            if now_sec < self.preclear_until:
+                if self.preclear_phase == 0:
+                    # BACK (optionally with a tiny turn bias)
+                    self.publish_cmd_vel(self.preclear_back_v, 0.25 * self.preclear_dir * self.preclear_turn_w)
+                else:
+                    # TURN
+                    self.publish_cmd_vel(0.0, self.preclear_dir * self.preclear_turn_w)
+                return
+            else:
+                # phase transition or finish
+                if self.preclear_phase == 0:
+                    self.preclear_phase = 1
+                    self.preclear_until = now_sec + self.preclear_turn_s
+                    self.publish_cmd_vel(0.0, self.preclear_dir * self.preclear_turn_w)
+                    return
+                else:
+                    self.preclear_active = False
+                    # reset speed ramp so we don't "jump" after preclear
+                    self.prev_speed_cmd = 0.0
+                    self.pid_speed.reset()
+                    self.pid_heading.reset()
+
+        # Not currently preclearing: if too close, start it
+        if too_close:
+            self._start_preclear(now_sec)
+            self.publish_cmd_vel(self.preclear_back_v, 0.0)
+            return
+
+        # If we are currently escaping, keep doing it until timeout
+        if self.escape_active and now_sec < self.escape_until:
+            self.publish_cmd_vel(0.0, self.escape_dir * self.escape_w)
+            return
+        else:
+            self.escape_active = False
+
+        # --- Obstacle logic (smarter) ---
+        if self.front_range_filt is not None and self.front_range_filt < self.obstacle_stop_dist:
+            # Pick turn direction by whichever side has more clearance
+            l = self.min_left_range if self.min_left_range is not None else -1.0
+            r = self.min_right_range if self.min_right_range is not None else -1.0
+
+            if l == -1.0 and r == -1.0:
+                self.escape_dir = 1.0
+            else:
+                self.escape_dir = 1.0 if l >= r else -1.0
+
+            self.escape_attempts += 1
+
+            # Try a few escape turns BEFORE giving up on this goal/path
+            if self.escape_attempts <= self.escape_attempt_limit:
+                self.escape_active = True
+                self.escape_until = now_sec + self.escape_duration_s
+                self.get_logger().warn(
+                    f"Obstacle close (front={self.front_range_filt:.2f}m). "
+                    f"Escape-turn attempt {self.escape_attempts}/{self.escape_attempt_limit} "
+                    f"dir={'L' if self.escape_dir > 0 else 'R'}."
+                )
+                self.publish_cmd_vel(0.0, self.escape_dir * self.escape_w)
+                return
+
+            # If we STILL can't clear it after multiple turns, then block & replan
+            if self.frontier_goal is not None:
+                gx, gy = self.frontier_goal
+                self.add_blocked_goal(gx, gy)  # upgraded in Fix 2 below
+                self.get_logger().warn(
+                    f"Escape failed; blocking goal region around {self.frontier_goal} and replanning."
+                )
+
+            self.escape_attempts = 0
             self.clear_current_path()
             return
 
-        # 2) map-based obstacle along path (occupied cells only)
+        # If we got here, no immediate obstacle → reset escape counter
+        self.escape_attempts = 0
+
+        # 2) map-based obstacle along path (traversability including clearance)
         if not self.is_path_still_valid():
             self.get_logger().warn(
-                'Current path intersects newly occupied/unknown cells in map. '
+                'Current path cells lost traversability (new obstacles / reduced clearance). '
                 'Clearing path for replanning.',
                 throttle_duration_sec=1.0
             )
@@ -1478,38 +1742,115 @@ class Task1(Node):
         ry = self.robot_y
         ryaw = self.robot_yaw
 
-        # --- SELECT WAYPOINT ---
-        idx = self.select_path_waypoint_index()
-        if idx is None:
-            self.publish_cmd_vel(0.0, 0.0)
-            return
+        # Update speed history for speed estimation
+        self.speed_hist.append((now_sec, rx, ry))
+        if len(self.speed_hist) > 5:
+            self.speed_hist.pop(0)
+
+        # Estimate current speed (scalar)
+        if len(self.speed_hist) >= 2:
+            t_prev, x_prev, y_prev = self.speed_hist[-2]
+            dt_speed = max(1e-3, now_sec - t_prev)
+            dist = math.hypot(rx - x_prev, ry - y_prev)
+            speed_curr = dist / dt_speed
+        else:
+            speed_curr = 0.0
+
+        # Advance waypoint index when close to current waypoint
+        while self.path_idx < len(self.current_path_world) - 1:
+            gx, gy = self.current_path_world[self.path_idx]
+            dist_to_wp = math.hypot(gx - rx, gy - ry)
+            if dist_to_wp < waypoint_tol:
+                self.path_idx += 1
+            else:
+                break
 
         gx, gy = self.current_path_world[idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
+        
+        is_final_wp = (self.path_idx == len(self.current_path_world) - 1)
+        slow_dist = self.goal_slow_down_dist if is_final_wp else self.slow_down_dist
 
-        # Check if we've reached the final goal
-        if (idx == len(self.current_path_world) - 1 and
-            dist_to_goal < goal_tol ):
-            self.get_logger().info(
-                'Reached current path goal. Stopping and clearing path.',
-                throttle_duration_sec=2.0
-            )
+        if (self.path_idx == len(self.current_path_world) - 1 and
+            dist_to_goal < goal_tol and
+            speed_curr < min_goal_speed):
+
+            if self.frontier_goal is not None:
+                old_count = self.frontier_visit_counts.get(self.frontier_goal, 0)
+                new_count = old_count + 1
+                self.frontier_visit_counts[self.frontier_goal] = new_count
+
+                self.get_logger().info(
+                    f'Reached frontier goal {self.frontier_goal}. '
+                    f'Visit count now = {new_count}. Clearing path.',
+                    throttle_duration_sec=2.0
+                )
+            else:
+                self.get_logger().info(
+                    'Reached current path goal. Stopping and clearing path.',
+                    throttle_duration_sec=2.0
+                )
+
+            # Reset both clearances back to their original safe values
+            self.frontier_clearance_current = self.FRONTIER_CLEARANCE_CELLS
+            self.path_clearance_current = self.PATH_CLEARANCE_CELLS
+
             self.clear_current_path()
             return
-        
+
         # Desired heading
         dx = gx - rx
         dy = gy - ry
         desired_yaw = math.atan2(dy, dx)
         heading_err = wrap_angle(desired_yaw - ryaw)
 
-        '''# Angular velocity from heading PID
+        # Deadband to eliminate micro-oscillations
+        if abs(heading_err) < self.heading_deadband:
+            heading_err = 0.0
+
+        # stronger turn penalty: drop faster as heading_err grows
+        turn_ratio = max(0.05, 1.0 - (abs(heading_err) / 1.2))  # 1.2 rad ~ 69 deg
+
+        # Angular velocity from heading PID
         heading_cmd = self.pid_heading.step(heading_err, dt)
 
-        if dist_to_goal > 0.5: speed_cmd = self.speed_max
-        else: speed_cmd = self.speed_min
+        # Heading factor: penalize misalignment but not too aggressively
+        heading_factor = max(0.0, math.cos(heading_err))
+
+        if dist_to_goal > slow_dist:
+            speed_goal = self.speed_max * heading_factor * turn_ratio
+        else:
+            base = self.speed_max * (dist_to_goal / max(slow_dist, 1e-3))
+            speed_goal = max(self.speed_min * heading_factor,
+                            base * heading_factor) * turn_ratio
+
+        # NEW: extra cap for final approach (acts like "turn cap", but for goal)
+        if is_final_wp:
+            speed_goal = min(speed_goal, self.goal_speed_cap)
+
+        # --- Obstacle-aware speed scaling (smooth slowdown before hard-stop) ---
+        d = self.front_range_filt if self.front_range_filt is not None else 10.0
+
+        slow_radius = 0.90  # start slowing when obstacle within this range (tune 0.7–1.2)
+        stop_dist   = self.obstacle_stop_dist  # your existing hard stop threshold
+
+        if d <= stop_dist:
+            obs_scale = 0.0
+        elif d >= slow_radius:
+            obs_scale = 1.0
+        else:
+            obs_scale = (d - stop_dist) / (slow_radius - stop_dist)
+
+        speed_goal *= obs_scale
+
+        speed_goal = max(0.0, speed_goal)
+
+        # Speed PID on (speed_goal - current_estimated_speed)
+        speed_err = speed_goal - speed_curr
+        speed_cmd = self.pid_speed.step(speed_err, dt)
+
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 0.1:
+        if abs(heading_err) > 0.7:  # allow bigger error before freezing linear speed
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
@@ -1531,12 +1872,23 @@ class Task1(Node):
         # clamp
         speed_cmd = max(0.0, min(self.speed_max, speed_cmd))
 
+        # --- Slew-rate limit linear speed (prevents jerky accel that causes instability) ---
+        dv_up   = self.max_accel * dt
+        dv_down = self.max_decel * dt
+
+        if speed_cmd > self.prev_speed_cmd + dv_up:
+            speed_cmd = self.prev_speed_cmd + dv_up
+        elif speed_cmd < self.prev_speed_cmd - dv_down:
+            speed_cmd = self.prev_speed_cmd - dv_down
+
+        self.prev_speed_cmd = speed_cmd
+
         self.publish_cmd_vel(speed_cmd, heading_cmd)
 
     # -------------------------------------------------------------------------
     # Timer callback - behavior loop (Stage 6)
     # -------------------------------------------------------------------------
-    
+
     def which_cluster_contains(
         self,
         clusters: List[List[Tuple[int, int]]],
@@ -1546,10 +1898,6 @@ class Task1(Node):
         """
         Find the cluster whose cells are closest to 'cell', as long as the
         minimum distance is within max_dist_cells (in grid units).
-
-        This is robust to goals that have been 'backed off' a bit from
-        the original frontier cells, so their exact grid index might not
-        be in the cluster.
         """
         mx, my = cell
         best_cluster = None
@@ -1569,6 +1917,195 @@ class Task1(Node):
             return best_cluster
 
         return None
+
+    def find_alternative_goal_for_cluster(
+        self,
+        desired_goal: Tuple[int, int],
+        cluster: List[Tuple[int, int]],
+        neighborhood_radius: int = 4,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Given a desired frontier-related goal (mx,my) and its cluster,
+        search for the nearest cell that:
+          - is traversable (is_traversable = free + PATH_CLEARANCE_CELLS)
+          - is not in a blocked region
+          - is at least MIN_GOAL_DIST_CELLS away from the robot
+
+        This is the "project the goal to a valid nearby cell" logic.
+        """
+        if self.robot_mx is None or self.robot_my is None:
+            return None
+
+        gx, gy = desired_goal
+        candidates: Set[Tuple[int, int]] = set()
+
+        # 1) Start with the desired goal itself
+        candidates.add((gx, gy))
+
+        # 2) Try backoff_to_known_safe_cell from the desired goal
+        backed = self.backoff_to_known_safe_cell(
+            gx, gy,
+            max_back_cells=6,
+            clearance_cells=self.frontier_clearance_current,
+        )
+        if backed is not None:
+            candidates.add(backed)
+
+        # 3) Add all cells in the cluster and their backed versions
+        for (mx, my) in cluster:
+            candidates.add((mx, my))
+
+            backed2 = self.backoff_to_known_safe_cell(
+                mx, my,
+                max_back_cells=6,
+                clearance_cells=self.frontier_clearance_current,
+            )
+            if backed2 is not None:
+                candidates.add(backed2)
+
+        # 4) Add a neighborhood around the cluster
+        for (cx, cy) in cluster:
+            for dx in range(-neighborhood_radius, neighborhood_radius + 1):
+                for dy in range(-neighborhood_radius, neighborhood_radius + 1):
+                    nx = cx + dx
+                    ny = cy + dy
+                    if self.map_index(nx, ny) is None:
+                        continue
+                    candidates.add((nx, ny))
+
+        valid_scored: List[Tuple[float, Tuple[int, int]]] = []
+
+        for (mx, my) in candidates:
+            # Must be inside map
+            if self.map_index(mx, my) is None:
+                continue
+
+            # Respect traversability gate
+            if not self.is_traversable(mx, my):
+                continue
+
+            # Skip blocked regions
+            if self.is_blocked_goal_cell(mx, my):
+                continue
+
+            # Respect minimum distance from robot
+            dx = mx - self.robot_mx
+            dy = my - self.robot_my
+            if dx * dx + dy * dy < self.MIN_GOAL_DIST_CELLS ** 2:
+                continue
+
+            # Score: prefer staying close to the originally desired goal
+            ddx = mx - gx
+            ddy = my - gy
+            dist2_to_desired = ddx * ddx + ddy * ddy
+            valid_scored.append((dist2_to_desired, (mx, my)))
+
+        if not valid_scored:
+            return None
+
+        # Pick the valid candidate closest to the original goal
+        valid_scored.sort(key=lambda x: x[0])
+        return valid_scored[0][1]
+
+    def compute_far_alternative_goal(
+        self,
+        mx: int,
+        my: int,
+        max_offset_cells: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        For a frontier cell that was rejected due to inflation / clearance,
+        search in axis and diagonal directions for a traversable cell that is
+        farther away from the original inflated area.
+
+        This is deliberately cheap: we only walk along a few rays.
+        """
+        if self.map_width is None or self.map_height is None:
+            return None
+
+        if max_offset_cells is None:
+            max_offset_cells = self.FRONTIER_FAR_ALT_MAX_OFFSET_CELLS
+
+        directions = [
+            (1, 0),  (-1, 0),
+            (0, 1),  (0, -1),
+            (1, 1),  (1, -1),
+            (-1, 1), (-1, -1),
+        ]
+
+        for step in range(self.FRONTIER_FAR_ALT_MIN_OFFSET_CELLS,
+                          max_offset_cells + 1):
+            for dx, dy in directions:
+                ax = mx + dx * step
+                ay = my + dy * step
+
+                if self.map_index(ax, ay) is None:
+                    continue
+
+                # Must be traversable (respects PATH_CLEARANCE_CELLS and unknown-as-free change)
+                if not self.is_traversable(ax, ay):
+                    continue
+
+                # Respect blocked-goal exclusion
+                if self.is_blocked_goal_cell(ax, ay):
+                    continue
+
+                # Keep some minimum distance from robot
+                if self.robot_mx is not None and self.robot_my is not None:
+                    ddx = ax - self.robot_mx
+                    ddy = ay - self.robot_my
+                    if ddx * ddx + ddy * ddy < self.MIN_GOAL_DIST_CELLS ** 2:
+                        continue
+
+                return (ax, ay)
+
+        return None
+
+    def try_inflated_backlog_goals(self) -> bool:
+        """
+        Third-tier: try to use 'far' alternative goals for frontiers whose
+        clusters were rejected due to inflation / clearance.
+        Returns True if we successfully set a new path.
+        """
+        if self.robot_mx is None or self.robot_my is None:
+            return False
+        if not self.inflated_filtered_frontiers:
+            return False
+
+        # Work on a copy so we can safely pop while iterating
+        for idx, (fx, fy) in enumerate(list(self.inflated_filtered_frontiers)):
+            alt = self.compute_far_alternative_goal(fx, fy)
+            if alt is None:
+                continue
+
+            gx, gy = alt
+            path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
+            if path is None:
+                continue
+
+            smoothed = self.smooth_path(path)
+
+            self.get_logger().info(
+                f'A* to far-alt frontier: raw_len={len(path)}, '
+                f'start={smoothed[0]}, end={smoothed[-1]}, '
+                f'raw_frontier={(fx, fy)}, alt_goal={alt}'
+            )
+
+            # Use the alternate as the actual goal; remember original
+            self.frontier_goal = alt
+            self.last_frontier_goal = (fx, fy)
+            self.set_current_path(smoothed)
+
+            # Remove this frontier from backlog now that we used it
+            try:
+                self.inflated_filtered_frontiers.pop(idx)
+            except IndexError:
+                pass
+
+            return True
+
+        # Could not find any usable far-alt goal
+        return False
 
     def timer_cb(self):
         """
@@ -1654,64 +2191,193 @@ class Task1(Node):
                     self.publish_cmd_vel(0.0, 0.0)
                     return
 
-                # If no current path, choose new goal and plan
                 if self.current_path is None:
-                    # iterate through clusters in order of distance
-                    remaining_clusters = list(clusters)
-
+                    # Try with gradually relaxed frontier clearance:
+                    # start from current value down to 0.
+                    original_frontier_clearance = self.frontier_clearance_current
+                    original_path_clearance = self.path_clearance_current
                     found_valid_goal = False
-                    while remaining_clusters and not found_valid_goal:
-                        self.last_goal_cell = goal_cell = self.choose_frontier_goal(remaining_clusters)
-                        if goal_cell is None:
-                            break
 
-                        gx, gy = goal_cell
-
-                        # If the chosen goal is not traversable, REMOVE THAT CLUSTER
-                        if not self.is_traversable(gx, gy):
-                            self.get_logger().warn(
-                                f'Frontier goal {goal_cell} not traversable — skipping this cluster.'
-                            )
-                            # remove the cluster that produced this goal
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
-                            continue
-                        
-                        # If the chosen goal is literally the robot cell, skip it
-                        if (gx, gy) == (self.robot_mx, self.robot_my):
-                            self.get_logger().warn(
-                                f'Chosen frontier goal {goal_cell} is at the robot position; skipping.'
-                            )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
-                            continue
-
-                        # Try A*
-                        path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
-                        if path is None:
-                            self.get_logger().warn(
-                                f'A*: no path to frontier {goal_cell} — skipping this cluster.'
-                            )
-                            cluster_to_remove = self.which_cluster_contains(remaining_clusters, goal_cell)
-                            if cluster_to_remove:
-                                remaining_clusters.remove(cluster_to_remove)
-                            continue
-
-                        # Smooth the path
-                        smoothed = self.smooth_path(path)
+                    '''while self.frontier_clearance_current >= self.frontier_clearance_min and not found_valid_goal:
+                        remaining_clusters = list(clusters)
 
                         self.get_logger().info(
-                            f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
-                            f'start={smoothed[0]}, end={smoothed[-1]}'
+                            f'Trying frontier selection with clearance={self.frontier_clearance_current} cells.'
                         )
-                        self.frontier_goal = goal_cell
-                        self.set_current_path(smoothed)
-                        found_valid_goal = True
+
+                        while remaining_clusters and not found_valid_goal:
+                            raw_goal = self.choose_frontier_goal(remaining_clusters)
+                            if raw_goal is None:
+                                # no more acceptable cells in these clusters
+                                break
+
+                            cluster_for_goal = self.which_cluster_contains(remaining_clusters, raw_goal)
+                            if cluster_for_goal is None:
+                                cluster_for_goal = [raw_goal]
+
+                            alt_goal = self.find_alternative_goal_for_cluster(
+                                desired_goal=raw_goal,
+                                cluster=cluster_for_goal,
+                                neighborhood_radius=4,
+                            )
+
+                            if alt_goal is None:
+                                # No valid traversable cell near this frontier under current clearance
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'No valid alternative goal near frontier {raw_goal} '
+                                    f'with clearance={self.frontier_clearance_current}; '
+                                    f'skipping this cluster (added to inflated backlog).'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            gx, gy = alt_goal
+                            path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
+                            if path is None:
+                                # Projected goal still unreachable; mark this frontier as inflation-filtered
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'A*: no path to adjusted frontier goal {alt_goal} '
+                                    f'for original {raw_goal} at clearance={self.frontier_clearance_current} '
+                                    f'— skipping this cluster.'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            smoothed = self.smooth_path(path)
+
+                            self.get_logger().info(
+                                f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
+                                f'start={smoothed[0]}, end={smoothed[-1]}, '
+                                f'raw_goal={raw_goal}, used_goal={alt_goal}, '
+                                f'clearance={self.frontier_clearance_current}'
+                            )
+
+                            self.frontier_goal = alt_goal
+                            self.last_frontier_goal = raw_goal
+                            self.set_current_path(smoothed)
+                            found_valid_goal = True
+
+                        # If we still didn't find anything at this clearance,
+                        # try far-alt backlog goals at the same clearance.
+                        if not found_valid_goal:
+                            used_backlog = self.try_inflated_backlog_goals()
+                            if used_backlog:
+                                found_valid_goal = True
+                                break
+
+                            if (self.frontier_clearance_current > self.frontier_clearance_min or
+                                self.path_clearance_current > self.path_clearance_min):
+
+                                new_frontier = max(self.frontier_clearance_min,
+                                                    self.frontier_clearance_current - 1)
+                                new_path = max(self.path_clearance_min,
+                                                self.path_clearance_current - 1)
+
+                                self.get_logger().warn(
+                                    f'No valid frontier goals for clearance='
+                                    f'(frontier={self.frontier_clearance_current}, path={self.path_clearance_current}). '
+                                    f'Reducing to (frontier={new_frontier}, path={new_path}) and retrying.'
+                                )
+
+                                self.frontier_clearance_current = new_frontier
+                                self.path_clearance_current = new_path
+                            else:
+                                # Already at minimum; break out.
+                                break'''
+
+                    # Try with gradually relaxed frontier clearance in a guaranteed staircase:
+                    # (frontier = N, N-1, ..., min)
+                    # and keep path clearance in lockstep.
+                    for clearance in range(original_frontier_clearance, self.frontier_clearance_min - 1, -1):
+                        # decrease frontier clearance step-by-step
+                        self.frontier_clearance_current = clearance
+
+                        # decrease path clearance by the same number of steps (lockstep)
+                        step = original_frontier_clearance - clearance
+                        self.path_clearance_current = max(self.path_clearance_min, original_path_clearance - step)
+
+                        remaining_clusters = list(clusters)
+
+                        self.get_logger().info(
+                            f'Trying frontier selection with clearance={self.frontier_clearance_current} cells.'
+                        )
+
+                        while remaining_clusters and not found_valid_goal:
+                            raw_goal = self.choose_frontier_goal(remaining_clusters)
+                            if raw_goal is None:
+                                break
+
+                            cluster_for_goal = self.which_cluster_contains(remaining_clusters, raw_goal)
+                            if cluster_for_goal is None:
+                                cluster_for_goal = [raw_goal]
+
+                            alt_goal = self.find_alternative_goal_for_cluster(
+                                desired_goal=raw_goal,
+                                cluster=cluster_for_goal,
+                                neighborhood_radius=4,
+                            )
+
+                            if alt_goal is None:
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'No valid alternative goal near frontier {raw_goal} '
+                                    f'with clearance={self.frontier_clearance_current}; '
+                                    f'skipping this cluster (added to inflated backlog).'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            gx, gy = alt_goal
+                            path = self.astar_plan((self.robot_mx, self.robot_my), (gx, gy))
+                            if path is None:
+                                self.remember_inflated_frontier(raw_goal)
+                                self.get_logger().warn(
+                                    f'A*: no path to adjusted frontier goal {alt_goal} '
+                                    f'for original {raw_goal} at clearance={self.frontier_clearance_current} '
+                                    f'— skipping this cluster.'
+                                )
+                                if cluster_for_goal in remaining_clusters:
+                                    remaining_clusters.remove(cluster_for_goal)
+                                continue
+
+                            smoothed = self.smooth_path(path)
+
+                            self.get_logger().info(
+                                f'A* to frontier: raw_len={len(path)}, smooth_len={len(smoothed)}, '
+                                f'start={(self.robot_mx, self.robot_my)}, end={smoothed[-1] if smoothed else None}, '
+                                f'raw_goal={raw_goal}, used_goal={(gx, gy)}, clearance={self.frontier_clearance_current}'
+                            )
+
+                            self.frontier_goal = alt_goal
+                            self.last_frontier_goal = raw_goal
+                            self.set_current_path(smoothed)
+                            found_valid_goal = True
+
+                        # If we still didn't find anything at this clearance,
+                        # try far-alt backlog goals at the same clearance.
+                        if not found_valid_goal:
+                            used_backlog = self.try_inflated_backlog_goals()
+                            if used_backlog:
+                                found_valid_goal = True
+
+                        if found_valid_goal:
+                            break
 
                     if not found_valid_goal:
-                        self.get_logger().warn('No valid frontier goal in ANY cluster.')
+                        # Could not find any goal even with clearance reduced down to min.
+                        self.get_logger().warn(
+                            'No usable frontier goals even after relaxing frontier clearance. '
+                            'Clearing path and continuing to spin.'
+                        )
+                        self.frontier_goal = None
+                        self.clear_current_path()
+                        self.frontier_clearance_current = original_frontier_clearance
+                        self.path_clearance_current = original_path_clearance
 
             # 4) Visualization
             self.publish_frontier_markers()
