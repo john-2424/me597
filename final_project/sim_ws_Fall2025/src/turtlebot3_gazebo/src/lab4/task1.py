@@ -159,7 +159,7 @@ class Task1(Node):
         # ---------------------------
         self.min_front_range: Optional[float] = None
         self.front_range_filt: Optional[float] = None
-        self.obstacle_stop_dist = 0.30  # m
+        self.obstacle_stop_dist = 0.35  # m
 
         self.min_front_range = None
         self.front_range_filt = None
@@ -170,7 +170,7 @@ class Task1(Node):
         # PID controllers (Stage 5)
         # ---------------------------
         # slightly slower but smoother body motion
-        self.speed_max = 0.45      # linear speed cap
+        self.speed_max = 0.60      # linear speed cap
         self.speed_min = 0.08      # minimum creeping speed
 
         # sharper heading control
@@ -178,15 +178,19 @@ class Task1(Node):
         self.heading_deadband = 0.04  # rad ≈ 2.3 degrees
 
         self.yaw_tol = 0.1         # rad
-        self.slow_down_dist = 0.80 # m, start braking earlier
+        self.slow_down_dist = 1.10 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
 
+        self.max_accel = 0.35        # m/s^2  (safe-ish)
+        self.max_decel = 0.55        # m/s^2  (can brake harder than accel)
+        self.prev_speed_cmd = 0.0
+
         self.pid_speed = PID(
-            kp=3.0,
-            ki=0.10,
-            kd=0.20,
+            kp=2.2,      # was 3.0
+            ki=0.08,     # was 0.10
+            kd=0.25,     # was 0.20 (more damping)
             i_limit=1.0,
             out_limit=(-self.speed_max, self.speed_max)
         )
@@ -1695,8 +1699,8 @@ class Task1(Node):
         if abs(heading_err) < self.heading_deadband:
             heading_err = 0.0
 
-        # Extra stability: slow down more when turning sharply
-        turn_ratio = max(0.2, 1.0 - abs(heading_err))
+        # stronger turn penalty: drop faster as heading_err grows
+        turn_ratio = max(0.05, 1.0 - (abs(heading_err) / 1.2))  # 1.2 rad ~ 69 deg
 
         # Angular velocity from heading PID
         heading_cmd = self.pid_heading.step(heading_err, dt)
@@ -1711,16 +1715,44 @@ class Task1(Node):
             speed_goal = max(self.speed_min * heading_factor,
                              base * heading_factor) * turn_ratio
 
+        # --- Obstacle-aware speed scaling (smooth slowdown before hard-stop) ---
+        d = self.front_range_filt if self.front_range_filt is not None else 10.0
+
+        slow_radius = 0.90  # start slowing when obstacle within this range (tune 0.7–1.2)
+        stop_dist   = self.obstacle_stop_dist  # your existing hard stop threshold
+
+        if d <= stop_dist:
+            obs_scale = 0.0
+        elif d >= slow_radius:
+            obs_scale = 1.0
+        else:
+            obs_scale = (d - stop_dist) / (slow_radius - stop_dist)
+
+        speed_goal *= obs_scale
+
+        speed_goal = max(0.0, speed_goal)
+
         # Speed PID on (speed_goal - current_estimated_speed)
         speed_err = speed_goal - speed_curr
         speed_cmd = self.pid_speed.step(speed_err, dt)
 
         # Extra safety: if very misaligned, stop and only rotate
-        if abs(heading_err) > 0.9:  # allow bigger error before freezing linear speed
+        if abs(heading_err) > 0.7:  # allow bigger error before freezing linear speed
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
         speed_cmd = max(0.0, min(self.speed_max, speed_cmd))
+
+        # --- Slew-rate limit linear speed (prevents jerky accel that causes instability) ---
+        dv_up   = self.max_accel * dt
+        dv_down = self.max_decel * dt
+
+        if speed_cmd > self.prev_speed_cmd + dv_up:
+            speed_cmd = self.prev_speed_cmd + dv_up
+        elif speed_cmd < self.prev_speed_cmd - dv_down:
+            speed_cmd = self.prev_speed_cmd - dv_down
+
+        self.prev_speed_cmd = speed_cmd
 
         self.publish_cmd_vel(speed_cmd, heading_cmd)
 
