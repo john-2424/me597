@@ -153,7 +153,6 @@ class Task1(Node):
         self.current_path: Optional[List[Tuple[int, int]]] = None
         self.current_path_world: Optional[List[Tuple[float, float]]] = None
         self.path_idx: Optional[int] = None
-        self.last_goal_cell = None
 
         # ---------------------------
         # Scan / obstacle state (Stage 5)
@@ -182,7 +181,7 @@ class Task1(Node):
         self.slow_down_dist = 1.10 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
-        self.speed_hist: List[Tuple[float, float, float]] = []
+        self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
 
         self.max_accel = 0.35        # m/s^2  (safe-ish)
         self.max_decel = 0.55        # m/s^2  (can brake harder than accel)
@@ -253,18 +252,6 @@ class Task1(Node):
         # Final-goal approach tuning (NEW)
         self.goal_slow_down_dist = 0.8     # m: start braking earlier for FINAL waypoint
         self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
-
-        # ---------------------------
-        # Spin-in-place exploration helper
-        # ---------------------------
-        self.spin_enabled = True
-        self.spin_interval_dist = 1.0  # meters between spins
-        self.dist_since_spin = 0.0
-        self.last_pose_for_spin: Optional[Tuple[float, float]] = None
-
-        self.doing_spin = False
-        self.spin_accum_angle = 0.0
-        self.prev_spin_yaw: Optional[float] = None
 
         # ---------------------------
         # Misc counters
@@ -344,15 +331,6 @@ class Task1(Node):
                 resized = True
 
         if resized:
-            self.state = "WAIT_FOR_MAP"
-            # Invalidate the current path on any geometry change
-            if self.current_path is not None:
-                self.get_logger().info(
-                    'Map geometry changed (size/origin/resolution). '
-                    'Clearing current path to replan on updated grid.'
-                )
-                self.clear_current_path()
-
             self.map_width = info.width
             self.map_height = info.height
             self.map_resolution = info.resolution
@@ -682,7 +660,7 @@ class Task1(Node):
             i = j
 
         return smoothed
-    
+
     def find_nearest_traversable(self, mx: int, my: int,
                                  max_radius: Optional[int] = None) -> Optional[Tuple[int, int]]:
         """
@@ -783,12 +761,12 @@ class Task1(Node):
             alt = self.find_nearest_traversable(sx, sy, max_radius=self.NEAREST_TRAVERSABLE_RADIUS_CELLS)
             if alt is None:
                 self.get_logger().warn(
-                    f"A*: start cell {start} is not traversable and no nearby escape cell found."
+                    f'A*: start cell {start} is not traversable and no free neighbor found.'
                 )
                 return None
             else:
                 self.get_logger().info(
-                    f"A*: start cell {start} not traversable, using nearby escape cell {alt} as start."
+                    f'A*: start cell {start} not traversable, using nearest free cell {alt} as start.'
                 )
                 sx, sy = alt
                 start = (sx, sy)
@@ -1174,7 +1152,7 @@ class Task1(Node):
                 return (bx, by)
 
         return None
-    
+
     def choose_frontier_goal(self, clusters: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         """
         Choose a frontier-related cell using a *geometric* distance band instead of
@@ -1195,15 +1173,6 @@ class Task1(Node):
             return None
         if self.robot_mx is None or self.robot_my is None:
             return None
-        rx, ry = self.robot_mx, self.robot_my
-
-        # -------------------------------------------------------------
-        # Step 1 — Collect ALL frontier cells (flatten all clusters)
-        # -------------------------------------------------------------
-        all_frontiers: List[Tuple[int, int]] = [
-            cell for cluster in clusters for cell in cluster
-            if self.map_index(cell[0], cell[1]) is not None
-        ]
 
         band_min = self.FRONTIER_PATH_LEN_MIN_CELLS
         band_max = self.FRONTIER_PATH_LEN_MAX_CELLS
@@ -1465,7 +1434,6 @@ class Task1(Node):
         self.publish_cmd_vel(0.0, 0.0)
 
     def publish_cmd_vel(self, linear_x: float, angular_z: float):
-        self.get_logger().info(f'Speed: {linear_x}; Heading: {angular_z}')
         msg = Twist()
         msg.linear.x = float(linear_x)
         msg.angular.z = float(angular_z)
@@ -1729,6 +1697,7 @@ class Task1(Node):
             return
 
         # --- NORMAL PATH FOLLOWING BELOW ---
+
         now_sec = self.get_clock().now().nanoseconds * 1e-9
 
         # dt for PID
@@ -1765,7 +1734,8 @@ class Task1(Node):
             else:
                 break
 
-        gx, gy = self.current_path_world[idx]
+        # Check final goal
+        gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
         
         is_final_wp = (self.path_idx == len(self.current_path_world) - 1)
@@ -1854,22 +1824,6 @@ class Task1(Node):
             speed_cmd = 0.0
 
         # never go backwards, clamp to limits
-        speed_cmd = max(0.0, min(self.speed_max, speed_cmd))'''
-
-        heading_err = wrap_angle(desired_yaw - ryaw)
-        heading_cmd = self.pid_heading.step(heading_err, dt)
-
-        # simple speed profile: slow down near final goal
-        if dist_to_goal > 0.5:
-            base_speed = self.speed_max
-        else:
-            base_speed = self.speed_min
-
-        # scale speed by alignment instead of hard stop
-        alignment = max(0.0, math.cos(heading_err))  # 1 when aligned, 0 when 90deg off
-        speed_cmd = base_speed * alignment
-
-        # clamp
         speed_cmd = max(0.0, min(self.speed_max, speed_cmd))
 
         # --- Slew-rate limit linear speed (prevents jerky accel that causes instability) ---
@@ -2153,16 +2107,17 @@ class Task1(Node):
         # State machine
         # ---------------------------
 
-        # WAIT_FOR_MAP: map + pose must be ready
+        # WAIT_FOR_MAP: map + pose must be ready, plus a short warmup
         if self.state == "WAIT_FOR_MAP":
             if (self.map_received and self.robot_pose_received and
-                    self.robot_mx is not None and self.robot_my is not None):
+                    self.robot_mx is not None and self.robot_my is not None and
+                    self.timer_counter > 30):
                 self.get_logger().info('Map & pose ready. Switching to EXPLORE.')
                 self.state = "EXPLORE"
             else:
                 self.publish_cmd_vel(0.0, 0.0)
                 return
-        
+
         # DONE: just stop and do nothing else
         if self.state == "DONE":
             self.publish_cmd_vel(0.0, 0.0)
@@ -2171,11 +2126,9 @@ class Task1(Node):
         # EXPLORE:
         if self.state == "EXPLORE":
             # 3) Frontier detection & clustering (every N steps)
-            if self.timer_counter % 1 == 0:  # every ~0.1s
+            if self.timer_counter % 3 == 0:  # every ~0.3s
                 frontier_cells = self.find_frontier_cells()
-                # self.get_logger().info(f'Frontier Cells: {frontier_cells}')
                 clusters = self.cluster_frontiers(frontier_cells)
-                # self.get_logger().info(f'Clusters: {clusters}')
                 self.frontier_clusters = clusters
                 self.get_logger().info(
                     f'Frontiers: {len(frontier_cells)} cells, {len(clusters)} clusters.'
