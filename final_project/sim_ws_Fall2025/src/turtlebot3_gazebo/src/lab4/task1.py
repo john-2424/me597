@@ -170,15 +170,15 @@ class Task1(Node):
         # PID controllers (Stage 5)
         # ---------------------------
         # slightly slower but smoother body motion
-        self.speed_max = 0.60      # linear speed cap
-        self.speed_min = 0.08      # minimum creeping speed
+        self.speed_max = 0.80      # linear speed cap
+        self.speed_min = 0.20      # minimum creeping speed
 
         # sharper heading control
-        self.heading_max = 1.0     # rad/s (faster turning allowed)
+        self.heading_max = 0.8     # rad/s (faster turning allowed)
         self.heading_deadband = 0.04  # rad ≈ 2.3 degrees
 
         self.yaw_tol = 0.1         # rad
-        self.slow_down_dist = 1.20 # m, start braking earlier
+        self.slow_down_dist = 2.0 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
@@ -195,9 +195,9 @@ class Task1(Node):
             out_limit=(-self.speed_max, self.speed_max)
         )
         self.pid_heading = PID(
-            kp=0.9,
+            kp=0.75,
             ki=0.008,
-            kd=0.24,
+            kd=0.32,
             i_limit=0.6,
             out_limit=(-self.heading_max, self.heading_max)
         )
@@ -250,8 +250,8 @@ class Task1(Node):
         self.preclear_turn_s = 0.45         # then turn away
 
         # Final-goal approach tuning (NEW)
-        self.goal_slow_down_dist = 1.20     # m: start braking earlier for FINAL waypoint
-        self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
+        self.goal_slow_down_dist = 2.5     # m: start braking earlier for FINAL waypoint
+        self.goal_speed_cap      = 0.4    # m/s: cap speed when tracking FINAL waypoint
 
         # ---------------------------
         # Misc counters
@@ -1578,8 +1578,8 @@ class Task1(Node):
         """
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
-        waypoint_tol = 0.5 * cell  # for intermediate waypoints
-        goal_tol     = 0.8 * cell  # for final goal
+        waypoint_tol = 1.0 * cell  # for intermediate waypoints
+        goal_tol     = 2.0 * cell  # for final goal
         min_goal_speed = 0.02
 
         if (self.current_path_world is None or
@@ -1779,7 +1779,7 @@ class Task1(Node):
             heading_err = 0.0
 
         # stronger turn penalty: drop faster as heading_err grows
-        turn_ratio = max(0.05, 1.0 - (abs(heading_err) / 1.2))  # 1.2 rad ~ 69 deg
+        turn_ratio = max(0.05, 1.0 - (abs(heading_err) / 0.8))  # 1.2 rad ~ 69 deg
 
         # Angular velocity from heading PID
         heading_cmd = self.pid_heading.step(heading_err, dt)
