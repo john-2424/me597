@@ -235,6 +235,24 @@ class Task1(Node):
         self.escape_attempts = 0
         self.escape_attempt_limit = 5
 
+        # --- NEW: pre-clear (wall un-sticking) state ---
+        self.preclear_active = False
+        self.preclear_phase = 0          # 0=BACK, 1=TURN
+        self.preclear_until = 0.0
+        self.preclear_dir = 1.0          # +1 left, -1 right
+
+        # Tunables (meters, seconds, speeds)
+        self.wall_clear_dist_side  = 0.35   # side too close -> preclear
+        self.wall_clear_dist_front = 0.30   # front too close -> preclear (can be a bit > obstacle_stop_dist)
+        self.preclear_back_v = -0.05        # reverse a little (negative!)
+        self.preclear_turn_w = 0.9          # turn speed while clearing
+        self.preclear_back_s = 0.35         # how long to back up
+        self.preclear_turn_s = 0.45         # then turn away
+
+        # Final-goal approach tuning (NEW)
+        self.goal_slow_down_dist = 0.8     # m: start braking earlier for FINAL waypoint
+        self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
+
         # ---------------------------
         # Misc counters
         # ---------------------------
@@ -1533,6 +1551,23 @@ class Task1(Node):
             else:
                 break
 
+    def _range_or_inf(self, r):
+        return float('inf') if (r is None or math.isinf(r) or math.isnan(r) or r <= 0.0) else r
+
+    def _start_preclear(self, now_sec: float):
+        # Decide which way to turn: turn away from the closer side
+        l = self._range_or_inf(self.min_left_range)
+        r = self._range_or_inf(self.min_right_range)
+
+        if l < r:
+            self.preclear_dir = -1.0   # left is closer => turn right
+        else:
+            self.preclear_dir =  1.0   # right is closer (or equal) => turn left
+
+        self.preclear_active = True
+        self.preclear_phase = 0  # BACK first
+        self.preclear_until = now_sec + self.preclear_back_s
+
     def follow_current_path(self):
         """
         Follow the current path using PID on speed and heading.
@@ -1562,6 +1597,47 @@ class Task1(Node):
 
         # 1) /scan-based obstacle
         now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        # --- NEW: pre-clear if too close to ANY wall before doing path tracking ---
+        front = self._range_or_inf(self.front_range_filt)
+        left  = self._range_or_inf(self.min_left_range)
+        right = self._range_or_inf(self.min_right_range)
+
+        too_close = (
+            front < self.wall_clear_dist_front or
+            left  < self.wall_clear_dist_side  or
+            right < self.wall_clear_dist_side
+        )
+
+        # If currently in a preclear maneuver, keep executing it
+        if self.preclear_active:
+            if now_sec < self.preclear_until:
+                if self.preclear_phase == 0:
+                    # BACK (optionally with a tiny turn bias)
+                    self.publish_cmd_vel(self.preclear_back_v, 0.25 * self.preclear_dir * self.preclear_turn_w)
+                else:
+                    # TURN
+                    self.publish_cmd_vel(0.0, self.preclear_dir * self.preclear_turn_w)
+                return
+            else:
+                # phase transition or finish
+                if self.preclear_phase == 0:
+                    self.preclear_phase = 1
+                    self.preclear_until = now_sec + self.preclear_turn_s
+                    self.publish_cmd_vel(0.0, self.preclear_dir * self.preclear_turn_w)
+                    return
+                else:
+                    self.preclear_active = False
+                    # reset speed ramp so we don't "jump" after preclear
+                    self.prev_speed_cmd = 0.0
+                    self.pid_speed.reset()
+                    self.pid_heading.reset()
+
+        # Not currently preclearing: if too close, start it
+        if too_close:
+            self._start_preclear(now_sec)
+            self.publish_cmd_vel(self.preclear_back_v, 0.0)
+            return
 
         # If we are currently escaping, keep doing it until timeout
         if self.escape_active and now_sec < self.escape_until:
@@ -1662,6 +1738,9 @@ class Task1(Node):
         gx, gy = self.current_path_world[self.path_idx]
         dist_to_goal = math.hypot(gx - rx, gy - ry)
         
+        is_final_wp = (self.path_idx == len(self.current_path_world) - 1)
+        slow_dist = self.goal_slow_down_dist if is_final_wp else self.slow_down_dist
+
         if (self.path_idx == len(self.current_path_world) - 1 and
             dist_to_goal < goal_tol and
             speed_curr < min_goal_speed):
@@ -1708,12 +1787,16 @@ class Task1(Node):
         # Heading factor: penalize misalignment but not too aggressively
         heading_factor = max(0.0, math.cos(heading_err))
 
-        if dist_to_goal > self.slow_down_dist:
+        if dist_to_goal > slow_dist:
             speed_goal = self.speed_max * heading_factor * turn_ratio
         else:
-            base = self.speed_max * (dist_to_goal / max(self.slow_down_dist, 1e-3))
+            base = self.speed_max * (dist_to_goal / max(slow_dist, 1e-3))
             speed_goal = max(self.speed_min * heading_factor,
-                             base * heading_factor) * turn_ratio
+                            base * heading_factor) * turn_ratio
+
+        # NEW: extra cap for final approach (acts like "turn cap", but for goal)
+        if is_final_wp:
+            speed_goal = min(speed_goal, self.goal_speed_cap)
 
         # --- Obstacle-aware speed scaling (smooth slowdown before hard-stop) ---
         d = self.front_range_filt if self.front_range_filt is not None else 10.0
