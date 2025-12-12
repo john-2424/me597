@@ -178,7 +178,7 @@ class Task1(Node):
         self.heading_deadband = 0.04  # rad ≈ 2.3 degrees
 
         self.yaw_tol = 0.1         # rad
-        self.slow_down_dist = 1.10 # m, start braking earlier
+        self.slow_down_dist = 1.20 # m, start braking earlier
 
         self.last_ctrl_time: Optional[float] = None
         self.speed_hist: List[Tuple[float, float, float]] = []  # (t, x, y)
@@ -243,14 +243,14 @@ class Task1(Node):
 
         # Tunables (meters, seconds, speeds)
         self.wall_clear_dist_side  = 0.35   # side too close -> preclear
-        self.wall_clear_dist_front = 0.30   # front too close -> preclear (can be a bit > obstacle_stop_dist)
+        self.wall_clear_dist_front = 0.35   # front too close -> preclear (can be a bit > obstacle_stop_dist)
         self.preclear_back_v = -0.05        # reverse a little (negative!)
         self.preclear_turn_w = 0.9          # turn speed while clearing
         self.preclear_back_s = 0.35         # how long to back up
         self.preclear_turn_s = 0.45         # then turn away
 
         # Final-goal approach tuning (NEW)
-        self.goal_slow_down_dist = 0.8     # m: start braking earlier for FINAL waypoint
+        self.goal_slow_down_dist = 1.20     # m: start braking earlier for FINAL waypoint
         self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
 
         # ---------------------------
