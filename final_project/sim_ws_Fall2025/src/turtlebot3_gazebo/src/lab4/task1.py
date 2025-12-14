@@ -239,19 +239,19 @@ class Task1(Node):
         self.preclear_active = False
         self.preclear_phase = 0          # 0=BACK, 1=TURN
         self.preclear_until = 0.0
-        self.preclear_dir = 1.0          # +1 left, -1 right
+        self.preclear_dir = 2.0          # +1 left, -1 right
 
         # Tunables (meters, seconds, speeds)
         self.wall_clear_dist_side  = 0.35   # side too close -> preclear
         self.wall_clear_dist_front = 0.30   # front too close -> preclear (can be a bit > obstacle_stop_dist)
-        self.preclear_back_v = -0.05        # reverse a little (negative!)
+        self.preclear_back_v = -0.10        # reverse a little (negative!)
         self.preclear_turn_w = 0.9          # turn speed while clearing
-        self.preclear_back_s = 0.35         # how long to back up
-        self.preclear_turn_s = 0.45         # then turn away
+        self.preclear_back_s = 0.40         # how long to back up
+        self.preclear_turn_s = 0.50         # then turn away
 
         # Final-goal approach tuning (NEW)
-        self.goal_slow_down_dist = 0.8     # m: start braking earlier for FINAL waypoint
-        self.goal_speed_cap      = 0.3    # m/s: cap speed when tracking FINAL waypoint
+        self.goal_slow_down_dist = 1.0     # m: start braking earlier for FINAL waypoint
+        self.goal_speed_cap      = 0.2    # m/s: cap speed when tracking FINAL waypoint
 
         # ---------------------------
         # Misc counters
@@ -1578,8 +1578,8 @@ class Task1(Node):
         """
         # pick a tolerance smaller than a cell
         cell = self.map_resolution if self.map_resolution is not None else 0.05
-        waypoint_tol = 0.5 * cell  # for intermediate waypoints
-        goal_tol     = 0.8 * cell  # for final goal
+        waypoint_tol = 2.0 * cell  # for intermediate waypoints
+        goal_tol     = 1.5 * cell  # for final goal
         min_goal_speed = 0.02
 
         if (self.current_path_world is None or
