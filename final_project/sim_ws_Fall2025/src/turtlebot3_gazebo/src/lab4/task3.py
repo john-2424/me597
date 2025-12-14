@@ -86,16 +86,16 @@ class Task3(Node):
         self.declare_parameter('angular_gain', 2.0)           # P-gain on heading error
         self.declare_parameter('obstacle_avoid_distance', 0.45)  # m, simple stop threshold
 
-        # NEW: when heading error is large, rotate-only instead of "plowing forward"
+        # when heading error is large, rotate-only instead of "plowing forward"
         self.declare_parameter('heading_align_only_threshold', 0.5)  # rad (~30 deg)
 
-        # NEW: slow down when something is near but not yet at avoid distance
+        # slow down when something is near but not yet at avoid distance
         self.declare_parameter('obstacle_slowdown_distance', 0.70)   # m
 
         # Align-to-ball (rotate-only) params 
         self.declare_parameter('align_center_tolerance', 0.1)  # normalized [0..1]
         self.declare_parameter('align_angular_gain', 1.0)       # rad/s per unit error
-        # NEW: max angular speed *specifically* for ALIGN_TO_BALL (gentler)
+        # max angular speed *specifically* for ALIGN_TO_BALL (gentler)
         self.declare_parameter('align_max_angular_vel', 0.25)    # rad/s
         self.declare_parameter('align_timeout_sec', 8.0)        # s
 
@@ -106,13 +106,13 @@ class Task3(Node):
         # Integral windup clamp (in "error * seconds" units)
         self.declare_parameter('align_i_max', 0.15)
 
-        # NEW: deadband and stability requirement for alignment
+        # deadband and stability requirement for alignment
         self.declare_parameter('align_deadband', 0.05)          # norm error below this → treat as 0
         self.declare_parameter('align_center_stable_frames', 4) # consecutive frames centered
-        # NEW: extra settle time with v=0, w=0 before LiDAR measurement
+        # extra settle time with v=0, w=0 before LiDAR measurement
         self.declare_parameter('align_settle_time_sec', 5.0)  # 0.3–0.5s is usually enough
 
-        # NEW: scan-at-waypoint params (full 360° spin)
+        # scan-at-waypoint params (full 360° spin)
         self.declare_parameter('scan_angular_vel', 0.9)         # rad/s
         self.declare_parameter('scan_turns', 1.0)               # number of full rotations
         self.declare_parameter('scan_timeout_sec', 30.0)        # safety timeout
@@ -135,7 +135,7 @@ class Task3(Node):
         self.declare_parameter('rrt_neighbor_radius', 0.5)    # meters
         self.declare_parameter('rrt_local_range', 5.0)        # meters (sampling window radius)
         self.declare_parameter('rrt_clearance_cells', 1)
-        # NEW: how many consecutive RRT* failures before we give up and unstick via AVOID_OBSTACLE
+        # how many consecutive RRT* failures before we give up and unstick via AVOID_OBSTACLE
         self.declare_parameter('rrt_fail_limit', 3)
 
         # Camera model (approximate)
@@ -248,13 +248,13 @@ class Task3(Node):
             self.get_parameter('align_center_stable_frames')
             .get_parameter_value().integer_value
         )
-        # NEW: settle time
+        # settle time
         self.align_settle_time_sec = (
             self.get_parameter('align_settle_time_sec')
             .get_parameter_value().double_value
         )
         
-        # NEW: scan-at-waypoint
+        # scan-at-waypoint
         self.scan_angular_vel = (
             self.get_parameter('scan_angular_vel')
             .get_parameter_value().double_value
@@ -377,7 +377,7 @@ class Task3(Node):
         self.current_waypoint_idx = None
         self.waypoints_generated = False  # flag to avoid regenerating
         self.visited_waypoints = set()
-        # NEW: track waypoints that A* failed to reach
+        # track waypoints that A* failed to reach
         self.unreachable_waypoints = set()
 
         # Global path currently being followed
@@ -391,7 +391,7 @@ class Task3(Node):
         self.local_replan_goal_index = None
         self.rrt_fail_count = 0
 
-        # NEW: track whether a local (RRT*) path is currently being followed
+        # track whether a local (RRT*) path is currently being followed
         self.local_plan_active = False
 
         # --- Replan cooldown / commit-to-motion ---
@@ -409,7 +409,7 @@ class Task3(Node):
         self.scan_start_yaw = None
         self.scan_last_yaw = None
         self.scan_accum_angle = 0.0
-        # NEW: task completion should wait until scan finishes
+        # task completion should wait until scan finishes
         self.pending_task_done = False
 
         # Simple reactive avoidance state
@@ -435,7 +435,7 @@ class Task3(Node):
         self.relocalize_range_margin = 0.05  # meters
 
         """# Per-color HSV ranges (BGR->HSV) as the *primary* color gate.
-        # ⚠️ You should tune these ranges using the notebook slider on real
+        # You should tune these ranges using the notebook slider on real
         # Gazebo screenshots. These are just reasonable starting points.
         self.BALL_HSV_RANGES = {
             "red": [
@@ -496,11 +496,11 @@ class Task3(Node):
         # For alignment math
         self.last_image_width = None         # updated every frame in _detect_balls_in_image
 
-        # NEW: filtered error + stability counter
+        # filtered error + stability counter
         self.align_filtered_err = 0.0
         self.align_center_stable_counter = 0
 
-        # NEW: when we started the "settle with zero cmd_vel" phase
+        # when we started the "settle with zero cmd_vel" phase
         self.align_settle_start_time = None
 
         # PID internal state for ALIGN_MEASURE (heading control)
@@ -508,7 +508,7 @@ class Task3(Node):
         self.align_pid_prev_err = 0.0
         self.align_pid_prev_time = None
 
-        # NEW: once True, we are in the "centered, settling" phase
+        # once True, we are in the "centered, settling" phase
         self.align_center_latched = False
 
         # Quality tracking for "best" detection per color
@@ -585,7 +585,7 @@ class Task3(Node):
         )
 
         # --------------------------------------------------
-        # NEW: geometry_msgs/Point publishers for each color
+        # geometry_msgs/Point publishers for each color
         # These are intentionally NOT namespace-prefixed,
         # because the spec requires exact topic names.
         # --------------------------------------------------
@@ -989,7 +989,7 @@ class Task3(Node):
             f'({start_x:.2f}, {start_y:.2f}) over {len(pruned_world_points)} waypoints.'
         )
 
-        # NEW: quadrant-based, direction-respecting planning
+        # quadrant-based, direction-respecting planning
         route_indices = self._directional_nearest_route(pruned_world_points, start_xy)
 
         # Optional: you can still run 2-opt on top if you want a little
@@ -2294,7 +2294,7 @@ class Task3(Node):
             )
             self._publish_stop()
 
-            # NEW: if task completion is pending (all balls found),
+            # if task completion is pending (all balls found),
             # finalize *now* instead of going to next waypoint.
             if self.pending_task_done:
                 self.get_logger().info(
@@ -2373,7 +2373,7 @@ class Task3(Node):
                 self.avoidance_direction = None
                 self.avoidance_phase_start_time = None
 
-                # ⬇️ NEW: reset RRT failure counter and force a fresh A* plan
+                # ⬇️ reset RRT failure counter and force a fresh A* plan
                 self.rrt_fail_count = 0
                 self.local_plan_active = False
                 self.active_path_points = []
@@ -2519,7 +2519,7 @@ class Task3(Node):
                 )
                 return i
 
-        # --- NEW: all waypoints seem "unreachable" → clear that blacklist and try once more
+        # --- all waypoints seem "unreachable" → clear that blacklist and try once more
         if self.patrol_waypoints and len(self.unreachable_waypoints) == len(self.patrol_waypoints):
             self.get_logger().warn(
                 '[Layer 3] _choose_next_waypoint_index: all patrol waypoints are in '
@@ -2700,7 +2700,7 @@ class Task3(Node):
             for c in contours:
                 area, circ = self._contour_circularity(c)
 
-                # NEW: no hard max-area gate
+                # no hard max-area gate
                 if area < min_area_hard:
                     continue
                 if circ < circ_hard:
@@ -3284,7 +3284,7 @@ class Task3(Node):
 
         row, col = idx
 
-        # NEW: reject localizations that land on walls / occupied cells
+        # reject localizations that land on walls / occupied cells
         static_occ = None
         if self.static_occupancy is not None:
             static_occ = int(self.static_occupancy[row, col])
@@ -3337,7 +3337,7 @@ class Task3(Node):
 
             wx, wy = world_xy
 
-            # 🔍 NEW: log the exact marker pose we’re about to publish
+            # 🔍 log the exact marker pose we’re about to publish
             self.get_logger().info(
                 f"[Layer 5] Marker for {color} at world=({wx:.2f}, {wy:.2f})",
                 throttle_duration_sec=1.0,
@@ -3484,7 +3484,7 @@ class Task3(Node):
             * switch the state machine to TASK_DONE
             * stop the robot permanently (until node restart)
         """
-        # NEW: re-validate that each "localized" ball is actually on a free cell.
+        # re-validate that each "localized" ball is actually on a free cell.
         for color in self.ball_colors:
             if not self.detected_balls.get(color, False):
                 continue
@@ -3528,7 +3528,7 @@ class Task3(Node):
         if not all(self.detected_balls.values()):
             return
 
-        # ---- NEW BLOCK: delay finalization until scan is done ----
+        # ---- BLOCK: delay finalization until scan is done ----
         required_angle = 2.0 * math.pi * self.scan_turns
         if (
             self.state in ['SCAN_AT_WAYPOINT', 'ALIGN_MEASURE']
@@ -3564,7 +3564,7 @@ class Task3(Node):
         self.state = 'TASK_DONE'
         self._publish_stop()
 
-        # NEW: clear pending flag
+        # clear pending flag
         self.pending_task_done = False
 
     # ----------------------------------------------------------------------
@@ -3596,7 +3596,7 @@ class Task3(Node):
         if frame is None:
             return
 
-        # NEW: Only run detection when we are scanning or aligning to a ball.
+        # Only run detection when we are scanning or aligning to a ball.
         if self.state in ['SCAN_AT_WAYPOINT', 'ALIGN_MEASURE']:
             self._detect_balls_in_image(frame)
             self._publish_ball_markers()
@@ -3725,7 +3725,7 @@ class Task3(Node):
         self.local_replan_start_index = None
         self.local_replan_goal_index = None
 
-        # NEW: mark that we are now following a local (RRT*) plan
+        # mark that we are now following a local (RRT*) plan
         self.local_plan_active = True
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
@@ -3845,7 +3845,7 @@ class Task3(Node):
                 self.state = 'SELECT_NEXT_WAYPOINT'
                 return
 
-            # --- NEW: opportunistic pickup of waypoints that lie on this A* path ---
+            # --- opportunistic pickup of waypoints that lie on this A* path ---
             alt_idx = self._find_unvisited_waypoint_on_path(path_world)
 
             if alt_idx is not None and alt_idx != target_idx:
@@ -3873,7 +3873,7 @@ class Task3(Node):
             self.active_path_points = list(path_world)
             self.current_path_index = 0
 
-            # 🔧 NEW: fresh global path → fresh RRT* fuse
+            # 🔧 fresh global path → fresh RRT* fuse
             self.rrt_fail_count = 0
             self.local_plan_active = False
 
