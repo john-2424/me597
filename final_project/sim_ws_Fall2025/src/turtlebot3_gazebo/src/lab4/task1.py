@@ -88,11 +88,11 @@ class Task1(Node):
     CLUSTER_RADIUS_CELLS = 2       # how far neighbors can be and still be in same cluster
     MIN_GOAL_DIST_CELLS = 12        # minimum distance of goal from the robot (in grid cells)
 
-    # NEW: frontier path-length band (in cells along A* path)
+    # frontier path-length band (in cells along A* path)
     FRONTIER_PATH_LEN_MIN_CELLS = 12
     FRONTIER_PATH_LEN_MAX_CELLS = 24
 
-    # NEW: parameters for "far" alternative goals for inflated frontiers
+    # parameters for "far" alternative goals for inflated frontiers
     FRONTIER_FAR_ALT_MIN_OFFSET_CELLS = 4     # start this many cells away from original
     FRONTIER_FAR_ALT_MAX_OFFSET_CELLS = 15    # max search offset along rays
 
@@ -102,7 +102,7 @@ class Task1(Node):
     # extra safety for frontier / goal cells (pulled slightly further from walls)
     FRONTIER_CLEARANCE_CELLS = 6
 
-    # NEW: max radius (in cells) when snapping start/goal to nearest traversable
+    # max radius (in cells) when snapping start/goal to nearest traversable
     NEAREST_TRAVERSABLE_RADIUS_CELLS = 18
 
     BLOCKED_GOAL_RADIUS_CELLS = 3
@@ -216,14 +216,14 @@ class Task1(Node):
         # Frontier visit counts: how many times each frontier goal has been reached
         self.frontier_visit_counts: Dict[Tuple[int, int], int] = {}
 
-        # NEW: frontier cells whose clusters were rejected due to inflation / clearance
+        # frontier cells whose clusters were rejected due to inflation / clearance
         self.inflated_filtered_frontiers: List[Tuple[int, int]] = []
 
-        # NEW: dynamic frontier clearance (we can shrink this in narrow passages)
+        # dynamic frontier clearance (we can shrink this in narrow passages)
         self.frontier_clearance_current = self.FRONTIER_CLEARANCE_CELLS
         self.frontier_clearance_min = 0
 
-        # NEW: dynamic path clearance (for A* traversability / smoothing)
+        # dynamic path clearance (for A* traversability / smoothing)
         self.path_clearance_current = self.PATH_CLEARANCE_CELLS
         self.path_clearance_min = 0
 
@@ -235,7 +235,7 @@ class Task1(Node):
         self.escape_attempts = 0
         self.escape_attempt_limit = 5
 
-        # --- NEW: pre-clear (wall un-sticking) state ---
+        # --- pre-clear (wall un-sticking) state ---
         self.preclear_active = False
         self.preclear_phase = 0          # 0=BACK, 1=TURN
         self.preclear_until = 0.0
@@ -249,7 +249,7 @@ class Task1(Node):
         self.preclear_back_s = 0.40         # how long to back up
         self.preclear_turn_s = 0.50         # then turn away
 
-        # Final-goal approach tuning (NEW)
+        # Final-goal approach tuning 
         self.goal_slow_down_dist = 1.0     # m: start braking earlier for FINAL waypoint
         self.goal_speed_cap      = 0.2    # m/s: cap speed when tracking FINAL waypoint
 
@@ -1164,7 +1164,7 @@ class Task1(Node):
              smallest visit count and then largest distance (farthest in band).
           2) All other "safe" candidates (same filters) with smallest visit
              count and then smallest distance.
-          3) NEW: if no safe candidate exists at all, fall back to the nearest
+          3) if no safe candidate exists at all, fall back to the nearest
              raw frontier cell (closest to the robot), even if it doesn't yet
              pass clearance/min-distance; later stages will try to adjust or
              reject it.
@@ -1184,7 +1184,7 @@ class Task1(Node):
         band_candidates: List[Tuple[int, int, int, int]] = []
         fb_candidates: List[Tuple[int, int, int, int]] = []
 
-        # NEW: raw per-cluster fallback candidates (no clearance/min-dist filters)
+        # raw per-cluster fallback candidates (no clearance/min-dist filters)
         raw_frontiers: List[Tuple[int, int, int, int]] = []
 
         for cluster in clusters:
@@ -1208,7 +1208,7 @@ class Task1(Node):
 
             bx, by = best_cell
 
-            # NEW: skip clusters whose representative is in a blocked-goal region
+            # skip clusters whose representative is in a blocked-goal region
             if self.is_blocked_goal_cell(bx, by):
                 self.get_logger().info(
                     f'Skipping frontier cluster whose representative ({bx}, {by}) '
@@ -1269,10 +1269,10 @@ class Task1(Node):
             _, _, gx, gy = fb_candidates[0]
             return (gx, gy)
 
-        # Third (NEW): if no safe candidate exists at all, fall back to the nearest
+        # Third : if no safe candidate exists at all, fall back to the nearest
         # raw frontier representative (closest to robot), ignoring safety filters.
         if raw_frontiers:
-            # NEW: ignore raw representatives inside blocked-goal regions
+            # ignore raw representatives inside blocked-goal regions
             usable_raw = [
                 t for t in raw_frontiers
                 if not self.is_blocked_goal_cell(t[2], t[3])
@@ -1598,7 +1598,7 @@ class Task1(Node):
         # 1) /scan-based obstacle
         now_sec = self.get_clock().now().nanoseconds * 1e-9
 
-        # --- NEW: pre-clear if too close to ANY wall before doing path tracking ---
+        # --- pre-clear if too close to ANY wall before doing path tracking ---
         front = self._range_or_inf(self.front_range_filt)
         left  = self._range_or_inf(self.min_left_range)
         right = self._range_or_inf(self.min_right_range)
@@ -1794,7 +1794,7 @@ class Task1(Node):
             speed_goal = max(self.speed_min * heading_factor,
                             base * heading_factor) * turn_ratio
 
-        # NEW: extra cap for final approach (acts like "turn cap", but for goal)
+        # extra cap for final approach (acts like "turn cap", but for goal)
         if is_final_wp:
             speed_goal = min(speed_goal, self.goal_speed_cap)
 
