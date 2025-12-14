@@ -74,9 +74,9 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 3.6)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 3.2)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 5)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 4)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
