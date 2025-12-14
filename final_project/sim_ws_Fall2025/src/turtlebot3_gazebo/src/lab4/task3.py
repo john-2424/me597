@@ -74,9 +74,9 @@ class Task3(Node):
         self.declare_parameter('inflation_kernel', 9) # for static obstacle inflation
 
         # Layer 2 tuning params
-        self.declare_parameter('l2_prune_dist', 2.8)          # m, min dist between waypoints
+        self.declare_parameter('l2_prune_dist', 3.6)          # m, min dist between waypoints
         self.declare_parameter('l2_two_opt_max_iters', 50)    # iterations for 2-opt
-        self.declare_parameter('l2_min_dt_cells', 1)          # min distance-to-obstacle in cells
+        self.declare_parameter('l2_min_dt_cells', 5)          # min distance-to-obstacle in cells
 
         # Layer 3 navigation params
         self.declare_parameter('max_linear_vel', 0.30)        # m/s
@@ -393,6 +393,11 @@ class Task3(Node):
 
         # NEW: track whether a local (RRT*) path is currently being followed
         self.local_plan_active = False
+
+        # --- Replan cooldown / commit-to-motion ---
+        self.replan_cooldown_s = 0.8          # seconds
+        self.replan_cooldown_until = 0.0
+        self.emergency_stop_dist = 0.25       # meters; always stop/escape if closer than this
 
         # -------------------------
         # High-level task state machine
@@ -1972,6 +1977,9 @@ class Task3(Node):
         nodes = [start_node]
         goal_node = None
 
+        best_node = start_node
+        best_dist = math.hypot(start_node.x - gx, start_node.y - gy)
+
         for it in range(self.rrt_max_iterations):
             if it % 200 == 0 and it > 0:
                 self.get_logger().info(
@@ -2018,6 +2026,11 @@ class Task3(Node):
             new_node.cost = best_cost
             nodes.append(new_node)
 
+            dgoal = math.hypot(new_node.x - gx, new_node.y - gy)
+            if dgoal < best_dist:
+                best_dist = dgoal
+                best_node = new_node
+
             for nb in neighbors:
                 d = math.hypot(nb.x - new_node.x, nb.y - new_node.y)
                 if new_node.cost + d < nb.cost and self._segment_collision_free(new_node.x, new_node.y, nb.x, nb.y):
@@ -2044,20 +2057,23 @@ class Task3(Node):
                     segment_collision_fail += 1
 
         if goal_node is None:
-            # Summarize why we failed
-            min_dist = min(
-                math.hypot(n.x - gx, n.y - gy) for n in nodes
-            ) if nodes else float('inf')
-
             self.get_logger().warn(
-                '[Layer 3] RRT*: FAILED to find a local path. '
-                f'iters={self.rrt_max_iterations}, nodes={len(nodes)}, '
-                f'samples={samples_total}, '
-                f'segment_collision_fail={segment_collision_fail}, '
-                f'goal_connect_attempts={goal_connect_attempts}, '
-                f'min_dist_to_goal={min_dist:.2f} m.'
+                "[Layer 3] RRT*: FAILED to reach goal; returning best partial path. "
+                f"best_dist_to_goal={best_dist:.2f} m, nodes={len(nodes)}"
             )
-            self.rrt_start_idx = None
+
+            # Reconstruct partial path from best_node back to start
+            path = []
+            cur = best_node
+            while cur is not None:
+                path.append((cur.x, cur.y))
+                cur = cur.parent
+            path.reverse()
+
+            # Require at least a tiny “escape” (avoid returning start-only)
+            if len(path) >= 2 and math.hypot(path[-1][0]-sx, path[-1][1]-sy) >= max(0.25, self.rrt_step_size):
+                return path
+
             return None
 
         path = []
@@ -2071,7 +2087,7 @@ class Task3(Node):
         self.rrt_start_idx = None
         return path
 
-    def _obstacle_too_close_ahead(self, max_distance=None, fov_deg=60.0):
+    def _obstacle_too_close_ahead(self, max_distance=None, fov_deg=90.0):
         """
         Return True if any obstacle is closer than max_distance in a symmetric
         FOV around the front. Defaults to self.obstacle_avoid_distance.
@@ -3648,13 +3664,10 @@ class Task3(Node):
                 )
                 snapped = self._find_nearest_free_goal_cell_rrt(gr, gc, max_radius=5)
                 if snapped is None:
-                    # No safe local goal → bail out and mark this waypoint unreachable
                     self.get_logger().warn(
-                        '[Layer 3] REPLAN_LOCAL: no nearby RRT-free cell for local goal. '
-                        'Marking current waypoint unreachable and switching to AVOID_OBSTACLE.'
+                        "[Layer 3] REPLAN_LOCAL: no nearby RRT-free cell for local goal. "
+                        "Running AVOID_OBSTACLE and replanning to SAME waypoint (no skipping)."
                     )
-                    if self.current_waypoint_idx is not None:
-                        self.unreachable_waypoints.add(self.current_waypoint_idx)
                     self._start_avoidance()
                     self.state = 'AVOID_OBSTACLE'
                     return
@@ -3698,7 +3711,12 @@ class Task3(Node):
         if math.hypot(local_path[-1][0] - goal_xy[0], local_path[-1][1] - goal_xy[1]) < 0.1:
             local_splice = local_path
         else:
-            local_splice = local_path + [goal_xy]
+            connect_ok = (
+                math.hypot(local_path[-1][0] - goal_xy[0], local_path[-1][1] - goal_xy[1]) < 0.35
+                and self._segment_collision_free(local_path[-1][0], local_path[-1][1], goal_xy[0], goal_xy[1])
+            )
+
+            local_splice = local_path + ([goal_xy] if connect_ok else [])
 
         new_active = prefix + local_splice + suffix
         self.active_path_points = new_active
@@ -3709,6 +3727,9 @@ class Task3(Node):
 
         # NEW: mark that we are now following a local (RRT*) plan
         self.local_plan_active = True
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        self.replan_cooldown_until = now_sec + self.replan_cooldown_s
 
         self.get_logger().info(
             f'[Layer 3] REPLAN_LOCAL: local detour spliced into active path. '
@@ -3877,31 +3898,41 @@ class Task3(Node):
             return
 
         if self.state == 'FOLLOW_PATH':
-            if self._obstacle_too_close_ahead(max_distance=self.obstacle_avoid_distance):
-                self.get_logger().warn(
-                    '[Layer 3] FOLLOW_PATH: obstacle too close ahead. '
-                    'Using AVOID_OBSTACLE (backup+turn) instead of REPLAN_LOCAL.'
-                )
+            now_sec = self.get_clock().now().nanoseconds / 1e9
 
-                # Just run the simple escape maneuver – do NOT call RRT* here.
+            # Always honor emergency distance (true "brace for impact")
+            if self._obstacle_too_close_ahead(max_distance=self.emergency_stop_dist):
+                self.get_logger().warn(
+                    '[Layer 3] FOLLOW_PATH: EMERGENCY obstacle too close. Running AVOID_OBSTACLE.'
+                )
                 self._start_avoidance()
                 self.state = 'AVOID_OBSTACLE'
                 return
+
+            # If we just replanned locally, commit to moving for a short window
+            if now_sec < self.replan_cooldown_until:
+                # skip the normal near-threshold trigger so we actually move
+                pass
+            else:
+                # normal threshold behavior
+                if self._obstacle_too_close_ahead(max_distance=self.obstacle_avoid_distance):
+                    self.get_logger().warn(
+                        '[Layer 3] FOLLOW_PATH: obstacle too close ahead. Triggering AVOID_OBSTACLE.'
+                    )
+                    self._start_avoidance()
+                    self.state = 'AVOID_OBSTACLE'
+                    return
 
             # 2) Normal blocked-path check using occupancy (static + dynamic)
             if not self.local_plan_active:
                 blocked, start_idx, goal_idx = self._check_path_blocked_ahead()
                 if blocked:
-                    # If RRT* has failed too many times in a row, stop trying local detours
-                    # and use the backup+turn behavior to unstick.
                     if self.rrt_fail_count >= self.rrt_fail_limit:
                         self.get_logger().warn(
-                            f'[Layer 3] FOLLOW_PATH: path blocked near idx={start_idx}, '
-                            f'rrt_fail_count={self.rrt_fail_count} >= limit={self.rrt_fail_limit}. '
-                            'Marking waypoint unreachable and using AVOID_OBSTACLE.'
+                            f"[Layer 3] FOLLOW_PATH: path blocked near idx={start_idx}, "
+                            f"rrt_fail_count={self.rrt_fail_count} >= limit={self.rrt_fail_limit}. "
+                            "Running AVOID_OBSTACLE and replanning to SAME waypoint (no skipping)."
                         )
-                        if self.current_waypoint_idx is not None:
-                            self.unreachable_waypoints.add(self.current_waypoint_idx)
                         self._start_avoidance()
                         self.state = 'AVOID_OBSTACLE'
                         return
