@@ -9,6 +9,62 @@ This repository presents the Fall 2025 ME59700AS final project: a ROS 2 TurtleBo
 
 The implementation is centered in [`final_project/sim_ws_Fall2025`](final_project/sim_ws_Fall2025). It uses occupancy grids, TF, AMCL, LaserScan data, A* planning, RRT* local replanning, PID control, OpenCV-based color detection, and RViz visualization.
 
+## Visual Overview
+
+![Final project map preview](docs/assets/final-project-map.png)
+
+The map preview above is generated from the saved final-project occupancy grid used by the localization and navigation tasks.
+
+```mermaid
+flowchart LR
+  Sim["Gazebo TurtleBot3 Simulation"]
+  Map["Occupancy Grid Map"]
+  Scan["LaserScan"]
+  Camera["Camera Frames"]
+  Pose["TF / AMCL Pose"]
+  Planner["A* Global Planner"]
+  Replanner["RRT* Local Replanner"]
+  Safety["Obstacle Safety Checks"]
+  Perception["HSV Object Detection"]
+  Localization["World-Frame Object Localization"]
+  Control["PID / Path Following"]
+  Outputs["RViz Markers, Paths, and Object Topics"]
+
+  Sim --> Scan
+  Sim --> Camera
+  Sim --> Pose
+  Map --> Planner
+  Scan --> Safety
+  Scan --> Localization
+  Camera --> Perception
+  Pose --> Planner
+  Pose --> Localization
+  Planner --> Replanner
+  Safety --> Replanner
+  Replanner --> Control
+  Perception --> Localization
+  Control --> Sim
+  Localization --> Outputs
+  Planner --> Outputs
+```
+
+```mermaid
+flowchart TD
+  T1["Task 1: Explore unknown world and build map"]
+  MapOut["Saved occupancy map"]
+  T2["Task 2: Navigate to goals with static obstacle handling"]
+  Bonus["Task 2 Bonus: RRT* local detours"]
+  T3["Task 3: Search, detect, and localize colored objects"]
+  Demo["Project archive: presentation and demo videos"]
+
+  T1 --> MapOut
+  MapOut --> T2
+  T2 --> Bonus
+  MapOut --> T3
+  Bonus --> T3
+  T3 --> Demo
+```
+
 ## Project Tasks
 
 ### Task 1: Autonomous Mapping
@@ -99,4 +155,4 @@ ros2 launch turtlebot3_gazebo task_6.launch.py
 
 ## Project Artifacts
 
-The archive link at the top of this README contains larger final-project artifacts such as presentation files, videos, maps, and submitted deliverables that are better kept outside the Git repository.
+The archive link at the top of this README contains larger final-project artifacts such as presentation files, task demo videos, maps, and submitted deliverables that are better kept outside the Git repository.
